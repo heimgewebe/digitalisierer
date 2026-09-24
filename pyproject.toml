@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digitalisierer"
+version = "0.1.0"
+description = "Local-first workbench for scanning, OCR, transcription and reproducible digitization workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+digitalisierer = "digitalisierer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
