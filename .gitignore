@@ -7,7 +7,24 @@ build/
 *.egg-info/
 .DS_Store
 
-# Local digitization data never belongs in Git.
+# Local environment / credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local models and large runtime data.
+models/
+.cache/
+data/
+
+# Digitization payloads never belong in Git by default.
 sessions/
 captures/
 exports/
+projects/
+recordings/
+transcripts/

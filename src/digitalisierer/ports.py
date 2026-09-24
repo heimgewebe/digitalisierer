@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .domain import MediaAsset
+from .domain import MediaAsset, QualityFinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,5 +75,5 @@ class MediaProbeBackend(Protocol):
 class QualityAnalyzer(Protocol):
     name: str
 
-    def analyze(self, asset: MediaAsset) -> list[object]:
+    def analyze(self, asset: MediaAsset) -> list[QualityFinding]:
         ...

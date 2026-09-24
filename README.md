@@ -1,75 +1,130 @@
 # Digitalisierer
 
-**Digitalisierer** is a local-first workbench for turning physical and digital source material into durable, searchable and machine-usable artifacts.
+**Digitalisierer** is a local-first workbench for turning physical and digital source material into durable, searchable, reviewable and machine-usable artifacts.
 
-It is deliberately broader than a scanner frontend:
+It is intentionally broader than a scanner frontend and intentionally narrower than a document-management or knowledge system.
 
 ```
-ingest -> preserve -> normalize -> extract -> review -> export -> archive handoff
+ingest -> preserve -> normalize -> extract -> quality -> review -> export
 ```
 
-The first vertical slice uses the **CZUR ET24 Pro** on Linux, because that path is already proven end-to-end. The core is media-neutral and is intended to grow into OCR, transcription, document/image/audio/video processing and related digitization workflows.
+The first real vertical slice is the **CZUR ET24 Pro** book workflow on Linux because that path is already proven end-to-end. The architecture itself is media-neutral and is intended to support OCR, transcription, PDF/image processing, audio/video digitization and additional extraction capabilities behind replaceable adapters.
 
-## What belongs here
+## Why this exists
 
-Digitalisierer may handle:
+Digitization is not the same as capture.
+
+A useful workflow must also answer:
+
+- What exactly was ingested?
+- Was the source preserved?
+- Which transformations were applied?
+- Which pages or segments look suspicious?
+- What did OCR or transcription actually produce?
+- What did a human change?
+- Can the result be reproduced from the recorded inputs and parameters?
+
+Digitalisierer makes those concerns first-class.
+
+## Capability direction
+
+Digitalisierer may support:
 
 - book and document scanning;
-- camera and folder ingest;
-- PDF import and normalization;
+- camera, folder and PDF ingest;
 - OCR and searchable PDF generation;
-- audio/video ingest;
-- speech-to-text transcription;
-- subtitle generation (SRT/VTT);
-- page/segment ordering, replacement and exclusion;
-- dewarp, crop, deskew and other non-destructive preprocessing;
-- image/audio/video quality checks;
-- blank, duplicate and anomaly detection;
-- metadata extraction and technical inspection;
+- transcription of audio and video;
+- TXT / Markdown / JSON / SRT / VTT export;
+- dewarp, crop, deskew and non-destructive normalization;
+- blank, duplicate, blur, clipping, silence and other quality findings;
+- metadata and technical inspection;
 - chapter/session/project assembly;
-- reproducible exports, checksums, manifests and provenance;
-- optional later enrichment such as layout extraction, structured text extraction or classification.
+- checksums, manifests and provenance;
+- optional layout, structure, barcode/QR and AI-assisted extraction.
+
+New functionality should normally enter as a **capability + adapter**, not as a special case in the core.
 
 ## Product boundary
 
-Digitalisierer is the **digitization layer**.
+Digitalisierer owns the **digitization layer**:
 
-It should not become a general-purpose DMS, media player, note-taking system or knowledge base merely because digitized artifacts can feed those systems.
+> bring material in, preserve the source, derive useful representations, surface uncertainty and defects, let a human correct the result, and emit trustworthy artifacts.
 
-The useful boundary is:
+It is not intended to become a general DMS, media player, note system, library catalogue or RAG/knowledge-base product.
 
-> get material in, preserve the source, extract usable information, make defects visible, let the user correct the result, and emit trustworthy artifacts.
+## Architectural invariants
 
-## Initial architecture
+1. **Source identity and review state are separate.** Excluding a page from an export does not mutate the source asset.
+2. **Sources are immutable by default.** Corrections create metadata, replacement associations or derived assets.
+3. **Every derived artifact should be explainable.** Inputs, parameters, engine/version and output hashes belong in provenance.
+4. **No hidden cloud requirement.** Local execution is the default; remote engines must be explicit adapters.
+5. **Vendor-specific behavior stays at the edge.** CZUR, Tesseract, Whisper, ffmpeg or another engine must not shape the core domain.
+6. **Automation may flag; it must not silently destroy.** Blank/duplicate/low-quality detection produces findings, not deletions.
 
-Hardware and engines live behind adapters:
+## Architecture sketch
 
 ```
 UI / CLI
    |
 Project + Session + Review
    |
-Processing / Extraction / QA
+Capability jobs
+   |-- normalize
+   |-- OCR
+   |-- transcribe
+   |-- analyze quality
+   |-- export
    |
-Export + Provenance
+Ports / adapters
+   |-- CaptureBackend        -> CZUR first
+   |-- OCRBackend            -> OCRmyPDF / Tesseract
+   |-- TranscriptionBackend  -> pluggable
+   |-- MediaProbeBackend     -> ffprobe
+   |-- Storage               -> local filesystem
    |
-Ports
-   +-- CaptureBackend        -> CZUR first
-   +-- OCRBackend            -> OCRmyPDF/Tesseract
-   +-- TranscriptionBackend  -> pluggable
-   +-- MediaProbeBackend     -> ffprobe
-   +-- Storage               -> local filesystem
+Provenance
+   input hashes + parameters + engine identity + output hashes
 ```
 
-CZUR's proprietary application is an implementation detail of one capture adapter. No proprietary CZUR binary or library belongs in this repository.
+## Current status
 
-## First milestones
+Very early foundation. The repository currently contains the domain/port skeleton, architectural decisions, CI and a `doctor` command. The existing working CZUR/OCR scripts on the development machine are migration input, not a reason to copy implementation accidents into the architecture.
 
-1. Scanner session with large review UI.
-2. Existing CZUR capture/dewarp integration.
-3. Page QA and non-destructive correction.
-4. Master PDF + OCR PDF + text + manifest.
-5. Audio/video import and transcription.
-6. Unified project/session model across media types.
+Run:
 
-See [docs/vision.md](docs/vision.md), [docs/capabilities.md](docs/capabilities.md), [docs/architecture.md](docs/architecture.md) and [docs/roadmap.md](docs/roadmap.md).
+```bash
+PYTHONPATH=src python -m digitalisierer doctor
+```
+
+## Roadmap
+
+The scanner flow remains the first vertical slice:
+
+```
+CZUR capture -> page review -> QA -> master PDF -> OCR -> searchable PDF
+```
+
+The second vertical slice is deliberately different:
+
+```
+audio/video ingest -> media probe -> audio preparation -> transcription
+                  -> transcript review -> TXT/JSON/SRT/VTT
+```
+
+If both fit the same project/session/job/provenance core without special pleading, the architecture is doing its job.
+
+See:
+
+- [Vision](docs/vision.md)
+- [Capability map](docs/capabilities.md)
+- [Architecture](docs/architecture.md)
+- [Roadmap](docs/roadmap.md)
+- [ADRs](docs/adr)
+
+## Security and privacy
+
+Do not commit source scans, recordings, transcripts, secrets, credentials or private datasets. Local digitization data is ignored by default. See [SECURITY.md](SECURITY.md).
+
+## License
+
+No open-source license has been selected yet. Public repository visibility does **not** grant reuse rights. Licensing is intentionally a separate decision.

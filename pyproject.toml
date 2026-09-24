@@ -8,9 +8,15 @@ version = "0.1.0"
 description = "Local-first workbench for scanning, OCR, transcription and reproducible digitization workflows."
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["digitization", "ocr", "transcription", "scanner", "local-first"]
 
 [project.scripts]
 digitalisierer = "digitalisierer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/heimgewebe/digitalisierer"
+Repository = "https://github.com/heimgewebe/digitalisierer"
+Issues = "https://github.com/heimgewebe/digitalisierer/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

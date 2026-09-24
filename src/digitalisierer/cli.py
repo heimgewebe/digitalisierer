@@ -8,8 +8,11 @@ import shutil
 from . import __version__
 
 
-CORE_TOOLS = ("ffmpeg", "ffprobe", "ocrmypdf", "tesseract")
-CZUR_TOOLS = ("xdotool", "v4l2-ctl")
+CAPABILITY_TOOLS = {
+    "media": ("ffmpeg", "ffprobe"),
+    "ocr": ("ocrmypdf", "tesseract"),
+    "capture-czur": ("xdotool", "v4l2-ctl"),
+}
 CZUR_APP = Path.home() / ".local/opt/czur-scanner/CzurScanner"
 
 
@@ -19,32 +22,43 @@ def _which(name: str) -> dict[str, object]:
 
 
 def doctor() -> int:
-    core = {name: _which(name) for name in CORE_TOOLS}
-    czur = {name: _which(name) for name in CZUR_TOOLS}
-    czur["czur-app"] = {
+    capabilities: dict[str, dict[str, object]] = {}
+
+    for capability, tools in CAPABILITY_TOOLS.items():
+        checks = {name: _which(name) for name in tools}
+        capabilities[capability] = {
+            "ready": all(item["found"] for item in checks.values()),
+            "checks": checks,
+        }
+
+    czur = capabilities["capture-czur"]
+    czur_checks = dict(czur["checks"])
+    czur_checks["czur-app"] = {
         "found": CZUR_APP.is_file(),
         "path": str(CZUR_APP),
     }
+    czur["checks"] = czur_checks
+    czur["ready"] = all(item["found"] for item in czur_checks.values())
+
     result = {
         "digitalisierer": __version__,
-        "core_ready": all(item["found"] for item in core.values()),
-        "checks": {
-            "core": core,
-            "capture": {"czur": czur},
-        },
-        "notes": {
-            "transcription": "No transcription engine is mandatory yet; it is a pluggable backend."
+        "capabilities": capabilities,
+        "optional": {
+            "transcription": {
+                "ready": False,
+                "detail": "No transcription adapter is selected yet.",
+            }
         },
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0 if result["core_ready"] else 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="digitalisierer")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor", help="check local digitization prerequisites")
+    sub.add_parser("doctor", help="report local digitization capability readiness")
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
