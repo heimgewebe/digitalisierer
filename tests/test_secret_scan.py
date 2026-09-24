@@ -1,6 +1,14 @@
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import sys
 
-from tools import secret_scan
+
+_MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "secret_scan.py"
+_SPEC = spec_from_file_location("digitalisierer_secret_scan_test_subject", _MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+secret_scan = module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = secret_scan
+_SPEC.loader.exec_module(secret_scan)
 
 
 def test_secret_rules_detect_classic_and_fine_grained_github_tokens() -> None:
