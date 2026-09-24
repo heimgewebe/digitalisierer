@@ -11,23 +11,28 @@ from digitalisierer.domain import (
 
 
 def test_review_state_does_not_change_source_asset_identity() -> None:
-    source = MediaAsset(
+    first = MediaAsset(
         "page-a",
         Path("page-a.jpg"),
         MediaKind.DOCUMENT_IMAGE,
         sha256="abc",
     )
+    excluded = MediaAsset("page-b", Path("page-b.jpg"), MediaKind.DOCUMENT_IMAGE)
+    third = MediaAsset("page-c", Path("page-c.jpg"), MediaKind.DOCUMENT_IMAGE)
     session = ProcessingSession(
         session_id="chapter",
         root=Path("/tmp/chapter"),
         items=[
-            SessionAsset(source, sequence=1, included=False),
+            SessionAsset(first, sequence=1),
+            SessionAsset(excluded, sequence=2, included=False),
+            SessionAsset(third, sequence=3),
         ],
     )
 
-    assert source.role is AssetRole.SOURCE
-    assert source.sha256 == "abc"
-    assert session.active_assets() == []
+    assert first.role is AssetRole.SOURCE
+    assert first.sha256 == "abc"
+    assert [asset.asset_id for asset in session.active_assets()] == ["page-a", "page-c"]
+    assert excluded.asset_id == "page-b"
 
 
 def test_ordered_items_keep_review_metadata_outside_assets() -> None:

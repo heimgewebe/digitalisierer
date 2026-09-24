@@ -16,18 +16,18 @@ build/
 *.p12
 *.pfx
 
-# Local models and large runtime data.
-models/
-.cache/
-data/
+# Repository-root local models and large runtime data.
+/models/
+/.cache/
+/data/
 
 # Local review evidence stays local.
-.review-audits/
+/.review-audits/
 
-# Digitization payloads never belong in Git by default.
-sessions/
-captures/
-exports/
-projects/
-recordings/
-transcripts/
+# Repository-root digitization payloads never belong in Git by default.
+/sessions/
+/captures/
+/exports/
+/projects/
+/recordings/
+/transcripts/

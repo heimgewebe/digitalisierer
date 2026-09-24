@@ -19,6 +19,7 @@ class Rule:
 RULES = (
     Rule("private-key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
     Rule("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    Rule("github-fine-grained-token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
     Rule("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     Rule("bearer-token", re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[A-Za-z0-9._~+/=-]{16,}")),
     Rule("openai-like-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
@@ -42,6 +43,20 @@ def tracked_files(root: Path) -> list[Path]:
     return [root / item.decode() for item in result.stdout.split(b"\0") if item]
 
 
+def find_matches(text: str) -> list[tuple[str, int]]:
+    findings: list[tuple[str, int]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for rule in RULES:
+            if rule.pattern.search(line):
+                findings.append((rule.name, lineno))
+    return findings
+
+
+def format_finding(rule: str, path: Path, line: int) -> str:
+    # Never accept or render matched source text here.
+    return f"{path}:{line}: potential secret ({rule})"
+
+
 def scan(root: Path) -> list[tuple[str, Path, int]]:
     findings: list[tuple[str, Path, int]] = []
     for path in tracked_files(root):
@@ -51,10 +66,10 @@ def scan(root: Path) -> list[tuple[str, Path, int]]:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            for rule in RULES:
-                if rule.pattern.search(line):
-                    findings.append((rule.name, path.relative_to(root), lineno))
+        findings.extend(
+            (rule, path.relative_to(root), lineno)
+            for rule, lineno in find_matches(text)
+        )
     return findings
 
 
@@ -63,8 +78,7 @@ def main() -> int:
     findings = scan(root)
     if findings:
         for rule, path, line in findings:
-            # Deliberately never print the matched secret material.
-            print(f"{path}:{line}: potential secret ({rule})", file=sys.stderr)
+            print(format_finding(rule, path, line), file=sys.stderr)
         return 1
     print("secret scan: clean")
     return 0
