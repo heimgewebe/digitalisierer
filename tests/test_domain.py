@@ -1,35 +1,63 @@
 from pathlib import Path
 
-from digitalisierer.domain import AssetRole, MediaAsset, MediaKind, ProcessingSession
+from digitalisierer.domain import (
+    AssetRole,
+    DigitizationProject,
+    MediaAsset,
+    MediaKind,
+    ProcessingSession,
+    SessionAsset,
+)
 
 
-def test_active_assets_preserve_non_excluded_assets() -> None:
+def test_review_state_does_not_change_source_asset_identity() -> None:
+    source = MediaAsset(
+        "page-a",
+        Path("page-a.jpg"),
+        MediaKind.DOCUMENT_IMAGE,
+        sha256="abc",
+    )
     session = ProcessingSession(
-        session_id="test",
-        root=Path("/tmp/test"),
-        assets=[
-            MediaAsset("a", Path("1.jpg"), MediaKind.DOCUMENT_IMAGE, sequence=1),
-            MediaAsset("b", Path("2.jpg"), MediaKind.DOCUMENT_IMAGE, sequence=2, excluded=True),
-            MediaAsset("c", Path("3.jpg"), MediaKind.DOCUMENT_IMAGE, sequence=3),
+        session_id="chapter",
+        root=Path("/tmp/chapter"),
+        items=[
+            SessionAsset(source, sequence=1, included=False),
         ],
     )
 
-    assert [asset.asset_id for asset in session.active_assets()] == ["a", "c"]
+    assert source.role is AssetRole.SOURCE
+    assert source.sha256 == "abc"
+    assert session.active_assets() == []
 
 
-def test_ordered_assets_support_sequence_without_changing_sources() -> None:
+def test_ordered_items_keep_review_metadata_outside_assets() -> None:
+    late = MediaAsset("late", Path("b.wav"), MediaKind.AUDIO)
+    early = MediaAsset("early", Path("a.pdf"), MediaKind.PDF)
+    derived = MediaAsset(
+        "derived",
+        Path("x.txt"),
+        MediaKind.TEXT,
+        role=AssetRole.DERIVED,
+    )
     session = ProcessingSession(
         session_id="mixed",
         root=Path("/tmp/mixed"),
-        assets=[
-            MediaAsset("late", Path("b.wav"), MediaKind.AUDIO, sequence=20),
-            MediaAsset("early", Path("a.pdf"), MediaKind.PDF, sequence=10),
-            MediaAsset("derived", Path("x.txt"), MediaKind.UNKNOWN, role=AssetRole.DERIVED),
+        items=[
+            SessionAsset(late, sequence=20),
+            SessionAsset(early, sequence=10),
+            SessionAsset(derived),
         ],
     )
 
-    assert [asset.asset_id for asset in session.ordered_assets()] == [
+    assert [item.asset.asset_id for item in session.ordered_items()] == [
         "early",
         "late",
         "derived",
     ]
+
+
+def test_project_groups_sessions_without_owning_engine_state() -> None:
+    session = ProcessingSession("one", Path("/tmp/one"))
+    project = DigitizationProject("project", Path("/tmp/project"), [session])
+
+    assert project.sessions == [session]
