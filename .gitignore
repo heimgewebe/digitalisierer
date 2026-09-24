@@ -21,6 +21,9 @@ models/
 .cache/
 data/
 
+# Local review evidence stays local.
+.review-audits/
+
 # Digitization payloads never belong in Git by default.
 sessions/
 captures/
