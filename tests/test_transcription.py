@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from digitalisierer import cli, transcription as transcription_module
-from digitalisierer.domain import ExportArtifact, Transcript, TranscriptSegment, TranscriptionResult
+from digitalisierer.domain import Transcript, TranscriptSegment, TranscriptionResult
 from digitalisierer.heim_pc_asr import (
     ASR_AUTHORITY,
     AsrAdapterError,
@@ -643,30 +643,36 @@ def test_export_reservation_prevents_late_destination_clobber(
     assert not (output / "manifest.json").exists()
 
 
-def test_failed_partial_publication_never_deletes_final_entries(
+def test_failure_after_atomic_exposure_never_deletes_final_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
-    original_copy = transcription_module._copy_artifact_exclusive
+    original_verify = transcription_module._verify_bound_artifacts
 
-    def collide_on_second_artifact(
+    def fail_after_exposure(
+        directory_path: Path,
         directory_fd: int,
-        artifact: ExportArtifact,
-    ) -> tuple[tuple[int, int], str]:
-        if artifact.path.name == "transcript.json":
-            (output / "transcript.json").write_text("foreign", encoding="utf-8")
+        directory_identity: tuple[int, int],
+        published: dict[str, tuple[tuple[int, int], str]],
+    ) -> None:
+        original_verify(
+            directory_path,
+            directory_fd,
+            directory_identity,
+            published,
+        )
+        if directory_path == output:
             raise TranscriptionWorkflowError(
-                "output directory changed during publication: transcript.json"
+                "output directory changed during publication"
             )
-        return original_copy(directory_fd, artifact)
 
     monkeypatch.setattr(
         transcription_module,
-        "_copy_artifact_exclusive",
-        collide_on_second_artifact,
+        "_verify_bound_artifacts",
+        fail_after_exposure,
     )
 
     with pytest.raises(
@@ -675,13 +681,18 @@ def test_failed_partial_publication_never_deletes_final_entries(
     ):
         transcribe_and_export(source, output, FakeBackend(_result()))
 
+    assert {entry.name for entry in output.iterdir()} == {
+        "transcript.txt",
+        "transcript.json",
+        "transcript.srt",
+        "transcript.vtt",
+        "manifest.json",
+    }
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "Hallo Welt\n"
-    assert (output / "transcript.json").read_text(encoding="utf-8") == "foreign"
-    assert not (output / "manifest.json").exists()
     assert list(tmp_path.glob(".export.staging-*")) == []
 
 
-def test_keyboard_interrupt_before_first_publish_cleans_final_reservation(
+def test_keyboard_interrupt_before_atomic_publish_cleans_private_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -689,17 +700,14 @@ def test_keyboard_interrupt_before_first_publish_cleans_final_reservation(
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
 
-    def interrupting_copy(
-        directory_fd: int,
-        artifact: ExportArtifact,
-    ) -> tuple[tuple[int, int], str]:
-        del directory_fd, artifact
+    def interrupting_rename(source: Path, destination: Path) -> None:
+        del source, destination
         raise KeyboardInterrupt
 
     monkeypatch.setattr(
         transcription_module,
-        "_copy_artifact_exclusive",
-        interrupting_copy,
+        "_rename_noreplace",
+        interrupting_rename,
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -709,32 +717,24 @@ def test_keyboard_interrupt_before_first_publish_cleans_final_reservation(
     assert list(tmp_path.glob(".export.staging-*")) == []
 
 
-def test_export_binds_publication_to_created_directory_inode(
+def test_atomic_publish_refuses_public_path_replacement_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
-    displaced = tmp_path / "displaced-export"
-    original_copy = transcription_module._copy_artifact_exclusive
-    swapped = False
+    original_rename = transcription_module._rename_noreplace
 
-    def replacing_copy(
-        directory_fd: int,
-        artifact: ExportArtifact,
-    ) -> tuple[tuple[int, int], str]:
-        nonlocal swapped
-        if not swapped:
-            output.rename(displaced)
-            output.mkdir()
-            swapped = True
-        return original_copy(directory_fd, artifact)
+    def racing_rename(source: Path, destination: Path) -> None:
+        destination.mkdir()
+        (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+        original_rename(source, destination)
 
     monkeypatch.setattr(
         transcription_module,
-        "_copy_artifact_exclusive",
-        replacing_copy,
+        "_rename_noreplace",
+        racing_rename,
     )
 
     with pytest.raises(
@@ -743,10 +743,10 @@ def test_export_binds_publication_to_created_directory_inode(
     ):
         transcribe_and_export(source, output, FakeBackend(_result()))
 
-    assert swapped is True
-    assert list(output.iterdir()) == []
-    assert (displaced / "transcript.txt").is_file()
-    assert (displaced / "manifest.json").is_file()
+    assert (output / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert not (output / "transcript.txt").exists()
+    assert not (output / "manifest.json").exists()
+    assert list(tmp_path.glob(".export.staging-*")) == []
 
 
 def test_export_does_not_require_hardlink_support(
@@ -769,30 +769,29 @@ def test_export_does_not_require_hardlink_support(
     assert (output / "manifest.json").is_file()
 
 
-def test_export_detects_same_name_replacement_during_staging_cleanup(
+def test_export_detects_same_name_replacement_during_atomic_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
-    original_rmtree = shutil.rmtree
+    original_rename = transcription_module._rename_noreplace
     swapped = False
 
-    def swapping_rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+    def swapping_rename(source: Path, destination: Path) -> None:
         nonlocal swapped
-        if (
-            not swapped
-            and Path(path).name.startswith(".export.staging-")
-            and (output / "transcript.txt").exists()
-        ):
-            destination = output / "transcript.txt"
-            destination.unlink()
-            destination.write_text("foreign", encoding="utf-8")
-            swapped = True
-        original_rmtree(path, *args, **kwargs)
+        artifact = source / "transcript.txt"
+        artifact.unlink()
+        artifact.write_text("foreign", encoding="utf-8")
+        swapped = True
+        original_rename(source, destination)
 
-    monkeypatch.setattr(shutil, "rmtree", swapping_rmtree)
+    monkeypatch.setattr(
+        transcription_module,
+        "_rename_noreplace",
+        swapping_rename,
+    )
 
     with pytest.raises(
         TranscriptionWorkflowError,
