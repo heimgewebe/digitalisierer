@@ -271,6 +271,7 @@ class HeimPcAsrBackend:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=min(self._timeout_seconds, 120),
             )
         except AsrAdapterError as exc:
@@ -279,7 +280,7 @@ class HeimPcAsrBackend:
                 detail=f"heim-pc ASR authority is not ready: {exc}",
                 entrypoint=None,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
             return AsrBackendStatus(
                 ready=False,
                 detail="heim-pc ASR authority is not ready",
@@ -316,9 +317,10 @@ class HeimPcAsrBackend:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=self._timeout_seconds,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
             raise AsrAdapterError("heim-pc ASR invocation failed") from exc
         if completed.returncode != 0:
             detail = _diagnostic_tail(completed.stderr)

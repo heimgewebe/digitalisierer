@@ -231,12 +231,13 @@ def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     captured: list[str] = []
+    captured_kwargs: dict[str, Any] = {}
 
     def fake_run(
         argv: list[str],
         **kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
-        del kwargs
+        captured_kwargs.update(kwargs)
         captured.extend(argv)
         return subprocess.CompletedProcess(
             argv,
@@ -256,6 +257,32 @@ def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
     assert "--engine" not in captured
     assert "--allow-metered-cloud" not in captured
     assert "--escalate-to-cloud" not in captured
+    assert captured_kwargs["text"] is True
+    assert captured_kwargs["encoding"] == "utf-8"
+
+
+def test_backend_invalid_utf8_is_controlled_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _operator_entry(
+        tmp_path / "operator-entry.json",
+        entrypoint=str(tmp_path / "asr_engine.py"),
+    )
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+
+    def fake_run(
+        argv: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        assert kwargs["encoding"] == "utf-8"
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
+
+    with pytest.raises(AsrAdapterError, match="heim-pc ASR invocation failed"):
+        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
 
 
 def test_backend_error_includes_sanitized_stderr_tail(
@@ -311,11 +338,13 @@ def test_backend_status_includes_doctor_stderr(
         entrypoint=str(tmp_path / "asr_engine.py"),
     )
 
+    captured_kwargs: dict[str, Any] = {}
+
     def fake_run(
         argv: list[str],
         **kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
-        del kwargs
+        captured_kwargs.update(kwargs)
         return subprocess.CompletedProcess(
             argv,
             3,
@@ -329,6 +358,8 @@ def test_backend_status_includes_doctor_stderr(
 
     assert status.ready is False
     assert status.detail == "heim-pc ASR doctor exited with status 3: runtime incomplete model missing"
+    assert captured_kwargs["text"] is True
+    assert captured_kwargs["encoding"] == "utf-8"
 
 
 def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> None:
