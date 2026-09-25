@@ -519,6 +519,46 @@ def test_export_reservation_prevents_late_destination_clobber(
     assert not (output / "manifest.json").exists()
 
 
+def test_export_detects_same_name_replacement_during_staging_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    original_unlink = Path.unlink
+    swapped = False
+
+    def swapping_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal swapped
+        if (
+            not swapped
+            and path.name == "transcript.txt"
+            and path.parent.name.startswith(".export.staging-")
+        ):
+            original_unlink(path, *args, **kwargs)
+            destination = output / "transcript.txt"
+            original_unlink(destination)
+            destination.write_text("foreign", encoding="utf-8")
+            swapped = True
+            return
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", swapping_unlink)
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="output directory changed during publication",
+    ):
+        transcribe_and_export(source, output, FakeBackend(_result()))
+
+    assert swapped is True
+    assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
+    assert (output / INCOMPLETE_MARKER).is_file()
+    assert not (output / "manifest.json").exists()
+    assert list(tmp_path.glob(".export.staging-*")) == []
+
+
 def test_export_fails_if_source_changes_during_initial_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
