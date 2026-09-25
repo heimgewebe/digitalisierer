@@ -1,9 +1,12 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from digitalisierer import cli
+from digitalisierer.domain import ExportArtifact
+from digitalisierer.transcription import TranscriptionExport, default_output_dir
 
 
 def _all_tools_present(name: str) -> cli.ToolCheck:
@@ -132,3 +135,69 @@ def test_doctor_require_transcription_reflects_backend_readiness(
     assert payload["ready"] is ready
     assert payload["required_capabilities"] == ["transcription"]
     assert payload["capabilities"]["transcription"]["ready"] is ready
+
+
+def test_doctor_emits_ascii_json_for_non_utf8_tool_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_tool_path = b"/tools/ffmpeg-\xff"
+    weird_path = os.fsdecode(raw_tool_path)
+
+    monkeypatch.setattr(
+        cli,
+        "_which",
+        lambda _name: {"found": True, "path": weird_path},
+    )
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
+
+    assert cli.main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    output.encode("ascii")
+    payload = json.loads(output)
+
+    observed = payload["capabilities"]["media"]["checks"]["ffmpeg"]["path"]
+    assert os.fsencode(observed) == raw_tool_path
+
+
+def test_transcribe_emits_ascii_json_for_non_utf8_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_name = b"sample-\xff.wav"
+    source = tmp_path / os.fsdecode(raw_name)
+    source.write_bytes(b"synthetic-audio")
+
+    monkeypatch.setattr(cli, "_transcription_backend", lambda: object())
+
+    def fake_export(
+        source_path: Path,
+        output_dir: Path,
+        _backend: object,
+    ) -> TranscriptionExport:
+        assert source_path == source
+        final_dir = output_dir.absolute()
+        return TranscriptionExport(
+            output_dir=final_dir,
+            artifacts=(
+                ExportArtifact(
+                    kind="transcript-json",
+                    path=final_dir / "transcript.json",
+                    sha256="a" * 64,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(cli, "transcribe_and_export", fake_export)
+
+    assert cli.main(["transcribe", str(source)]) == 0
+    output = capsys.readouterr().out
+    output.encode("ascii")
+    payload = json.loads(output)
+
+    expected_output = str(default_output_dir(source).absolute())
+    assert os.fsencode(payload["output_dir"]) == os.fsencode(expected_output)
+    assert os.fsencode(payload["artifacts"][0]["path"]) == os.fsencode(
+        str(Path(expected_output) / "transcript.json")
+    )

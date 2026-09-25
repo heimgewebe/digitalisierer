@@ -111,7 +111,7 @@ def doctor(required: tuple[str, ...] = DEFAULT_REQUIRED_CAPABILITIES) -> int:
         "required_capabilities": list(required),
         "capabilities": capabilities,
     }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(result, indent=2, ensure_ascii=True))
     return 0 if ready else 1
 
 
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                     ],
                 },
                 indent=2,
-                ensure_ascii=False,
+                ensure_ascii=True,
             )
         )
         return 0
