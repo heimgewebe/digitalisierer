@@ -18,6 +18,7 @@ from digitalisierer.heim_pc_asr import (
     parse_route_result,
 )
 from digitalisierer.transcription import (
+    INCOMPLETE_MARKER,
     TranscriptionWorkflowError,
     transcribe_and_export,
 )
@@ -289,6 +290,55 @@ def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> No
     }
 
 
+def test_subtitle_export_escapes_markup_and_collapses_line_breaks(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    raw_text = "Er sagte <unverstaendlich> & zeigte -->\n\ndorthin"
+    result = TranscriptionResult(
+        transcript=Transcript(
+            text=raw_text,
+            language="de",
+            segments=(
+                TranscriptSegment(
+                    raw_text,
+                    start=0.0,
+                    end=1.25,
+                    speaker="A&B",
+                ),
+            ),
+        ),
+        provider="local",
+        engine="faster-whisper",
+        model="Systran/faster-whisper-large-v3",
+        backend_version="1.2.1",
+        cloud_used=False,
+    )
+
+    transcribe_and_export(source, output, FakeBackend(result))
+
+    safe = (
+        "A&amp;B: Er sagte &lt;unverstaendlich&gt; "
+        "&amp; zeigte --&gt; dorthin"
+    )
+    assert (output / "transcript.srt").read_text(encoding="utf-8") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,250\n"
+        f"{safe}\n"
+    )
+    assert (output / "transcript.vtt").read_text(encoding="utf-8") == (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:01.250\n"
+        f"{safe}\n"
+    )
+    payload = json.loads((output / "transcript.json").read_text(encoding="utf-8"))
+    assert payload["text"] == raw_text
+    assert payload["segments"][0]["text"] == raw_text
+    assert payload["segments"][0]["speaker"] == "A&B"
+
+
 def test_export_omits_subtitles_without_complete_timing(tmp_path: Path) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
@@ -318,6 +368,48 @@ def test_export_rejects_existing_output_before_starting_backend(
 
     with pytest.raises(TranscriptionWorkflowError, match="output directory already exists"):
         transcribe_and_export(source, output, MustNotRunBackend(_result()))
+
+
+def test_export_validates_parent_before_starting_backend(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    output = blocked_parent / "export"
+
+    class MustNotRunBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            pytest.fail("backend must not run when output parent is invalid")
+
+    with pytest.raises(OSError):
+        transcribe_and_export(source, output, MustNotRunBackend(_result()))
+
+
+def test_export_reservation_prevents_late_destination_clobber(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+
+    class InterferingBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            assert output.is_dir()
+            assert (output / INCOMPLETE_MARKER).is_file()
+            (output / "transcript.txt").write_text("foreign", encoding="utf-8")
+            return self.result
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="output directory changed during publication",
+    ):
+        transcribe_and_export(source, output, InterferingBackend(_result()))
+
+    assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
+    assert (output / INCOMPLETE_MARKER).is_file()
+    assert not (output / "manifest.json").exists()
 
 
 def test_export_fails_closed_if_source_changes_during_transcription(
