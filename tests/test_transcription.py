@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
-import shutil
 from typing import Any
 
 import pytest
@@ -110,6 +110,13 @@ class FakeBackend:
     def transcribe(self, source: Path) -> TranscriptionResult:
         assert source.is_file()
         return self.result
+
+
+def _assert_single_empty_staging_residue(tmp_path: Path) -> None:
+    residues = list(tmp_path.glob(".export.staging-*"))
+    assert len(residues) == 1
+    assert residues[0].is_dir()
+    assert list(residues[0].iterdir()) == []
 
 
 def test_route_contract_maps_nullable_segment_fields_without_invention() -> None:
@@ -562,7 +569,7 @@ def test_keyboard_interrupt_during_staging_creation_cleans_output(
         transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert not output.exists()
-    assert list(tmp_path.glob(".export.staging-*")) == []
+    _assert_single_empty_staging_residue(tmp_path)
 
 
 def test_keyboard_interrupt_during_backend_cleans_reserved_output(
@@ -583,7 +590,68 @@ def test_keyboard_interrupt_during_backend_cleans_reserved_output(
         transcribe_and_export(source, output, InterruptingBackend(_result()))
 
     assert not output.exists()
-    assert list(tmp_path.glob(".export.staging-*")) == []
+    _assert_single_empty_staging_residue(tmp_path)
+
+
+def test_atomic_noreplace_support_is_probed_before_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+
+    class MustNotRunBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            pytest.fail("backend must not run without atomic publication support")
+
+    monkeypatch.setattr(
+        transcription_module,
+        "_renameat2_noreplace",
+        lambda *args: errno.EOPNOTSUPP,
+    )
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="atomic no-replace publication is not supported",
+    ):
+        transcribe_and_export(source, output, MustNotRunBackend(_result()))
+
+    assert not output.exists()
+    _assert_single_empty_staging_residue(tmp_path)
+
+
+def test_cleanup_does_not_follow_replaced_staging_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    moved = tmp_path / "original-staging"
+
+    class ReplacingBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            assert source.is_file()
+            staging_dirs = list(tmp_path.glob(".export.staging-*"))
+            assert len(staging_dirs) == 1
+            staging_dir = staging_dirs[0]
+            staging_dir.rename(moved)
+            staging_dir.mkdir()
+            (staging_dir / "foreign.txt").write_text(
+                "foreign",
+                encoding="utf-8",
+            )
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        transcribe_and_export(source, output, ReplacingBackend(_result()))
+
+    assert not output.exists()
+    replacements = list(tmp_path.glob(".export.staging-*"))
+    assert len(replacements) == 1
+    assert (replacements[0] / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert moved.is_dir()
+    assert list(moved.iterdir()) == []
 
 
 def test_export_rejects_existing_output_before_starting_backend(
@@ -641,6 +709,7 @@ def test_export_reservation_prevents_late_destination_clobber(
 
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
     assert not (output / "manifest.json").exists()
+    _assert_single_empty_staging_residue(tmp_path)
 
 
 def test_failure_after_atomic_exposure_never_deletes_final_entries(
@@ -714,7 +783,7 @@ def test_keyboard_interrupt_before_atomic_publish_cleans_private_staging(
         transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert not output.exists()
-    assert list(tmp_path.glob(".export.staging-*")) == []
+    _assert_single_empty_staging_residue(tmp_path)
 
 
 def test_atomic_publish_refuses_public_path_replacement_race(
@@ -746,7 +815,7 @@ def test_atomic_publish_refuses_public_path_replacement_race(
     assert (output / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert not (output / "transcript.txt").exists()
     assert not (output / "manifest.json").exists()
-    assert list(tmp_path.glob(".export.staging-*")) == []
+    _assert_single_empty_staging_residue(tmp_path)
 
 
 def test_export_does_not_require_hardlink_support(

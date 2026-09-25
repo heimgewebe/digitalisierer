@@ -10,7 +10,6 @@ import math
 import os
 from pathlib import Path
 import secrets
-import shutil
 
 from .domain import ExportArtifact, TranscriptSegment, TranscriptionResult
 from .ports import TranscriptionBackend
@@ -192,16 +191,44 @@ def _directory_flags() -> int:
     )
 
 
+_STAGED_ARTIFACT_NAMES = frozenset(
+    {
+        "transcript.txt",
+        "transcript.json",
+        "transcript.srt",
+        "transcript.vtt",
+        "manifest.json",
+    }
+)
+
+
 def _cleanup_private_staging(
     staging_dir: Path,
+    directory_fd: int,
     directory_identity: FileIdentity,
 ) -> None:
+    """Remove only known files through the already bound staging directory.
+
+    The top-level staging pathname is never removed here. A same-user process
+    may replace that name after any identity check; recursive pathname cleanup
+    could then delete unrelated data. An empty private staging directory is a
+    safer failure residue than a destructive cleanup race.
+    """
+
     try:
+        if _identity_from_stat(os.fstat(directory_fd)) != directory_identity:
+            return
         if _path_identity(staging_dir) != directory_identity:
             return
+        names = set(os.listdir(directory_fd))
     except OSError:
         return
-    shutil.rmtree(staging_dir, ignore_errors=True)
+
+    for name in names & _STAGED_ARTIFACT_NAMES:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            pass
 
 
 def _prepare_staging_dir(final_dir: Path) -> tuple[Path, int, FileIdentity]:
@@ -219,9 +246,6 @@ def _prepare_staging_dir(final_dir: Path) -> tuple[Path, int, FileIdentity]:
             staging_dir.mkdir(mode=0o700)
         except FileExistsError:
             continue
-        except BaseException:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
 
         directory_fd: int | None = None
         directory_identity: FileIdentity | None = None
@@ -232,17 +256,20 @@ def _prepare_staging_dir(final_dir: Path) -> tuple[Path, int, FileIdentity]:
                 raise TranscriptionWorkflowError(
                     "staging directory changed during reservation"
                 )
+            _probe_atomic_noreplace(directory_fd)
             return staging_dir, directory_fd, directory_identity
         except BaseException:
+            if directory_fd is not None and directory_identity is not None:
+                _cleanup_private_staging(
+                    staging_dir,
+                    directory_fd,
+                    directory_identity,
+                )
             if directory_fd is not None:
                 try:
                     os.close(directory_fd)
                 except OSError:
                     pass
-            if directory_identity is None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            else:
-                _cleanup_private_staging(staging_dir, directory_identity)
             raise
 
     raise TranscriptionWorkflowError(
@@ -316,18 +343,16 @@ _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    if source.parent != destination.parent:
-        raise TranscriptionWorkflowError(
-            "staging and output directories must share one parent"
-        )
-
+def _renameat2_noreplace(
+    source_dir_fd: int,
+    source_name: bytes,
+    destination_dir_fd: int,
+    destination_name: bytes,
+) -> int:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
-        raise TranscriptionWorkflowError(
-            "atomic no-replace publication is not supported on this host"
-        )
+        return errno.ENOSYS
 
     renameat2.argtypes = [
         ctypes.c_int,
@@ -337,17 +362,96 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         ctypes.c_uint,
     ]
     renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
     result = renameat2(
+        source_dir_fd,
+        source_name,
+        destination_dir_fd,
+        destination_name,
+        _RENAME_NOREPLACE,
+    )
+    return 0 if result == 0 else ctypes.get_errno()
+
+
+def _unsupported_atomic_rename(error_number: int) -> bool:
+    return error_number in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}
+
+
+def _probe_atomic_noreplace(directory_fd: int) -> None:
+    """Prove no-replace directory rename support before invoking ASR."""
+
+    token = secrets.token_hex(8)
+    conflict_source = f".rename-probe-source-{token}"
+    conflict_destination = f".rename-probe-destination-{token}"
+    success_source = f".rename-probe-move-source-{token}"
+    success_destination = f".rename-probe-move-destination-{token}"
+    probe_names = (
+        conflict_source,
+        conflict_destination,
+        success_source,
+        success_destination,
+    )
+
+    try:
+        for name in (conflict_source, conflict_destination, success_source):
+            os.mkdir(name, mode=0o700, dir_fd=directory_fd)
+
+        conflict_error = _renameat2_noreplace(
+            directory_fd,
+            os.fsencode(conflict_source),
+            directory_fd,
+            os.fsencode(conflict_destination),
+        )
+        if conflict_error not in {errno.EEXIST, errno.ENOTEMPTY}:
+            if conflict_error == 0 or _unsupported_atomic_rename(conflict_error):
+                raise TranscriptionWorkflowError(
+                    "atomic no-replace publication is not supported on this "
+                    "host/filesystem"
+                )
+            raise TranscriptionWorkflowError(
+                "unable to validate atomic no-replace publication: "
+                f"{os.strerror(conflict_error)}"
+            )
+
+        success_error = _renameat2_noreplace(
+            directory_fd,
+            os.fsencode(success_source),
+            directory_fd,
+            os.fsencode(success_destination),
+        )
+        if success_error != 0:
+            if _unsupported_atomic_rename(success_error):
+                raise TranscriptionWorkflowError(
+                    "atomic no-replace publication is not supported on this "
+                    "host/filesystem"
+                )
+            raise TranscriptionWorkflowError(
+                "unable to validate atomic no-replace publication: "
+                f"{os.strerror(success_error)}"
+            )
+    finally:
+        for name in probe_names:
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    if source.parent != destination.parent:
+        raise TranscriptionWorkflowError(
+            "staging and output directories must share one parent"
+        )
+
+    error_number = _renameat2_noreplace(
         _AT_FDCWD,
         os.fsencode(source),
         _AT_FDCWD,
         os.fsencode(destination),
-        _RENAME_NOREPLACE,
     )
-    if result == 0:
+    if error_number == 0:
         return
 
-    error_number = ctypes.get_errno()
     cause = OSError(error_number, os.strerror(error_number))
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise TranscriptionWorkflowError(
@@ -357,9 +461,9 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         raise TranscriptionWorkflowError(
             "staging and output directories must be on the same filesystem"
         ) from cause
-    if error_number in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+    if _unsupported_atomic_rename(error_number):
         raise TranscriptionWorkflowError(
-            "atomic no-replace publication is not supported on this host"
+            "atomic no-replace publication is not supported on this host/filesystem"
         ) from cause
     raise TranscriptionWorkflowError(
         f"unable to publish output directory atomically: {os.strerror(error_number)}"
@@ -552,7 +656,11 @@ def transcribe_and_export(
         # Before the atomic rename, cleanup is limited to the bound private
         # staging instance. After exposure, staging_dir no longer names it, so
         # failures leave final_dir untouched for inspection.
-        _cleanup_private_staging(staging_dir, staging_identity)
+        _cleanup_private_staging(
+            staging_dir,
+            staging_fd,
+            staging_identity,
+        )
         raise
     finally:
         try:
