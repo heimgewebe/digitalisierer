@@ -5,9 +5,17 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import TypedDict
 
 from . import __version__
+from .heim_pc_asr import AsrAdapterError, HeimPcAsrBackend
+from .ports import TranscriptionBackend
+from .transcription import (
+    TranscriptionWorkflowError,
+    default_output_dir,
+    transcribe_and_export,
+)
 
 
 CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
@@ -39,6 +47,24 @@ def _czur_app_path() -> Path:
     return Path.home() / ".local/opt/czur-scanner/CzurScanner"
 
 
+def _transcription_backend() -> TranscriptionBackend:
+    return HeimPcAsrBackend()
+
+
+def _transcription_capability() -> CapabilityStatus:
+    status = HeimPcAsrBackend().status()
+    return {
+        "ready": status.ready,
+        "checks": {
+            "heim-pc-asr": {
+                "found": status.ready,
+                "path": status.entrypoint,
+            }
+        },
+        "detail": status.detail,
+    }
+
+
 def _capabilities() -> dict[str, CapabilityStatus]:
     capabilities: dict[str, CapabilityStatus] = {}
 
@@ -60,11 +86,7 @@ def _capabilities() -> dict[str, CapabilityStatus]:
             "detail": detail,
         }
 
-    capabilities["transcription"] = {
-        "ready": False,
-        "checks": {},
-        "detail": "Transcription adapter is not integrated yet.",
-    }
+    capabilities["transcription"] = _transcription_capability()
     return capabilities
 
 
@@ -105,6 +127,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    transcribe_parser = sub.add_parser(
+        "transcribe",
+        help="transcribe one local media file through the canonical heim-pc ASR authority",
+    )
+    transcribe_parser.add_argument("source", type=Path)
+    transcribe_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="output directory; default: <source>.digitalisierer-transcript",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "doctor":
         required = (
@@ -113,4 +146,38 @@ def main(argv: list[str] | None = None) -> int:
             else DEFAULT_REQUIRED_CAPABILITIES
         )
         return doctor(required)
+    if args.command == "transcribe":
+        source = args.source.expanduser()
+        output_dir = (
+            args.output_dir.expanduser()
+            if args.output_dir is not None
+            else default_output_dir(source)
+        )
+        try:
+            exported = transcribe_and_export(
+                source,
+                output_dir,
+                _transcription_backend(),
+            )
+        except (AsrAdapterError, TranscriptionWorkflowError, OSError) as exc:
+            print(f"transcription failed: {exc}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "output_dir": str(exported.output_dir),
+                    "artifacts": [
+                        {
+                            "kind": artifact.kind,
+                            "path": str(artifact.path),
+                            "sha256": artifact.sha256,
+                        }
+                        for artifact in exported.artifacts
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
     return 2

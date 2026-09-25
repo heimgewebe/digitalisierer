@@ -197,7 +197,7 @@ First adapter: OCRmyPDF/Tesseract.
 
 ### TranscriptionBackend
 
-Speech-to-text engine. The implementation remains pluggable so an existing local ASR authority or another backend can be selected without changing the domain.
+Speech-to-text capability. The first adapter is `HeimPcAsrBackend`, which consumes the installed `audio.transcribe` locator for the external `heim_pc_asr_open_engine` authority. The adapter does not pin an ASR engine or authorize cloud use; it validates the returned `heim-pc.asr-transcript` contract and maps only supplied metadata into the domain. Engine/model/runtime policy and caches remain owned by the Heim-PC authority. See ADR 0007.
 
 ### MediaProbeBackend
 
