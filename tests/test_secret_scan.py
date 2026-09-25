@@ -99,6 +99,20 @@ def test_unquoted_literal_with_mixed_alphanumeric_content_is_detected() -> None:
     ]
 
 
+def test_unquoted_digit_leading_literal_is_detected() -> None:
+    key_name = "api_" + "key"
+    values = [
+        "1234567890abcdef",
+        "7f3a9b2c1d4e5f60a1b2",
+        "9" + ("a" * 39),
+    ]
+
+    for value in values:
+        assert secret_scan.find_matches(key_name + "=" + value) == [
+            ("credential-assignment", 1)
+        ]
+
+
 def test_openai_rule_does_not_match_ordinary_sk_kebab_identifier() -> None:
     ordinary = "sk-normalization-profile-default"
     realish = "sk-" + "proj-" + ("A" * 32)

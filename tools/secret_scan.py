@@ -140,6 +140,10 @@ def _credential_value_is_likely_literal(value: str) -> bool:
     # literal credentials merely because the target name is sensitive.
     if any(char in normalized for char in "()[]{}"):
         return False
+    if normalized[0].isdigit():
+        # A digit-leading token cannot be a Python/shell identifier reference.
+        # In a sensitive assignment, treat it as a literal credential candidate.
+        return True
     if _DOTTED_IDENTIFIER.fullmatch(normalized) is not None:
         if "." in normalized or "_" in normalized:
             return False
