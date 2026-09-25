@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from digitalisierer import cli
+from digitalisierer import cli, transcription as transcription_module
 from digitalisierer.domain import Transcript, TranscriptSegment, TranscriptionResult
 from digitalisierer.heim_pc_asr import (
     ASR_AUTHORITY,
@@ -339,6 +339,40 @@ def test_subtitle_export_escapes_markup_and_collapses_line_breaks(
     assert payload["segments"][0]["speaker"] == "A&B"
 
 
+def test_subtitle_export_rejects_timestamp_outside_supported_range(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    result = TranscriptionResult(
+        transcript=Transcript(
+            text="Hallo Welt",
+            language="de",
+            segments=(
+                TranscriptSegment(
+                    "Hallo Welt",
+                    start=0.0,
+                    end=1e308,
+                ),
+            ),
+        ),
+        provider="local",
+        engine="faster-whisper",
+        model="Systran/faster-whisper-large-v3",
+        backend_version="1.2.1",
+        cloud_used=False,
+    )
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="subtitle timestamp exceeds the supported range",
+    ):
+        transcribe_and_export(source, output, FakeBackend(result))
+
+    assert not output.exists()
+
+
 def test_export_omits_subtitles_without_complete_timing(tmp_path: Path) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
@@ -410,6 +444,36 @@ def test_export_reservation_prevents_late_destination_clobber(
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
     assert (output / INCOMPLETE_MARKER).is_file()
     assert not (output / "manifest.json").exists()
+
+
+def test_export_fails_if_source_changes_during_initial_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"before")
+    output = tmp_path / "export"
+    original_hash = transcription_module._sha256_file
+    mutated = False
+
+    def mutating_hash(path: Path) -> str:
+        nonlocal mutated
+        if path == source.resolve() and not mutated:
+            mutated = True
+            path.write_bytes(b"after-and-larger")
+        return original_hash(path)
+
+    class MustNotRunBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            pytest.fail("backend must not run when the initial source hash is unstable")
+
+    monkeypatch.setattr(transcription_module, "_sha256_file", mutating_hash)
+
+    with pytest.raises(TranscriptionWorkflowError, match="changed while hashing"):
+        transcribe_and_export(source, output, MustNotRunBackend(_result()))
+
+    assert mutated is True
+    assert not output.exists()
 
 
 def test_export_fails_closed_if_source_changes_during_transcription(

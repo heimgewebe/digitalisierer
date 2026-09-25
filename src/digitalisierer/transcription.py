@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import hashlib
 import html
 import json
+import math
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -38,6 +40,26 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+
+
+def _stable_source_hash(path: Path) -> tuple[str, os.stat_result]:
+    before = path.stat()
+    digest = _sha256_file(path)
+    after = path.stat()
+    if _stat_identity(before) != _stat_identity(after):
+        raise TranscriptionWorkflowError(
+            "transcription source changed while hashing"
+        )
+    return digest, after
+
+
 def _json_text(payload: object) -> str:
     return json.dumps(
         payload,
@@ -66,7 +88,17 @@ def _all_segments_timed(result: TranscriptionResult) -> bool:
 
 
 def _timestamp(seconds: float, *, separator: str) -> str:
-    total_ms = max(0, round(seconds * 1000))
+    scaled_ms = seconds * 1000.0
+    if not math.isfinite(scaled_ms):
+        raise TranscriptionWorkflowError(
+            "subtitle timestamp exceeds the supported range"
+        )
+    try:
+        total_ms = max(0, round(scaled_ms))
+    except (OverflowError, ValueError) as exc:
+        raise TranscriptionWorkflowError(
+            "subtitle timestamp exceeds the supported range"
+        ) from exc
     hours, remainder = divmod(total_ms, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     secs, millis = divmod(remainder, 1000)
@@ -282,13 +314,17 @@ def transcribe_and_export(
     artifacts: list[ExportArtifact] = []
 
     try:
-        source_stat = source_path.stat()
-        source_sha256 = _sha256_file(source_path)
+        source_sha256, source_stat = _stable_source_hash(source_path)
         result = backend.transcribe(source_path)
-        if _sha256_file(source_path) != source_sha256:
+        verified_sha256, verified_stat = _stable_source_hash(source_path)
+        if (
+            verified_sha256 != source_sha256
+            or _stat_identity(verified_stat) != _stat_identity(source_stat)
+        ):
             raise TranscriptionWorkflowError(
                 "transcription source changed while the backend was running"
             )
+        source_stat = verified_stat
         if result.cloud_used:
             raise TranscriptionWorkflowError(
                 "transcription backend used cloud without Digitalisierer authorization"
