@@ -138,6 +138,49 @@ def test_route_contract_accepts_no_segments() -> None:
     assert result.transcript.segments == ()
 
 
+def test_route_contract_ignores_undeclared_confidence_field() -> None:
+    result = parse_route_result(
+        _route_payload(
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": None,
+                    "text": "Hallo Welt.",
+                    "confidence": 0.99,
+                }
+            ]
+        )
+    )
+
+    assert result.transcript.segments[0].confidence is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start", float("nan")),
+        ("start", float("inf")),
+        ("end", float("-inf")),
+        ("start", 10**1000),
+    ],
+)
+def test_route_contract_rejects_non_finite_or_overflowing_timestamps(
+    field: str,
+    value: object,
+) -> None:
+    segment: dict[str, object] = {
+        "start": 0.0,
+        "end": 1.0,
+        "speaker": None,
+        "text": "Hallo Welt.",
+    }
+    segment[field] = value
+
+    with pytest.raises(AsrAdapterError, match="finite number or null"):
+        parse_route_result(_route_payload(segments=[segment]))
+
+
 def test_route_contract_rejects_cloud_use() -> None:
     with pytest.raises(AsrAdapterError, match="did not authorize cloud"):
         parse_route_result(_route_payload(cloud_used=True))
@@ -259,6 +302,22 @@ def test_export_omits_subtitles_without_complete_timing(tmp_path: Path) -> None:
     assert not (output / "transcript.vtt").exists()
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["subtitles_written"] is False
+
+
+def test_export_rejects_existing_output_before_starting_backend(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    output.mkdir()
+
+    class MustNotRunBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            pytest.fail("backend must not run when output directory already exists")
+
+    with pytest.raises(TranscriptionWorkflowError, match="output directory already exists"):
+        transcribe_and_export(source, output, MustNotRunBackend(_result()))
 
 
 def test_export_fails_closed_if_source_changes_during_transcription(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from pathlib import Path
 
 
@@ -86,19 +87,28 @@ class TranscriptSegment:
     confidence: float | None = None
 
     def __post_init__(self) -> None:
-        if self.start is not None and self.start < 0:
-            raise ValueError("transcript segment start must be non-negative")
-        if self.end is not None and self.end < 0:
-            raise ValueError("transcript segment end must be non-negative")
+        if self.start is not None and (
+            isinstance(self.start, bool)
+            or not math.isfinite(self.start)
+            or self.start < 0
+        ):
+            raise ValueError("transcript segment start must be a finite non-negative number")
+        if self.end is not None and (
+            isinstance(self.end, bool)
+            or not math.isfinite(self.end)
+            or self.end < 0
+        ):
+            raise ValueError("transcript segment end must be a finite non-negative number")
         if self.start is not None and self.end is not None and self.end < self.start:
             raise ValueError("transcript segment end must not precede start")
         if self.speaker is not None and not self.speaker.strip():
             raise ValueError("transcript segment speaker must not be empty")
         if self.confidence is not None and (
             isinstance(self.confidence, bool)
+            or not math.isfinite(self.confidence)
             or not 0.0 <= self.confidence <= 1.0
         ):
-            raise ValueError("transcript segment confidence must be between 0 and 1")
+            raise ValueError("transcript segment confidence must be finite and between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)

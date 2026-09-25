@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -125,7 +126,13 @@ def _timestamp(value: object, *, field: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AsrAdapterError(f"{field} must be numeric or null")
-    return float(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise AsrAdapterError(f"{field} must be a finite number or null") from exc
+    if not math.isfinite(numeric):
+        raise AsrAdapterError(f"{field} must be a finite number or null")
+    return numeric
 
 
 def _parse_transcript(payload: object) -> TranscriptionResult:

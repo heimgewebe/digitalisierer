@@ -152,6 +152,10 @@ def transcribe_and_export(
     if not source_path.is_file():
         raise TranscriptionWorkflowError("transcription source must be a regular file")
 
+    final_dir = output_dir.expanduser().absolute()
+    if final_dir.exists():
+        raise TranscriptionWorkflowError(f"output directory already exists: {final_dir}")
+
     source_stat = source_path.stat()
     source_sha256 = _sha256_file(source_path)
     result = backend.transcribe(source_path)
@@ -164,9 +168,10 @@ def transcribe_and_export(
             "transcription backend used cloud without Digitalisierer authorization"
         )
 
-    final_dir = output_dir.expanduser().absolute()
     if final_dir.exists():
-        raise TranscriptionWorkflowError(f"output directory already exists: {final_dir}")
+        raise TranscriptionWorkflowError(
+            f"output directory appeared while transcription was running: {final_dir}"
+        )
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
         tempfile.mkdtemp(prefix=f".{final_dir.name}.", dir=final_dir.parent)
