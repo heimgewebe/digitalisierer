@@ -5,7 +5,8 @@ Digitalisierer is early-stage. Architectural clarity is more valuable than featu
 ## Development
 
 ```bash
-python -m pip install -e . pytest
+python -m pip install -e ".[dev]"
+python -m mypy src
 pytest -q
 PYTHONPATH=src python -m digitalisierer doctor
 ```
@@ -18,6 +19,7 @@ A change should preserve these invariants:
 
 - source assets are not silently mutated or deleted;
 - review state is separate from source identity;
+- replacement relationships remain valid and export order follows reviewed sequence;
 - vendor/engine-specific behavior stays behind adapters;
 - network use is explicit;
 - derived outputs are intended to be traceable to inputs and parameters.

@@ -56,10 +56,12 @@ It is not intended to become a general DMS, media player, note system, library c
 
 1. **Source identity and review state are separate.** Excluding a page from an export does not mutate the source asset.
 2. **Sources are immutable by default.** Corrections create metadata, replacement associations or derived assets.
-3. **Every derived artifact should be explainable.** Inputs, parameters, engine/version and output hashes belong in provenance.
-4. **No hidden cloud requirement.** Local execution is the default; remote engines must be explicit adapters.
-5. **Vendor-specific behavior stays at the edge.** CZUR, Tesseract, Whisper, ffmpeg or another engine must not shape the core domain.
-6. **Automation may flag; it must not silently destroy.** Blank/duplicate/low-quality detection produces findings, not deletions.
+3. **Review order is export order.** Export-facing asset access uses the reviewed sequence rather than insertion order.
+4. **Replacement state is validated.** Asset ids are unique inside a session and an included replacement cannot coexist with its included original.
+5. **Every derived artifact should be explainable.** Inputs, parameters, engine/version and output hashes belong in provenance.
+6. **No hidden cloud requirement.** Local execution is the default; remote engines must be explicit adapters.
+7. **Vendor-specific behavior stays at the edge.** CZUR, Tesseract, Whisper, ffmpeg or another engine must not shape the core domain.
+8. **Automation may flag; it must not silently destroy.** Blank/duplicate/low-quality detection produces findings, not deletions.
 
 ## Architecture sketch
 
@@ -76,11 +78,13 @@ Capability jobs
    |-- export
    |
 Ports / adapters
-   |-- CaptureBackend        -> CZUR first
-   |-- OCRBackend            -> OCRmyPDF / Tesseract
-   |-- TranscriptionBackend  -> pluggable
-   |-- MediaProbeBackend     -> ffprobe
-   |-- Storage               -> local filesystem
+   |-- CaptureBackend          -> CZUR first
+   |-- OCRBackend              -> OCRmyPDF / Tesseract
+   |-- TranscriptionBackend    -> pluggable
+   |-- MediaProbeBackend       -> ffprobe
+   |-- AssetQualityAnalyzer    -> per-asset checks
+   |-- SessionQualityAnalyzer  -> duplicate/order/gap checks
+   |-- Storage                 -> local filesystem
    |
 Provenance
    input hashes + parameters + engine identity + output hashes
@@ -123,7 +127,7 @@ See:
 
 ## Security and privacy
 
-Do not commit source scans, recordings, transcripts, secrets, credentials or private datasets. Local digitization data is ignored by default. See [SECURITY.md](SECURITY.md).
+Do not commit source scans, recordings, transcripts, secrets, credentials or private datasets. Local digitization data is ignored by default. The CI secret scan also fails closed when a tracked file is too large or not UTF-8, because an unscannable tracked payload must not be reported as clean. See [SECURITY.md](SECURITY.md).
 
 ## License
 

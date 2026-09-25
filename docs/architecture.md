@@ -24,6 +24,10 @@ A `SessionAsset` associates an asset with a processing session and may carry:
 - inclusion/exclusion;
 - replacement relationship.
 
+`replacement_for` names another `MediaAsset.asset_id` in the same session. Asset ids are unique within a session. An included replacement requires the replaced item to be excluded, and only one included replacement may target a given asset.
+
+Export-facing access uses `ordered_items()` / `ordered_assets()`, so manual review order is not lost when assets are finalized.
+
 This separation matters because the same source may participate in different exports without changing source identity.
 
 ### Project and session
@@ -103,6 +107,8 @@ Generate explicit findings. Examples:
 - silence/noise/clipping;
 - missing or duplicated segments.
 
+Per-asset checks use `AssetQualityAnalyzer`. Cross-asset checks such as duplicates, sequence gaps, suspicious relative dimensions, or missing segments use `SessionQualityAnalyzer` so the analyzer can inspect the complete reviewed session context.
+
 A finding is evidence for review, not permission to destroy source data.
 
 ### Review
@@ -177,7 +183,7 @@ First adapter: OCRmyPDF/Tesseract.
 
 ### TranscriptionBackend
 
-Speech-to-text engine. The implementation remains pluggable so a local Whisper-family engine or another backend can be selected later.
+Speech-to-text engine. The implementation remains pluggable so an existing local ASR authority or another backend can be selected without changing the domain.
 
 ### MediaProbeBackend
 
@@ -185,9 +191,13 @@ Technical metadata and stream inspection.
 
 First adapter: ffprobe.
 
-### QualityAnalyzer
+### AssetQualityAnalyzer
 
-Capability-specific quality inspection that returns explicit findings.
+Per-asset quality inspection that returns explicit findings.
+
+### SessionQualityAnalyzer
+
+Cross-asset/session quality inspection for comparisons, ordering/gap checks, and other findings that require context beyond one isolated asset.
 
 ### Storage
 

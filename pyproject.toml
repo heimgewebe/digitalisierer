@@ -10,6 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["digitization", "ocr", "transcription", "scanner", "local-first"]
 
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13,<2",
+  "pytest>=8,<10",
+]
+
 [project.scripts]
 digitalisierer = "digitalisierer.cli:main"
 
@@ -24,3 +30,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src"]

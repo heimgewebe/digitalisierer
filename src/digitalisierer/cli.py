@@ -2,43 +2,57 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
+from typing import TypedDict
 
 from . import __version__
 
 
-CAPABILITY_TOOLS = {
+CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
     "media": ("ffmpeg", "ffprobe"),
     "ocr": ("ocrmypdf", "tesseract"),
     "capture-czur": ("xdotool", "v4l2-ctl"),
 }
-CZUR_APP = Path.home() / ".local/opt/czur-scanner/CzurScanner"
 
 
-def _which(name: str) -> dict[str, object]:
+class ToolCheck(TypedDict):
+    found: bool
+    path: str | None
+
+
+class CapabilityStatus(TypedDict):
+    ready: bool
+    checks: dict[str, ToolCheck]
+
+
+def _which(name: str) -> ToolCheck:
     path = shutil.which(name)
-    return {"found": bool(path), "path": path}
+    return {"found": path is not None, "path": path}
+
+
+def _czur_app_path() -> Path:
+    return Path.home() / ".local/opt/czur-scanner/CzurScanner"
 
 
 def doctor() -> int:
-    capabilities: dict[str, dict[str, object]] = {}
+    capabilities: dict[str, CapabilityStatus] = {}
 
     for capability, tools in CAPABILITY_TOOLS.items():
-        checks = {name: _which(name) for name in tools}
+        checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
+
+        if capability == "capture-czur":
+            app_path = _czur_app_path()
+            checks["czur-app"] = {
+                "found": app_path.is_file() and os.access(app_path, os.X_OK),
+                "path": str(app_path),
+            }
+
         capabilities[capability] = {
             "ready": all(item["found"] for item in checks.values()),
             "checks": checks,
         }
-
-    czur = capabilities["capture-czur"]
-    czur_checks = dict(czur["checks"])
-    czur_checks["czur-app"] = {
-        "found": CZUR_APP.is_file(),
-        "path": str(CZUR_APP),
-    }
-    czur["checks"] = czur_checks
-    czur["ready"] = all(item["found"] for item in czur_checks.values())
 
     result = {
         "digitalisierer": __version__,
