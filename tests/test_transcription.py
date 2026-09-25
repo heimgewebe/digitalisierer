@@ -257,6 +257,79 @@ def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
     assert "--escalate-to-cloud" not in captured
 
 
+def test_backend_error_includes_sanitized_stderr_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _operator_entry(
+        tmp_path / "operator-entry.json",
+        entrypoint=str(tmp_path / "asr_engine.py"),
+    )
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+
+    def fake_run(
+        argv: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(
+            argv,
+            7,
+            stdout="",
+            stderr="backend failed\n  model cache unavailable  ",
+        )
+
+    monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
+
+    with pytest.raises(
+        AsrAdapterError,
+        match="status 7: backend failed model cache unavailable",
+    ):
+        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
+
+
+def test_backend_status_preserves_locator_error_detail(tmp_path: Path) -> None:
+    unsafe = _operator_entry(
+        tmp_path / "operator-entry-unsafe.json",
+        cloud_authorized=True,
+    )
+
+    status = HeimPcAsrBackend(unsafe).status()
+
+    assert status.ready is False
+    assert "must not authorize cloud" in status.detail
+
+
+def test_backend_status_includes_doctor_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _operator_entry(
+        tmp_path / "operator-entry.json",
+        entrypoint=str(tmp_path / "asr_engine.py"),
+    )
+
+    def fake_run(
+        argv: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(
+            argv,
+            3,
+            stdout="",
+            stderr="runtime incomplete\n model missing",
+        )
+
+    monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
+
+    status = HeimPcAsrBackend(contract, timeout_seconds=10).status()
+
+    assert status.ready is False
+    assert status.detail == "heim-pc ASR doctor exited with status 3: runtime incomplete model missing"
+
+
 def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")

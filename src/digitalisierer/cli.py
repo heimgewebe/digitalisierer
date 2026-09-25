@@ -33,7 +33,7 @@ class ToolCheck(TypedDict):
 
 
 class CapabilityStatus(TypedDict):
-    ready: bool
+    ready: bool | None
     checks: dict[str, ToolCheck]
     detail: str
 
@@ -65,7 +65,7 @@ def _transcription_capability() -> CapabilityStatus:
     }
 
 
-def _capabilities() -> dict[str, CapabilityStatus]:
+def _capabilities(required: tuple[str, ...]) -> dict[str, CapabilityStatus]:
     capabilities: dict[str, CapabilityStatus] = {}
 
     for capability, tools in CAPABILITY_TOOLS.items():
@@ -86,17 +86,25 @@ def _capabilities() -> dict[str, CapabilityStatus]:
             "detail": detail,
         }
 
-    capabilities["transcription"] = _transcription_capability()
+    capabilities["transcription"] = (
+        _transcription_capability()
+        if "transcription" in required
+        else {
+            "ready": None,
+            "checks": {},
+            "detail": "not checked; use --require transcription for a live ASR readiness probe",
+        }
+    )
     return capabilities
 
 
 def doctor(required: tuple[str, ...] = DEFAULT_REQUIRED_CAPABILITIES) -> int:
-    capabilities = _capabilities()
-    unknown = sorted(set(required).difference(capabilities))
+    unknown = sorted(set(required).difference(CAPABILITY_NAMES))
     if unknown:
         raise ValueError(f"unknown required capabilities: {', '.join(unknown)}")
+    capabilities = _capabilities(required)
 
-    ready = all(capabilities[name]["ready"] for name in required)
+    ready = all(capabilities[name]["ready"] is True for name in required)
     result = {
         "digitalisierer": __version__,
         "ready": ready,

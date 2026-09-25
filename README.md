@@ -111,7 +111,7 @@ digitalisierer doctor --require capture-czur
 digitalisierer doctor --require transcription
 ```
 
-The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities.
+The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities. Expensive optional probes are lazy: transcription reports `ready: null` unless it is explicitly required, so the default doctor does not invoke the Heim-PC ASR runtime.
 
 Transcribe one local media file through the canonical local ASR authority:
 

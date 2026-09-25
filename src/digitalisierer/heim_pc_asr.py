@@ -63,6 +63,13 @@ def _optional_string(value: object, *, field: str) -> str | None:
     return _string(value, field=field)
 
 
+def _diagnostic_tail(value: str, *, limit: int = 500) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return "…" + normalized[-limit:]
+
+
 def _expand_home(value: str, home: Path) -> str:
     expanded = value.replace("${HOME}", str(home))
     if "${" in expanded:
@@ -266,18 +273,28 @@ class HeimPcAsrBackend:
                 text=True,
                 timeout=min(self._timeout_seconds, 120),
             )
-        except (AsrAdapterError, OSError, subprocess.TimeoutExpired):
+        except AsrAdapterError as exc:
+            return AsrBackendStatus(
+                ready=False,
+                detail=f"heim-pc ASR authority is not ready: {exc}",
+                entrypoint=None,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             return AsrBackendStatus(
                 ready=False,
                 detail="heim-pc ASR authority is not ready",
                 entrypoint=None,
             )
+        detail = _diagnostic_tail(completed.stderr)
         return AsrBackendStatus(
             ready=completed.returncode == 0,
             detail=(
                 "heim-pc audio.transcribe authority ready"
                 if completed.returncode == 0
-                else "heim-pc ASR doctor reported an incomplete runtime"
+                else (
+                    f"heim-pc ASR doctor exited with status {completed.returncode}"
+                    + (f": {detail}" if detail else "")
+                )
             ),
             entrypoint=locator.argv_prefix[-1],
         )
@@ -304,8 +321,10 @@ class HeimPcAsrBackend:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AsrAdapterError("heim-pc ASR invocation failed") from exc
         if completed.returncode != 0:
+            detail = _diagnostic_tail(completed.stderr)
             raise AsrAdapterError(
                 f"heim-pc ASR exited with status {completed.returncode}"
+                + (f": {detail}" if detail else "")
             )
         try:
             payload: object = json.loads(completed.stdout)

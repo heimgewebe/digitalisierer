@@ -10,6 +10,10 @@ def _all_tools_present(name: str) -> cli.ToolCheck:
     return {"found": True, "path": f"/tools/{name}"}
 
 
+def _unexpected_transcription_capability() -> cli.CapabilityStatus:
+    pytest.fail("transcription must not be probed unless it is required")
+
+
 def _transcription_status(ready: bool) -> cli.CapabilityStatus:
     return {
         "ready": ready,
@@ -38,7 +42,7 @@ def test_doctor_reports_uniform_capability_json(
 
     monkeypatch.setattr(cli, "_which", _all_tools_present)
     monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
-    monkeypatch.setattr(cli, "_transcription_capability", lambda: _transcription_status(True))
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -52,10 +56,10 @@ def test_doctor_reports_uniform_capability_json(
         "found": True,
         "path": str(app),
     }
-    assert set(payload["capabilities"]["transcription"]) == {
-        "ready",
-        "checks",
-        "detail",
+    assert payload["capabilities"]["transcription"] == {
+        "ready": None,
+        "checks": {},
+        "detail": "not checked; use --require transcription for a live ASR readiness probe",
     }
 
 
@@ -70,7 +74,7 @@ def test_doctor_can_require_executable_czur_app(
 
     monkeypatch.setattr(cli, "_which", _all_tools_present)
     monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
-    monkeypatch.setattr(cli, "_transcription_capability", lambda: _transcription_status(True))
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor", "--require", "capture-czur"]) == 1
     payload = json.loads(capsys.readouterr().out)
@@ -100,7 +104,7 @@ def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
 
     monkeypatch.setattr(cli, "_which", missing_tesseract)
     monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
-    monkeypatch.setattr(cli, "_transcription_capability", lambda: _transcription_status(True))
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 1
     payload = json.loads(capsys.readouterr().out)
