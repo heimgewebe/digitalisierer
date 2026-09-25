@@ -623,28 +623,31 @@ def test_atomic_noreplace_support_is_probed_before_backend(
 
 def test_cleanup_does_not_follow_replaced_staging_path(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
     moved = tmp_path / "original-staging"
 
-    class ReplacingBackend(FakeBackend):
-        def transcribe(self, source: Path) -> TranscriptionResult:
-            assert source.is_file()
-            staging_dirs = list(tmp_path.glob(".export.staging-*"))
-            assert len(staging_dirs) == 1
-            staging_dir = staging_dirs[0]
-            staging_dir.rename(moved)
-            staging_dir.mkdir()
-            (staging_dir / "foreign.txt").write_text(
-                "foreign",
-                encoding="utf-8",
-            )
-            raise KeyboardInterrupt
+    def replacing_rename(staging_dir: Path, destination: Path) -> None:
+        del destination
+        staging_dir.rename(moved)
+        staging_dir.mkdir()
+        (staging_dir / "foreign.txt").write_text(
+            "foreign",
+            encoding="utf-8",
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        transcription_module,
+        "_rename_noreplace",
+        replacing_rename,
+    )
 
     with pytest.raises(KeyboardInterrupt):
-        transcribe_and_export(source, output, ReplacingBackend(_result()))
+        transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert not output.exists()
     replacements = list(tmp_path.glob(".export.staging-*"))
@@ -748,6 +751,40 @@ def test_failure_after_atomic_exposure_never_deletes_final_entries(
         TranscriptionWorkflowError,
         match="output directory changed during publication",
     ):
+        transcribe_and_export(source, output, FakeBackend(_result()))
+
+    assert {entry.name for entry in output.iterdir()} == {
+        "transcript.txt",
+        "transcript.json",
+        "transcript.srt",
+        "transcript.vtt",
+        "manifest.json",
+    }
+    assert (output / "transcript.txt").read_text(encoding="utf-8") == "Hallo Welt\n"
+    assert list(tmp_path.glob(".export.staging-*")) == []
+
+
+def test_keyboard_interrupt_immediately_after_atomic_exposure_is_non_destructive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    original_publish = transcription_module._publish_staged_artifacts
+
+    def interrupt_after_publish(*args: Any, **kwargs: Any) -> None:
+        original_publish(*args, **kwargs)
+        assert output.is_dir()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        transcription_module,
+        "_publish_staged_artifacts",
+        interrupt_after_publish,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
         transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert {entry.name for entry in output.iterdir()} == {

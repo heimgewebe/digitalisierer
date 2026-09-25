@@ -203,22 +203,18 @@ _STAGED_ARTIFACT_NAMES = frozenset(
 
 
 def _cleanup_private_staging(
-    staging_dir: Path,
     directory_fd: int,
     directory_identity: FileIdentity,
 ) -> None:
     """Remove only known files through the already bound staging directory.
 
-    The top-level staging pathname is never removed here. A same-user process
-    may replace that name after any identity check; recursive pathname cleanup
-    could then delete unrelated data. An empty private staging directory is a
-    safer failure residue than a destructive cleanup race.
+    The top-level staging pathname is never resolved or removed here. A
+    same-user process may replace that name at any time; all destructive
+    cleanup therefore stays relative to the verified directory descriptor.
     """
 
     try:
         if _identity_from_stat(os.fstat(directory_fd)) != directory_identity:
-            return
-        if _path_identity(staging_dir) != directory_identity:
             return
         names = set(os.listdir(directory_fd))
     except OSError:
@@ -261,7 +257,6 @@ def _prepare_staging_dir(final_dir: Path) -> tuple[Path, int, FileIdentity]:
         except BaseException:
             if directory_fd is not None and directory_identity is not None:
                 _cleanup_private_staging(
-                    staging_dir,
                     directory_fd,
                     directory_identity,
                 )
@@ -476,7 +471,7 @@ def _publish_staged_artifacts(
     directory_fd: int,
     directory_identity: FileIdentity,
     artifacts: list[ExportArtifact],
-) -> None:
+) -> dict[str, FileFingerprint]:
     names = [artifact.path.name for artifact in artifacts]
     if len(names) != len(set(names)):
         raise TranscriptionWorkflowError(
@@ -501,17 +496,10 @@ def _publish_staged_artifacts(
     )
 
     # Commit point: the complete verified directory becomes visible in one
-    # no-replace rename. If final_dir appeared concurrently, it is untouched.
+    # no-replace rename. The caller marks exposure immediately after this
+    # function returns, before any post-exposure verification can fail.
     _rename_noreplace(staging_dir, final_dir)
-
-    # No final_dir mutation follows this verification. If it fails, leave the
-    # externally visible directory intact for explicit inspection.
-    _verify_bound_artifacts(
-        final_dir,
-        directory_fd,
-        directory_identity,
-        published,
-    )
+    return published
 
 
 def _result_payload(
@@ -549,6 +537,7 @@ def transcribe_and_export(
     final_dir = output_dir.expanduser().absolute()
     staging_dir, staging_fd, staging_identity = _prepare_staging_dir(final_dir)
     artifacts: list[ExportArtifact] = []
+    exposed = False
 
     try:
         source_sha256, source_stat = _stable_source_hash(source_path)
@@ -645,22 +634,34 @@ def transcribe_and_export(
             )
         )
 
-        _publish_staged_artifacts(
+        published = _publish_staged_artifacts(
             final_dir,
             staging_dir,
             staging_fd,
             staging_identity,
             artifacts,
         )
-    except BaseException:
-        # Before the atomic rename, cleanup is limited to the bound private
-        # staging instance. After exposure, staging_dir no longer names it, so
-        # failures leave final_dir untouched for inspection.
-        _cleanup_private_staging(
-            staging_dir,
+        exposed = True
+
+        # No final_dir mutation follows this verification. If it fails, leave
+        # the externally visible directory intact for explicit inspection.
+        _verify_bound_artifacts(
+            final_dir,
             staging_fd,
             staging_identity,
+            published,
         )
+    except BaseException:
+        if not exposed:
+            try:
+                exposed = _path_identity(final_dir) == staging_identity
+            except OSError:
+                exposed = False
+        if not exposed:
+            _cleanup_private_staging(
+                staging_fd,
+                staging_identity,
+            )
         raise
     finally:
         try:
