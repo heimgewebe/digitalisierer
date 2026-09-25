@@ -166,21 +166,12 @@ FileIdentity = tuple[int, int]
 FileFingerprint = tuple[FileIdentity, str]
 
 
+def _identity_from_stat(value: os.stat_result) -> FileIdentity:
+    return (value.st_dev, value.st_ino)
+
+
 def _path_identity(path: Path) -> FileIdentity:
-    stat = path.stat(follow_symlinks=False)
-    return (stat.st_dev, stat.st_ino)
-
-
-def _path_fingerprint(path: Path) -> FileFingerprint:
-    return (_path_identity(path), _sha256_file(path))
-
-
-def _path_matches_fingerprint(path: Path, fingerprint: FileFingerprint) -> bool:
-    try:
-        identity, sha256 = fingerprint
-        return _path_identity(path) == identity and _sha256_file(path) == sha256
-    except FileNotFoundError:
-        return False
+    return _identity_from_stat(path.stat(follow_symlinks=False))
 
 
 def _path_exists(path: Path) -> bool:
@@ -215,40 +206,129 @@ def _prepare_staging_dir(final_dir: Path) -> Path:
     )
 
 
+def _fingerprint_at(directory_fd: int, name: str) -> FileFingerprint:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        stat_value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        file_fd = os.open(name, os.O_RDONLY | nofollow, dir_fd=directory_fd)
+    except OSError as exc:
+        raise TranscriptionWorkflowError(
+            f"output directory changed during publication: {name}"
+        ) from exc
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(file_fd, "rb", closefd=True) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TranscriptionWorkflowError(
+            f"output directory changed during publication: {name}"
+        ) from exc
+    return (_identity_from_stat(stat_value), digest.hexdigest())
+
+
+def _copy_artifact_exclusive(
+    directory_fd: int,
+    artifact: ExportArtifact,
+) -> FileFingerprint:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+    name = artifact.path.name
+    try:
+        destination_fd = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except FileExistsError as exc:
+        raise TranscriptionWorkflowError(
+            f"output directory changed during publication: {name}"
+        ) from exc
+    try:
+        with artifact.path.open("rb") as source_handle:
+            with os.fdopen(destination_fd, "wb", closefd=True) as destination_handle:
+                shutil.copyfileobj(
+                    source_handle,
+                    destination_handle,
+                    length=1024 * 1024,
+                )
+    except BaseException:
+        try:
+            os.close(destination_fd)
+        except OSError:
+            pass
+        raise
+
+    fingerprint = _fingerprint_at(directory_fd, name)
+    if fingerprint[1] != artifact.sha256:
+        raise TranscriptionWorkflowError(
+            f"published artifact hash mismatch: {name}"
+        )
+    return fingerprint
+
+
 def _verify_published_artifacts(
     final_dir: Path,
-    published: dict[Path, FileFingerprint],
+    directory_fd: int,
+    directory_identity: FileIdentity,
+    published: dict[str, FileFingerprint],
 ) -> None:
-    expected_names = {destination.name for destination in published}
-    actual_names = {entry.name for entry in final_dir.iterdir()}
+    if _identity_from_stat(os.fstat(directory_fd)) != directory_identity:
+        raise TranscriptionWorkflowError(
+            "output directory changed during publication"
+        )
+
+    expected_names = set(published)
+    try:
+        actual_names = set(os.listdir(directory_fd))
+    except OSError as exc:
+        raise TranscriptionWorkflowError(
+            "output directory changed during publication"
+        ) from exc
     if actual_names != expected_names:
         raise TranscriptionWorkflowError(
             "output directory changed during publication"
         )
-    for destination, fingerprint in published.items():
-        if not _path_matches_fingerprint(destination, fingerprint):
+
+    for name, fingerprint in published.items():
+        if _fingerprint_at(directory_fd, name) != fingerprint:
             raise TranscriptionWorkflowError(
-                f"output directory changed during publication: {destination}"
+                f"output directory changed during publication: {name}"
             )
+
+    try:
+        path_identity = _path_identity(final_dir)
+    except OSError as exc:
+        raise TranscriptionWorkflowError(
+            "output directory changed during publication"
+        ) from exc
+    if path_identity != directory_identity:
+        raise TranscriptionWorkflowError(
+            "output directory changed during publication"
+        )
 
 
 def _cleanup_failed_publication(
     final_dir: Path,
     staging_dir: Path,
-    published: dict[Path, FileFingerprint],
+    published: dict[str, FileFingerprint],
     *,
     final_dir_created: bool,
+    directory_identity: FileIdentity | None,
 ) -> None:
     shutil.rmtree(staging_dir, ignore_errors=True)
 
-    # Once any artifact reached final_dir, failure cleanup must be
-    # non-destructive: leave the partial state for explicit inspection.
-    if published or not final_dir_created:
+    # Once publication wrote anything into the bound final directory, failure
+    # cleanup is non-destructive: leave the partial state for explicit inspection.
+    if published or not final_dir_created or directory_identity is None:
         return
 
     try:
+        if _path_identity(final_dir) != directory_identity:
+            return
         remaining = list(final_dir.iterdir())
-    except FileNotFoundError:
+    except OSError:
         return
     if remaining:
         return
@@ -263,8 +343,10 @@ def _publish_staged_artifacts(
     staging_dir: Path,
     artifacts: list[ExportArtifact],
 ) -> None:
-    published: dict[Path, FileFingerprint] = {}
+    published: dict[str, FileFingerprint] = {}
     final_dir_created = False
+    directory_identity: FileIdentity | None = None
+    directory_fd: int | None = None
     try:
         try:
             final_dir.mkdir(mode=0o700)
@@ -273,37 +355,52 @@ def _publish_staged_artifacts(
                 f"output directory changed during publication: {final_dir}"
             ) from exc
         final_dir_created = True
+        directory_identity = _path_identity(final_dir)
 
-        for artifact in artifacts:
-            destination = final_dir / artifact.path.name
-            try:
-                destination.hardlink_to(artifact.path)
-            except FileExistsError as exc:
-                raise TranscriptionWorkflowError(
-                    f"output directory changed during publication: {destination}"
-                ) from exc
-            published[destination] = (
-                _path_identity(destination),
-                artifact.sha256,
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(final_dir, directory_flags)
+        if _identity_from_stat(os.fstat(directory_fd)) != directory_identity:
+            raise TranscriptionWorkflowError(
+                "output directory changed during publication"
             )
 
-        _verify_published_artifacts(final_dir, published)
-
         for artifact in artifacts:
-            artifact.path.unlink()
-        staging_dir.rmdir()
+            published[artifact.path.name] = _copy_artifact_exclusive(
+                directory_fd,
+                artifact,
+            )
 
-        # This is the commit point: after this exact verification there are no
-        # further mutations in final_dir.
-        _verify_published_artifacts(final_dir, published)
+        _verify_published_artifacts(
+            final_dir,
+            directory_fd,
+            directory_identity,
+            published,
+        )
+
+        shutil.rmtree(staging_dir)
+
+        # Commit point: exact names, final file identities/hashes and the public
+        # directory path are all rebound to the opened directory. No mutation
+        # of final_dir follows this verification.
+        _verify_published_artifacts(
+            final_dir,
+            directory_fd,
+            directory_identity,
+            published,
+        )
     except BaseException:
         _cleanup_failed_publication(
             final_dir,
             staging_dir,
             published,
             final_dir_created=final_dir_created,
+            directory_identity=directory_identity,
         )
         raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 def _result_payload(
     result: TranscriptionResult,
