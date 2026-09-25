@@ -183,6 +183,35 @@ def test_route_contract_rejects_non_finite_or_overflowing_timestamps(
         parse_route_result(_route_payload(segments=[segment]))
 
 
+@pytest.mark.parametrize("field", ["text", "language"])
+def test_route_contract_rejects_lone_surrogate_in_transcript_strings(
+    field: str,
+) -> None:
+    payload = _route_payload()
+    selected = payload["selected"]
+    assert isinstance(selected, dict)
+    selected[field] = "\udcff"
+
+    with pytest.raises(AsrAdapterError, match="valid UTF-8 text"):
+        parse_route_result(payload)
+
+
+@pytest.mark.parametrize("field", ["text", "speaker"])
+def test_route_contract_rejects_lone_surrogate_in_segment_strings(
+    field: str,
+) -> None:
+    segment: dict[str, object] = {
+        "start": 0.0,
+        "end": 1.0,
+        "speaker": None,
+        "text": "Hallo",
+    }
+    segment[field] = "\udcff"
+
+    with pytest.raises(AsrAdapterError, match="valid UTF-8 text"):
+        parse_route_result(_route_payload(segments=[segment]))
+
+
 def test_route_contract_rejects_cloud_use() -> None:
     with pytest.raises(AsrAdapterError, match="did not authorize cloud"):
         parse_route_result(_route_payload(cloud_used=True))
@@ -503,6 +532,27 @@ def test_export_omits_subtitles_without_complete_timing(tmp_path: Path) -> None:
     assert not (output / "transcript.vtt").exists()
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["subtitles_written"] is False
+
+
+def test_keyboard_interrupt_during_backend_cleans_reserved_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+
+    class InterruptingBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            assert source.is_file()
+            assert output.is_dir()
+            assert (output / INCOMPLETE_MARKER).is_file()
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        transcribe_and_export(source, output, InterruptingBackend(_result()))
+
+    assert not output.exists()
+    assert list(tmp_path.glob(".export.staging-*")) == []
 
 
 def test_export_rejects_existing_output_before_starting_backend(

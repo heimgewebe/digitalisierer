@@ -351,7 +351,7 @@ def _publish_staged_artifacts(
             published,
             marker_required=False,
         )
-    except Exception:
+    except BaseException:
         if not _path_matches_fingerprint(marker, marker_fingerprint):
             restored_identity = _restore_incomplete_marker(marker)
             if restored_identity is not None:
@@ -504,7 +504,7 @@ def transcribe_and_export(
             marker_fingerprint,
             artifacts,
         )
-    except Exception:
+    except BaseException:
         _cleanup_reserved_output(
             final_dir,
             staging_dir,

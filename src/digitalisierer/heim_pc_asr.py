@@ -54,13 +54,21 @@ def _object(value: object, *, field: str) -> dict[str, object]:
 def _string(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise AsrAdapterError(f"{field} must be a non-empty string")
-    return value
+    return _utf8_text(value, field=field)
 
 
 def _optional_string(value: object, *, field: str) -> str | None:
     if value is None:
         return None
     return _string(value, field=field)
+
+
+def _utf8_text(value: str, *, field: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AsrAdapterError(f"{field} must be valid UTF-8 text") from exc
+    return value
 
 
 def _diagnostic_tail(value: str, *, limit: int = 500) -> str:
@@ -178,9 +186,12 @@ def _parse_transcript(payload: object) -> TranscriptionResult:
     text = transcript.get("text")
     if not isinstance(text, str):
         raise AsrAdapterError("ASR transcript text must be a string")
+    text = _utf8_text(text, field="text")
     language = transcript.get("language")
-    if language is not None and not isinstance(language, str):
-        raise AsrAdapterError("ASR transcript language must be a string or null")
+    if language is not None:
+        if not isinstance(language, str):
+            raise AsrAdapterError("ASR transcript language must be a string or null")
+        language = _utf8_text(language, field="language")
 
     raw_segments = transcript.get("segments")
     if not isinstance(raw_segments, list):
@@ -197,9 +208,12 @@ def _parse_transcript(payload: object) -> TranscriptionResult:
         segment_text = segment.get("text")
         if not isinstance(segment_text, str):
             raise AsrAdapterError(f"segments[{index}].text must be a string")
+        segment_text = _utf8_text(segment_text, field=f"segments[{index}].text")
         speaker = segment.get("speaker")
-        if speaker is not None and not isinstance(speaker, str):
-            raise AsrAdapterError(f"segments[{index}].speaker must be a string or null")
+        if speaker is not None:
+            if not isinstance(speaker, str):
+                raise AsrAdapterError(f"segments[{index}].speaker must be a string or null")
+            speaker = _utf8_text(speaker, field=f"segments[{index}].speaker")
         try:
             segments.append(
                 TranscriptSegment(
