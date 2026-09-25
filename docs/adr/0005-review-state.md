@@ -21,15 +21,20 @@ Within one `ProcessingSession`:
 - `replacement_for` references another asset id in the same session;
 - an included replacement requires the replaced item to be excluded;
 - at most one included replacement may target a given asset;
+- replacement cycles are invalid;
+- an included replacement without an explicit sequence inherits the effective sequence of the asset it replaces;
+- two included assets may not resolve to the same effective sequence;
 - export-facing asset access follows reviewed sequence through `ordered_items()` / `ordered_assets()`.
 
-Quality findings reference assets but do not mutate them.
+Quality findings reference zero, one, or several assets but do not mutate them.
 
 ## Consequences
 
 - the same source asset may participate in several sessions/exports;
 - source identity remains stable;
 - review decisions are auditable and reversible;
+- rescans substitute into the reviewed position by default;
 - manual reordering is preserved by export-facing access;
+- ambiguous duplicate sequence positions fail before export;
 - invalid replacement states fail before processing/export;
 - session models become slightly more explicit.

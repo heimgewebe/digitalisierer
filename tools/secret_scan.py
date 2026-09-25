@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+from typing import Any
 
 
 MAX_BYTES = 2_000_000
+ALLOWLIST_NAME = ".secret-scan-allowlist.json"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -22,6 +28,13 @@ class ScanFinding:
     rule: str
     path: Path
     line: int | None = None
+
+
+@dataclass(frozen=True)
+class AllowlistEntry:
+    path: Path
+    sha256: str
+    reason: str
 
 
 RULES = (
@@ -39,14 +52,22 @@ RULES = (
             r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{32,})\b"
         ),
     ),
+    Rule("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    Rule("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
 )
 
+_SENSITIVE_KEY = (
+    r"(?:[A-Za-z_][A-Za-z0-9_.-]*[_.-])?"
+    r"(?:password|passwd|client[_-]?secret|secret[_-]?access[_-]?key|"
+    r"api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|secret)"
+)
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*"
+    rf"(?i)(?<![A-Za-z0-9_])"
+    rf"(?P<key_quote>['\"]?)(?P<key>{_SENSITIVE_KEY})(?P=key_quote)\s*[:=]\s*"
     r"(?P<value>"
     r"\"(?:\\.|[^\"\\\r\n]){8,}\""
     r"|'(?:\\.|[^'\\\r\n]){8,}'"
-    r"|[^\s'\"#;]{8,}"
+    r"|[^\s'\"#;,}\]]{8,}"
     r")"
 )
 
@@ -72,6 +93,20 @@ def tracked_files(root: Path) -> list[Path]:
         stdout=subprocess.PIPE,
     )
     return [root / os.fsdecode(item) for item in result.stdout.split(b"\0") if item]
+
+
+def staged_deleted_files(root: Path) -> set[Path]:
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=D", "-z"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return {
+        Path(os.fsdecode(item))
+        for item in result.stdout.split(b"\0")
+        if item
+    }
 
 
 def _credential_value_is_placeholder(value: str) -> bool:
@@ -102,35 +137,131 @@ def format_finding(finding: ScanFinding) -> str:
     location = str(finding.path)
     if finding.line is not None:
         location = f"{location}:{finding.line}"
-    return f"{location}: potential secret or unscannable tracked file ({finding.rule})"
+    return (
+        f"{location}: potential secret or unscannable tracked file "
+        f"({finding.rule})"
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_allowlist(root: Path) -> dict[Path, AllowlistEntry]:
+    path = root / ALLOWLIST_NAME
+    if not path.is_file():
+        return {}
+
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("secret-scan allowlist must be a schema_version=1 object")
+    entries = raw.get("allow_unscannable")
+    if not isinstance(entries, list):
+        raise ValueError("secret-scan allowlist allow_unscannable must be a list")
+
+    result: dict[Path, AllowlistEntry] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError("secret-scan allowlist entry must be an object")
+        raw_path = item.get("path")
+        raw_sha = item.get("sha256")
+        reason = item.get("reason")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or Path(raw_path).is_absolute()
+            or ".." in Path(raw_path).parts
+        ):
+            raise ValueError("secret-scan allowlist path must be a safe relative path")
+        if (
+            not isinstance(raw_sha, str)
+            or _SHA256_RE.fullmatch(raw_sha) is None
+        ):
+            raise ValueError("secret-scan allowlist sha256 must be lowercase SHA-256")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("secret-scan allowlist reason must not be empty")
+
+        relative = Path(raw_path)
+        if relative in result:
+            raise ValueError(f"duplicate secret-scan allowlist path: {raw_path}")
+        result[relative] = AllowlistEntry(relative, raw_sha, reason.strip())
+    return result
+
+
+def _allowlisted(
+    relative: Path,
+    sha256: str,
+    allowlist: dict[Path, AllowlistEntry],
+) -> bool:
+    entry = allowlist.get(relative)
+    return entry is not None and entry.sha256 == sha256
 
 
 def scan(root: Path) -> list[ScanFinding]:
     findings: list[ScanFinding] = []
+    allowlist = load_allowlist(root)
+    staged_deleted = staged_deleted_files(root)
+
     for path in tracked_files(root):
+        relative = path.relative_to(root)
         try:
-            metadata = path.stat()
+            metadata = path.lstat()
+        except FileNotFoundError:
+            if relative in staged_deleted:
+                continue
+            findings.append(ScanFinding("missing-tracked-file", relative))
+            continue
         except OSError:
-            findings.append(ScanFinding("unreadable-tracked-file", path.relative_to(root)))
+            findings.append(ScanFinding("unreadable-tracked-file", relative))
             continue
 
-        if not path.is_file():
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                text = os.readlink(path)
+            except OSError:
+                findings.append(ScanFinding("unreadable-tracked-symlink", relative))
+                continue
+            findings.extend(
+                ScanFinding(rule, relative, lineno)
+                for rule, lineno in find_matches(text)
+            )
             continue
+
+        if not stat.S_ISREG(metadata.st_mode):
+            # Gitlinks/submodules do not publish the checked-out directory payload
+            # as a file blob in this repository.
+            continue
+
         if metadata.st_size > MAX_BYTES:
-            findings.append(ScanFinding("oversized-tracked-file", path.relative_to(root)))
+            try:
+                digest = _file_sha256(path)
+            except OSError:
+                findings.append(ScanFinding("unreadable-tracked-file", relative))
+                continue
+            if not _allowlisted(relative, digest, allowlist):
+                findings.append(ScanFinding("oversized-tracked-file", relative))
             continue
 
         try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            findings.append(ScanFinding("non-utf8-tracked-file", path.relative_to(root)))
-            continue
+            raw = path.read_bytes()
         except OSError:
-            findings.append(ScanFinding("unreadable-tracked-file", path.relative_to(root)))
+            findings.append(ScanFinding("unreadable-tracked-file", relative))
+            continue
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            digest = hashlib.sha256(raw).hexdigest()
+            if not _allowlisted(relative, digest, allowlist):
+                findings.append(ScanFinding("non-utf8-tracked-file", relative))
             continue
 
         findings.extend(
-            ScanFinding(rule, path.relative_to(root), lineno)
+            ScanFinding(rule, relative, lineno)
             for rule, lineno in find_matches(text)
         )
     return findings
@@ -138,7 +269,12 @@ def scan(root: Path) -> list[ScanFinding]:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    findings = scan(root)
+    try:
+        findings = scan(root)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"secret scan configuration error: {exc}", file=sys.stderr)
+        return 2
+
     if findings:
         for finding in findings:
             print(format_finding(finding), file=sys.stderr)

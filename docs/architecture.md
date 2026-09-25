@@ -26,9 +26,21 @@ A `SessionAsset` associates an asset with a processing session and may carry:
 
 `replacement_for` names another `MediaAsset.asset_id` in the same session. Asset ids are unique within a session. An included replacement requires the replaced item to be excluded, and only one included replacement may target a given asset.
 
+Sequence is review state. An included replacement with no explicit sequence inherits the effective sequence of the asset it replaces; this also works through replacement chains. Two included assets may not resolve to the same effective sequence. Replacement cycles are invalid.
+
 Export-facing access uses `ordered_items()` / `ordered_assets()`, so manual review order is not lost when assets are finalized.
 
 This separation matters because the same source may participate in different exports without changing source identity.
+
+### Quality findings
+
+A `QualityFinding` identifies a kind, a human-readable message, optional confidence/evidence, and zero or more `asset_ids`:
+
+- zero asset ids means a session-wide finding such as a missing expected segment;
+- one asset id means an isolated finding such as blur;
+- multiple asset ids express relationships such as duplicate/near-duplicate pages.
+
+This avoids inventing fake single-asset ownership for cross-asset findings.
 
 ### Project and session
 
@@ -108,6 +120,8 @@ Generate explicit findings. Examples:
 - missing or duplicated segments.
 
 Per-asset checks use `AssetQualityAnalyzer`. Cross-asset checks such as duplicates, sequence gaps, suspicious relative dimensions, or missing segments use `SessionQualityAnalyzer` so the analyzer can inspect the complete reviewed session context.
+
+The application/capability-job layer keeps those two scopes explicit rather than introspecting a runtime union. An implementation may implement both protocols if it genuinely provides both kinds of analysis.
 
 A finding is evidence for review, not permission to destroy source data.
 

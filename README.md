@@ -56,12 +56,13 @@ It is not intended to become a general DMS, media player, note system, library c
 
 1. **Source identity and review state are separate.** Excluding a page from an export does not mutate the source asset.
 2. **Sources are immutable by default.** Corrections create metadata, replacement associations or derived assets.
-3. **Review order is export order.** Export-facing asset access uses the reviewed sequence rather than insertion order.
-4. **Replacement state is validated.** Asset ids are unique inside a session and an included replacement cannot coexist with its included original.
-5. **Every derived artifact should be explainable.** Inputs, parameters, engine/version and output hashes belong in provenance.
-6. **No hidden cloud requirement.** Local execution is the default; remote engines must be explicit adapters.
-7. **Vendor-specific behavior stays at the edge.** CZUR, Tesseract, Whisper, ffmpeg or another engine must not shape the core domain.
-8. **Automation may flag; it must not silently destroy.** Blank/duplicate/low-quality detection produces findings, not deletions.
+3. **Review order is export order.** Export-facing asset access uses reviewed sequence rather than insertion order. A replacement with no explicit sequence inherits the position of the asset it replaces, and conflicting effective sequence positions are rejected.
+4. **Replacement state is validated.** Asset ids are unique inside a session; replacement targets must exist in that session; replacement cycles are invalid; and an included replacement cannot coexist with its included original.
+5. **Quality scope is explicit.** Per-asset analyzers receive one asset. Cross-asset analyzers receive the complete session. A `QualityFinding` may reference zero assets (session-wide), one asset, or several assets.
+6. **Every derived artifact should be explainable.** Inputs, parameters, engine/version and output hashes belong in provenance.
+7. **No hidden cloud requirement.** Local execution is the default; remote engines must be explicit adapters.
+8. **Vendor-specific behavior stays at the edge.** CZUR, Tesseract, Whisper, ffmpeg or another engine must not shape the core domain.
+9. **Automation may flag; it must not silently destroy.** Blank/duplicate/low-quality detection produces findings, not deletions.
 
 ## Architecture sketch
 
@@ -94,11 +95,21 @@ Provenance
 
 Very early foundation. The repository currently contains the domain/port skeleton, architectural decisions, CI and a `doctor` command. The existing working CZUR/OCR scripts on the development machine are migration input, not a reason to copy implementation accidents into the architecture.
 
-Run:
+Install development dependencies and run the default readiness check:
 
 ```bash
-PYTHONPATH=src python -m digitalisierer doctor
+python -m pip install -e ".[dev]"
+digitalisierer doctor
 ```
+
+The default doctor exit status requires the media and OCR capabilities. Require another capability explicitly when a workflow depends on it:
+
+```bash
+digitalisierer doctor --require capture-czur
+digitalisierer doctor --require transcription
+```
+
+The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities.
 
 ## Roadmap
 
@@ -127,7 +138,9 @@ See:
 
 ## Security and privacy
 
-Do not commit source scans, recordings, transcripts, secrets, credentials or private datasets. Local digitization data is ignored by default. The CI secret scan also fails closed when a tracked file is too large or not UTF-8, because an unscannable tracked payload must not be reported as clean. See [SECURITY.md](SECURITY.md).
+Do not commit source scans, recordings, transcripts, secrets, credentials or private datasets. Local digitization payload directories are ignored by default.
+
+The CI secret scan fails closed when a tracked file cannot be safely inspected, including oversized or non-UTF-8 files. Deliberate binary/large fixtures require an explicit path + SHA-256 + reason entry in `.secret-scan-allowlist.json`; changing the file invalidates that exception. See [SECURITY.md](SECURITY.md).
 
 ## License
 

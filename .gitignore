@@ -17,20 +17,20 @@ build/
 *.p12
 *.pfx
 
-# Local models and large runtime data at any depth.
-models/
-.cache/
-data/
+# Repository-root runtime/model payloads. Keep generic source-package names usable.
+/models/
+/.cache/
+/data/
+/projects/
+/recordings/
+/transcripts/
 
 # Local review evidence stays local.
 .review-audits/
 
-# Digitization payloads never belong in Git by default, including nested projects.
+# Digitization payload directories are private at any project nesting depth.
 sessions/
 captures/
 exports/
-projects/
-recordings/
-transcripts/
 **/assets/source/
 **/assets/derived/

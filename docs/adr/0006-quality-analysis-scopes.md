@@ -7,7 +7,7 @@
 
 Some quality checks are intrinsically local to one asset, such as blur or exposure. Others require comparison or sequence context, such as duplicate/near-duplicate pages, relative-size anomalies, missing segments or sequence gaps.
 
-A single protocol of the form `analyze(asset)` cannot establish cross-asset findings without hidden external state.
+A single protocol of the form `analyze(asset)` cannot establish cross-asset findings without hidden external state. Likewise, a finding model that requires exactly one asset id cannot faithfully represent session-wide or multi-asset findings.
 
 ## Decision
 
@@ -20,10 +20,17 @@ The capability-job/application layer keeps these scopes explicit: it invokes ass
 
 There is deliberately no runtime union/marker `QualityAnalyzer` that callers must introspect to discover which method exists.
 
+`QualityFinding.asset_ids` is a typed tuple:
+
+- zero ids for a session-wide finding;
+- one id for an asset-local finding;
+- multiple ids for relational findings such as duplicate pairs.
+
 ## Consequences
 
 - cross-page and cross-segment checks are expressible without hidden mutable state;
 - analyzer implementations state their required context in their type;
+- cross-asset findings no longer need a fake primary asset id;
 - orchestration remains deterministic and testable;
 - a plugin that needs both scopes may implement both protocols;
 - the application layer must keep two analyzer collections or otherwise retain the scope explicitly.

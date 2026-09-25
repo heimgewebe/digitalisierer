@@ -8,6 +8,7 @@ from digitalisierer.domain import (
     MediaAsset,
     MediaKind,
     ProcessingSession,
+    QualityFinding,
     SessionAsset,
 )
 
@@ -93,7 +94,7 @@ def test_replacement_requires_original_to_be_excluded() -> None:
             Path("/tmp/invalid"),
             items=[
                 SessionAsset(original, sequence=1),
-                SessionAsset(replacement, sequence=1, replacement_for="original"),
+                SessionAsset(replacement, replacement_for="original"),
             ],
         )
 
@@ -118,11 +119,12 @@ def test_replacement_reference_must_exist_and_asset_ids_are_unique() -> None:
         )
 
 
-def test_valid_replacement_exports_only_replacement() -> None:
-    original = MediaAsset("original", Path("original.jpg"), MediaKind.DOCUMENT_IMAGE)
+def test_replacement_without_sequence_inherits_replaced_position() -> None:
+    original = MediaAsset("page-01", Path("page-01.jpg"), MediaKind.DOCUMENT_IMAGE)
+    page_02 = MediaAsset("page-02", Path("page-02.jpg"), MediaKind.DOCUMENT_IMAGE)
     replacement = MediaAsset(
-        "replacement",
-        Path("replacement.jpg"),
+        "page-01-rescan",
+        Path("page-01-rescan.jpg"),
         MediaKind.DOCUMENT_IMAGE,
     )
     session = ProcessingSession(
@@ -130,15 +132,72 @@ def test_valid_replacement_exports_only_replacement() -> None:
         Path("/tmp/replacement"),
         items=[
             SessionAsset(original, sequence=1, included=False),
-            SessionAsset(
-                replacement,
-                sequence=1,
-                replacement_for="original",
-            ),
+            SessionAsset(page_02, sequence=2),
+            SessionAsset(replacement, replacement_for="page-01"),
         ],
     )
 
-    assert [asset.asset_id for asset in session.ordered_assets()] == ["replacement"]
+    assert [asset.asset_id for asset in session.ordered_assets()] == [
+        "page-01-rescan",
+        "page-02",
+    ]
+
+
+def test_duplicate_effective_sequence_is_rejected() -> None:
+    original = MediaAsset("original", Path("original.jpg"), MediaKind.DOCUMENT_IMAGE)
+    replacement = MediaAsset("replacement", Path("replacement.jpg"), MediaKind.DOCUMENT_IMAGE)
+    conflict = MediaAsset("conflict", Path("conflict.jpg"), MediaKind.DOCUMENT_IMAGE)
+
+    with pytest.raises(ValueError, match="duplicate effective sequence 1"):
+        ProcessingSession(
+            "duplicate-sequence",
+            Path("/tmp/duplicate-sequence"),
+            items=[
+                SessionAsset(original, sequence=1, included=False),
+                SessionAsset(replacement, replacement_for="original"),
+                SessionAsset(conflict, sequence=1),
+            ],
+        )
+
+
+def test_replacement_cycle_is_rejected_even_when_items_are_excluded() -> None:
+    first = MediaAsset("first", Path("first.jpg"), MediaKind.DOCUMENT_IMAGE)
+    second = MediaAsset("second", Path("second.jpg"), MediaKind.DOCUMENT_IMAGE)
+
+    with pytest.raises(ValueError, match="replacement cycle"):
+        ProcessingSession(
+            "cycle",
+            Path("/tmp/cycle"),
+            items=[
+                SessionAsset(first, included=False, replacement_for="second"),
+                SessionAsset(second, included=False, replacement_for="first"),
+            ],
+        )
+
+
+def test_quality_finding_can_be_asset_pair_or_session_wide() -> None:
+    duplicate = QualityFinding(
+        kind="near-duplicate",
+        message="two pages look alike",
+        asset_ids=("page-01", "page-02"),
+        confidence=0.9,
+    )
+    gap = QualityFinding(
+        kind="sequence-gap",
+        message="expected sequence position is missing",
+    )
+
+    assert duplicate.asset_ids == ("page-01", "page-02")
+    assert gap.asset_ids == ()
+
+
+def test_quality_finding_rejects_duplicate_asset_references() -> None:
+    with pytest.raises(ValueError, match="asset ids must be unique"):
+        QualityFinding(
+            kind="duplicate",
+            message="invalid duplicate references",
+            asset_ids=("page-01", "page-01"),
+        )
 
 
 def test_project_groups_sessions_without_owning_engine_state() -> None:

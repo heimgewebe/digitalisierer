@@ -15,6 +15,8 @@ CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
     "ocr": ("ocrmypdf", "tesseract"),
     "capture-czur": ("xdotool", "v4l2-ctl"),
 }
+CAPABILITY_NAMES = (*CAPABILITY_TOOLS, "transcription")
+DEFAULT_REQUIRED_CAPABILITIES = ("media", "ocr")
 
 
 class ToolCheck(TypedDict):
@@ -25,6 +27,7 @@ class ToolCheck(TypedDict):
 class CapabilityStatus(TypedDict):
     ready: bool
     checks: dict[str, ToolCheck]
+    detail: str
 
 
 def _which(name: str) -> ToolCheck:
@@ -36,11 +39,12 @@ def _czur_app_path() -> Path:
     return Path.home() / ".local/opt/czur-scanner/CzurScanner"
 
 
-def doctor() -> int:
+def _capabilities() -> dict[str, CapabilityStatus]:
     capabilities: dict[str, CapabilityStatus] = {}
 
     for capability, tools in CAPABILITY_TOOLS.items():
         checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
+        detail = ""
 
         if capability == "capture-czur":
             app_path = _czur_app_path()
@@ -48,33 +52,65 @@ def doctor() -> int:
                 "found": app_path.is_file() and os.access(app_path, os.X_OK),
                 "path": str(app_path),
             }
+            detail = "CZUR capture adapter prerequisites"
 
         capabilities[capability] = {
             "ready": all(item["found"] for item in checks.values()),
             "checks": checks,
+            "detail": detail,
         }
 
+    capabilities["transcription"] = {
+        "ready": False,
+        "checks": {},
+        "detail": "Transcription adapter is not integrated yet.",
+    }
+    return capabilities
+
+
+def doctor(required: tuple[str, ...] = DEFAULT_REQUIRED_CAPABILITIES) -> int:
+    capabilities = _capabilities()
+    unknown = sorted(set(required).difference(capabilities))
+    if unknown:
+        raise ValueError(f"unknown required capabilities: {', '.join(unknown)}")
+
+    ready = all(capabilities[name]["ready"] for name in required)
     result = {
         "digitalisierer": __version__,
+        "ready": ready,
+        "required_capabilities": list(required),
         "capabilities": capabilities,
-        "optional": {
-            "transcription": {
-                "ready": False,
-                "detail": "No transcription adapter is selected yet.",
-            }
-        },
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    return 0 if ready else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="digitalisierer")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor", help="report local digitization capability readiness")
-    args = parser.parse_args(argv)
 
+    doctor_parser = sub.add_parser(
+        "doctor",
+        help="report local digitization capability readiness",
+    )
+    doctor_parser.add_argument(
+        "--require",
+        action="append",
+        choices=CAPABILITY_NAMES,
+        dest="required_capabilities",
+        help=(
+            "require one capability for a successful exit; repeat for multiple. "
+            "Default: media + ocr"
+        ),
+    )
+
+    args = parser.parse_args(argv)
     if args.command == "doctor":
-        return doctor()
+        required = (
+            tuple(args.required_capabilities)
+            if args.required_capabilities
+            else DEFAULT_REQUIRED_CAPABILITIES
+        )
+        return doctor(required)
     return 2
