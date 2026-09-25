@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .domain import MediaAsset
+from .domain import MediaAsset, ProcessingSession, QualityFinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +72,19 @@ class MediaProbeBackend(Protocol):
         ...
 
 
-class QualityAnalyzer(Protocol):
+class AssetQualityAnalyzer(Protocol):
+    """Analyzer for findings that can be established from one asset."""
+
     name: str
 
-    def analyze(self, asset: MediaAsset) -> list[object]:
+    def analyze_asset(self, asset: MediaAsset) -> list[QualityFinding]:
+        ...
+
+
+class SessionQualityAnalyzer(Protocol):
+    """Analyzer for findings that require complete session context."""
+
+    name: str
+
+    def analyze_session(self, session: ProcessingSession) -> list[QualityFinding]:
         ...

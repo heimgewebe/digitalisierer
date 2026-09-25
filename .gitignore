@@ -1,13 +1,36 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
 .venv/
 dist/
 build/
 *.egg-info/
 .DS_Store
 
-# Local digitization data never belongs in Git.
+# Local environment / credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Repository-root runtime/model payloads. Keep generic source-package names usable.
+/models/
+/.cache/
+/data/
+/projects/
+/recordings/
+/transcripts/
+
+# Local review evidence stays local.
+.review-audits/
+
+# Digitization payload directories are private at any project nesting depth.
 sessions/
 captures/
 exports/
+**/assets/source/
+**/assets/derived/

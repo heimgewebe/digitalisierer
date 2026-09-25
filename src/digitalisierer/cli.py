@@ -2,51 +2,115 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
+from typing import TypedDict
 
 from . import __version__
 
 
-CORE_TOOLS = ("ffmpeg", "ffprobe", "ocrmypdf", "tesseract")
-CZUR_TOOLS = ("xdotool", "v4l2-ctl")
-CZUR_APP = Path.home() / ".local/opt/czur-scanner/CzurScanner"
+CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
+    "media": ("ffmpeg", "ffprobe"),
+    "ocr": ("ocrmypdf", "tesseract"),
+    "capture-czur": ("xdotool", "v4l2-ctl"),
+}
+CAPABILITY_NAMES = (*CAPABILITY_TOOLS, "transcription")
+DEFAULT_REQUIRED_CAPABILITIES = ("media", "ocr")
 
 
-def _which(name: str) -> dict[str, object]:
+class ToolCheck(TypedDict):
+    found: bool
+    path: str | None
+
+
+class CapabilityStatus(TypedDict):
+    ready: bool
+    checks: dict[str, ToolCheck]
+    detail: str
+
+
+def _which(name: str) -> ToolCheck:
     path = shutil.which(name)
-    return {"found": bool(path), "path": path}
+    return {"found": path is not None, "path": path}
 
 
-def doctor() -> int:
-    core = {name: _which(name) for name in CORE_TOOLS}
-    czur = {name: _which(name) for name in CZUR_TOOLS}
-    czur["czur-app"] = {
-        "found": CZUR_APP.is_file(),
-        "path": str(CZUR_APP),
+def _czur_app_path() -> Path:
+    return Path.home() / ".local/opt/czur-scanner/CzurScanner"
+
+
+def _capabilities() -> dict[str, CapabilityStatus]:
+    capabilities: dict[str, CapabilityStatus] = {}
+
+    for capability, tools in CAPABILITY_TOOLS.items():
+        checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
+        detail = ""
+
+        if capability == "capture-czur":
+            app_path = _czur_app_path()
+            checks["czur-app"] = {
+                "found": app_path.is_file() and os.access(app_path, os.X_OK),
+                "path": str(app_path),
+            }
+            detail = "CZUR capture adapter prerequisites"
+
+        capabilities[capability] = {
+            "ready": all(item["found"] for item in checks.values()),
+            "checks": checks,
+            "detail": detail,
+        }
+
+    capabilities["transcription"] = {
+        "ready": False,
+        "checks": {},
+        "detail": "Transcription adapter is not integrated yet.",
     }
+    return capabilities
+
+
+def doctor(required: tuple[str, ...] = DEFAULT_REQUIRED_CAPABILITIES) -> int:
+    capabilities = _capabilities()
+    unknown = sorted(set(required).difference(capabilities))
+    if unknown:
+        raise ValueError(f"unknown required capabilities: {', '.join(unknown)}")
+
+    ready = all(capabilities[name]["ready"] for name in required)
     result = {
         "digitalisierer": __version__,
-        "core_ready": all(item["found"] for item in core.values()),
-        "checks": {
-            "core": core,
-            "capture": {"czur": czur},
-        },
-        "notes": {
-            "transcription": "No transcription engine is mandatory yet; it is a pluggable backend."
-        },
+        "ready": ready,
+        "required_capabilities": list(required),
+        "capabilities": capabilities,
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0 if result["core_ready"] else 1
+    return 0 if ready else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="digitalisierer")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor", help="check local digitization prerequisites")
-    args = parser.parse_args(argv)
 
+    doctor_parser = sub.add_parser(
+        "doctor",
+        help="report local digitization capability readiness",
+    )
+    doctor_parser.add_argument(
+        "--require",
+        action="append",
+        choices=CAPABILITY_NAMES,
+        dest="required_capabilities",
+        help=(
+            "require one capability for a successful exit; repeat for multiple. "
+            "Default: media + ocr"
+        ),
+    )
+
+    args = parser.parse_args(argv)
     if args.command == "doctor":
-        return doctor()
+        required = (
+            tuple(args.required_capabilities)
+            if args.required_capabilities
+            else DEFAULT_REQUIRED_CAPABILITIES
+        )
+        return doctor(required)
     return 2

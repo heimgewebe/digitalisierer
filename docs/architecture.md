@@ -2,25 +2,72 @@
 
 ## Principle
 
-**Own the workflow, isolate capture devices and processing engines.**
+**Own the workflow; isolate capture devices and processing engines.**
 
 Digitalisierer should not be architecturally shaped around CZUR, Tesseract, Whisper, ffmpeg or any other single implementation.
 
-## Domain
+## 1. Domain model
 
-Core concepts are media-neutral:
+The core is media-neutral, but not media-blind.
 
-- `DigitizationProject`
-- `ProcessingSession`
-- `SourceAsset`
-- `DerivedAsset`
-- `QualityFinding`
-- `ExportArtifact`
-- provenance records
+### Asset identity
 
-A page is a source asset with sequence semantics. An audio recording is a source asset with time semantics. The core can model both without pretending they are identical.
+A `MediaAsset` describes an artifact that exists: path, media kind, role and optionally a content hash.
 
-## Pipeline stages
+It does **not** contain mutable review decisions such as “exclude this page from the export”.
+
+### Session membership and review state
+
+A `SessionAsset` associates an asset with a processing session and may carry:
+
+- sequence/order;
+- inclusion/exclusion;
+- replacement relationship.
+
+`replacement_for` names another `MediaAsset.asset_id` in the same session. Asset ids are unique within a session. An included replacement requires the replaced item to be excluded, and only one included replacement may target a given asset.
+
+Sequence is review state. An included replacement with no explicit sequence inherits the effective sequence of the asset it replaces; this also works through replacement chains. Two included assets may not resolve to the same effective sequence. Replacement cycles are invalid.
+
+Export-facing access uses `ordered_items()` / `ordered_assets()`, so manual review order is not lost when assets are finalized.
+
+This separation matters because the same source may participate in different exports without changing source identity.
+
+### Quality findings
+
+A `QualityFinding` identifies a kind, a human-readable message, optional confidence/evidence, and zero or more `asset_ids`:
+
+- zero asset ids means a session-wide finding such as a missing expected segment;
+- one asset id means an isolated finding such as blur;
+- multiple asset ids express relationships such as duplicate/near-duplicate pages.
+
+This avoids inventing fake single-asset ownership for cross-asset findings.
+
+### Project and session
+
+A `DigitizationProject` groups related sessions.
+
+A `ProcessingSession` is one bounded workflow such as:
+
+- scan chapter 3;
+- OCR an imported PDF;
+- transcribe one interview;
+- process one video.
+
+## 2. Lifecycle
+
+The default lifecycle is:
+
+```
+ingest
+  -> preserve
+  -> normalize
+  -> extract
+  -> quality analysis
+  -> human review
+  -> export
+```
+
+Not every workflow needs every stage.
 
 ### Ingest
 
@@ -28,11 +75,19 @@ Accept material from scanners, cameras, folders, PDFs, audio/video files or futu
 
 ### Preserve
 
-Record source identity, checksums, size, timestamps and relevant technical metadata. Source mutation is forbidden by default.
+Record identity and technical facts before interpretation:
+
+- content hash where practical;
+- size;
+- timestamps;
+- media type;
+- source path / acquisition context.
+
+Source mutation is forbidden by default.
 
 ### Normalize
 
-Optional derived processing:
+Produce derived working assets where needed:
 
 - image orientation/crop/dewarp;
 - PDF normalization;
@@ -42,34 +97,49 @@ Optional derived processing:
 
 ### Extract
 
-Pluggable extraction:
+Run pluggable extraction capabilities:
 
 - OCR;
-- speech transcription;
+- transcription;
 - subtitles;
 - metadata;
 - layout/structure;
+- barcode/QR;
 - future structured or AI-assisted extraction.
 
 ### Quality analysis
 
-Examples:
+Generate explicit findings. Examples:
 
-- blank or near-blank page;
-- duplicate/near-duplicate page;
-- suspicious page size;
-- blur/exposure later;
-- OCR confidence later;
-- silence/noise/clipping later;
+- blank/near-blank page;
+- duplicate/near-duplicate;
+- suspicious dimensions;
+- blur/exposure;
+- OCR confidence;
+- silence/noise/clipping;
 - missing or duplicated segments.
+
+Per-asset checks use `AssetQualityAnalyzer`. Cross-asset checks such as duplicates, sequence gaps, suspicious relative dimensions, or missing segments use `SessionQualityAnalyzer` so the analyzer can inspect the complete reviewed session context.
+
+The application/capability-job layer keeps those two scopes explicit rather than introspecting a runtime union. An implementation may implement both protocols if it genuinely provides both kinds of analysis.
+
+A finding is evidence for review, not permission to destroy source data.
 
 ### Review
 
-Humans may reorder, exclude, replace, rescan, edit transcripts or accept/reject findings without deleting source material.
+Humans may:
+
+- reorder;
+- include/exclude;
+- replace/rescan;
+- correct OCR/transcripts;
+- accept/reject findings.
+
+Review changes session metadata or creates a derived/replacement asset. It does not rewrite source identity.
 
 ### Export
 
-Create stable artifacts such as:
+Create durable artifacts such as:
 
 - master PDF;
 - searchable PDF;
@@ -79,7 +149,39 @@ Create stable artifacts such as:
 - normalized audio/video;
 - manifests and reports.
 
-## Ports
+## 3. Capability jobs
+
+Digitalisierer should not grow into one giant hard-coded pipeline.
+
+A processing step is represented conceptually as a **capability job**:
+
+```
+capability id
++ exact input asset ids / hashes
++ parameters
++ adapter / engine identity and version
+= derived outputs + findings + provenance
+```
+
+Examples:
+
+- `document.ocr`
+- `speech.transcribe`
+- `media.probe`
+- `document.blank-detect`
+- `document.export-searchable-pdf`
+
+Workflow profiles compose jobs. “Book chapter” and “Interview transcription” are profiles, not special domain models.
+
+This creates a natural path to:
+
+- resumable/background jobs;
+- deterministic reruns;
+- cache/reuse later;
+- alternative engines;
+- explicit failure states.
+
+## 4. Ports and adapters
 
 ### CaptureBackend
 
@@ -95,7 +197,7 @@ First adapter: OCRmyPDF/Tesseract.
 
 ### TranscriptionBackend
 
-Speech-to-text engine. The initial implementation is intentionally left pluggable so local Whisper/faster-whisper or other engines can be selected later without changing the domain.
+Speech-to-text engine. The implementation remains pluggable so an existing local ASR authority or another backend can be selected without changing the domain.
 
 ### MediaProbeBackend
 
@@ -103,33 +205,81 @@ Technical metadata and stream inspection.
 
 First adapter: ffprobe.
 
+### AssetQualityAnalyzer
+
+Per-asset quality inspection that returns explicit findings.
+
+### SessionQualityAnalyzer
+
+Cross-asset/session quality inspection for comparisons, ordering/gap checks, and other findings that require context beyond one isolated asset.
+
 ### Storage
 
 Local filesystem first.
 
-## UI
+## 5. Provenance
+
+Every finalized derived artifact should be traceable to:
+
+- exact source/derived inputs;
+- hashes where practical;
+- capability id;
+- parameters;
+- adapter/engine/version;
+- timestamps;
+- output hashes;
+- relevant human review decisions.
+
+Provenance is part of the product, not debugging exhaust.
+
+## 6. UI
 
 The UI should be task-oriented, not engine-oriented.
 
 Examples:
 
-- **Book session:** large preview, scan/rescan, page strip, findings, finish chapter.
-- **Transcription session:** waveform/timeline later, transcript segments, confidence/findings, export subtitles.
-- **Import session:** inspect files, choose processing profile, review output.
+### Book session
 
-## Data layout
+- large preview;
+- Scan / Rescan;
+- page strip;
+- clear findings;
+- fast include/exclude/reorder;
+- Finish chapter.
 
-A project may contain multiple sessions and media types:
+### Transcription session
+
+- waveform/timeline later;
+- timestamped transcript;
+- confidence/findings;
+- text correction;
+- subtitle export.
+
+### Generic import
+
+- inspect sources;
+- select workflow profile;
+- observe running jobs;
+- review findings;
+- finalize outputs.
+
+The UI toolkit is deliberately **not** locked in yet. The first vertical slice should establish interaction requirements before choosing a long-lived desktop/web framework.
+
+## 7. Data layout
+
+A project may contain several sessions and media types:
 
 ```
 <project>/
   project.json
+  assets/
+    source/
+    derived/
   sessions/
     <session-id>/
       session.json
-      source/
-      derived/
-      review/
+      review.json
+      jobs/
       export/
         <run-id>/
           manifest.json
@@ -137,10 +287,10 @@ A project may contain multiple sessions and media types:
           ...
 ```
 
-Source assets are immutable after ingestion. Corrections create metadata changes or derived/replacement assets.
+The exact layout may evolve, but source assets and derived/export artifacts remain distinct.
 
-## Adapter rule
+## 8. Adapter rule
 
-External binaries, proprietary libraries and engine-specific state never leak into the domain model.
+External binaries, proprietary libraries and engine-specific state do not leak into the core domain model.
 
-That rule is what allows a future native ET24 backend, another OCR engine or a transcription engine to coexist without rewriting the product.
+That rule is what allows a future native ET24 backend, another OCR engine, or several transcription engines to coexist without rewriting the product.
