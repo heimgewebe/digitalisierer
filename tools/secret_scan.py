@@ -84,6 +84,9 @@ _PLACEHOLDERS = {
     "<redacted>",
 }
 _ENV_REFERENCE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\Z")
+_DOTTED_IDENTIFIER = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z"
+)
 
 
 def tracked_files(root: Path) -> list[Path]:
@@ -121,6 +124,33 @@ def _credential_value_is_placeholder(value: str) -> bool:
     )
 
 
+def _credential_value_is_likely_literal(value: str) -> bool:
+    normalized = value.strip()
+    if _credential_value_is_placeholder(normalized):
+        return False
+
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        return True
+
+    # Avoid treating ordinary references, calls, and type expressions as
+    # literal credentials merely because the target name is sensitive.
+    if any(char in normalized for char in "()[]{}"):
+        return False
+    if _DOTTED_IDENTIFIER.fullmatch(normalized) is not None:
+        if "." in normalized or "_" in normalized:
+            return False
+        if any(char.isdigit() for char in normalized):
+            return True
+        return len(normalized) >= 20
+
+    # Punctuation outside identifier syntax is useful evidence for a literal token.
+    return any(char in normalized for char in "-+/=@:~")
+
+
 def find_matches(text: str) -> list[tuple[str, int]]:
     findings: list[tuple[str, int]] = []
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -129,7 +159,7 @@ def find_matches(text: str) -> list[tuple[str, int]]:
                 findings.append((rule.name, lineno))
 
         for match in _CREDENTIAL_ASSIGNMENT.finditer(line):
-            if not _credential_value_is_placeholder(match.group("value")):
+            if _credential_value_is_likely_literal(match.group("value")):
                 findings.append(("credential-assignment", lineno))
     return findings
 

@@ -69,6 +69,36 @@ def test_credential_assignment_rejects_mismatched_quotes_and_env_references() ->
     assert secret_scan.find_matches(env_reference) == []
 
 
+def test_credential_assignment_ignores_code_references_and_calls() -> None:
+    key_name = "api_" + "key"
+    password_name = "pass" + "word"
+    secret_name = "sec" + "ret"
+    client_name = "client_" + "secret"
+    auth_name = "auth_" + "token"
+
+    examples = [
+        "self." + key_name + " = " + key_name + "_from_config",
+        key_name + ' = os.environ["DIGITALISIERER_API_KEY"]',
+        key_name + ' = os.getenv("API_KEY")',
+        password_name + " = getpass.getpass()",
+        secret_name + " = load_secret(path)",
+        client_name + "=settings." + client_name,
+        auth_name + ": Optional[str] = None",
+    ]
+
+    for example in examples:
+        assert secret_scan.find_matches(example) == []
+
+
+def test_unquoted_literal_with_mixed_alphanumeric_content_is_detected() -> None:
+    key_name = "api_" + "key"
+    value = "abcdef" + "1234567890"
+
+    assert secret_scan.find_matches(key_name + "=" + value) == [
+        ("credential-assignment", 1)
+    ]
+
+
 def test_openai_rule_does_not_match_ordinary_sk_kebab_identifier() -> None:
     ordinary = "sk-normalization-profile-default"
     realish = "sk-" + "proj-" + ("A" * 32)

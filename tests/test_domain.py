@@ -191,6 +191,21 @@ def test_replacement_cycle_is_rejected_even_when_items_are_excluded() -> None:
         )
 
 
+def test_replacement_cycle_is_rejected_even_with_explicit_sequences() -> None:
+    first = MediaAsset("first", Path("first.jpg"), MediaKind.DOCUMENT_IMAGE)
+    second = MediaAsset("second", Path("second.jpg"), MediaKind.DOCUMENT_IMAGE)
+
+    with pytest.raises(ValueError, match="replacement cycle"):
+        ProcessingSession(
+            "cycle-with-sequence",
+            Path("/tmp/cycle-with-sequence"),
+            items=[
+                SessionAsset(first, sequence=5, replacement_for="second"),
+                SessionAsset(second, sequence=6, included=False, replacement_for="first"),
+            ],
+        )
+
+
 def test_quality_finding_can_be_asset_pair_or_session_wide() -> None:
     duplicate = QualityFinding(
         kind="near-duplicate",

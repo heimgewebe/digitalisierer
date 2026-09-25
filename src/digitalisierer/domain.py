@@ -122,9 +122,37 @@ class ProcessingSession:
                 )
             current = next_item
 
+    @staticmethod
+    def _validate_replacement_graph(
+        item_by_id: dict[str, SessionAsset],
+    ) -> None:
+        for item in item_by_id.values():
+            target_id = item.replacement_for
+            if target_id is None:
+                continue
+            asset_id = item.asset.asset_id
+            if target_id == asset_id:
+                raise ValueError(f"asset cannot replace itself: {asset_id}")
+            if target_id not in item_by_id:
+                raise ValueError(
+                    "replacement_for must reference an asset_id in the same session: "
+                    f"{target_id}"
+                )
+
+        for item in item_by_id.values():
+            current = item
+            seen: set[str] = set()
+            while current.replacement_for is not None:
+                asset_id = current.asset.asset_id
+                if asset_id in seen:
+                    raise ValueError(f"replacement cycle in session: {asset_id}")
+                seen.add(asset_id)
+                current = item_by_id[current.replacement_for]
+
     def validate(self) -> None:
         """Validate review-state invariants before processing or export."""
         item_by_id = self._items_by_id()
+        self._validate_replacement_graph(item_by_id)
         included_replacements: dict[str, str] = {}
 
         for item in self.items:
@@ -133,18 +161,7 @@ class ProcessingSession:
                 continue
 
             asset_id = item.asset.asset_id
-            if target_id == asset_id:
-                raise ValueError(f"asset cannot replace itself: {asset_id}")
-
-            target = item_by_id.get(target_id)
-            if target is None:
-                raise ValueError(
-                    f"replacement_for must reference an asset_id in the same session: {target_id}"
-                )
-
-            # Resolve every replacement chain even for excluded historical items so
-            # cycles cannot remain latent in persisted review state.
-            self._effective_sequence(item, item_by_id)
+            target = item_by_id[target_id]
 
             if not item.included:
                 continue
