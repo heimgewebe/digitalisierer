@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -363,6 +364,18 @@ def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> No
     }
 
 
+def test_export_serializes_non_utf8_source_filename(tmp_path: Path) -> None:
+    raw_name = b"sample-\xff.wav"
+    source = tmp_path / os.fsdecode(raw_name)
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+
+    transcribe_and_export(source, output, FakeBackend(_result(timed=False)))
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert os.fsencode(manifest["source"]["file_name"]) == raw_name
+
+
 def test_subtitle_export_escapes_markup_and_collapses_line_breaks(
     tmp_path: Path,
 ) -> None:
@@ -519,6 +532,36 @@ def test_export_reservation_prevents_late_destination_clobber(
     assert not (output / "manifest.json").exists()
 
 
+def test_failed_partial_publication_never_deletes_final_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+    output = tmp_path / "export"
+    original_hardlink_to = Path.hardlink_to
+
+    def collide_on_second_artifact(destination: Path, target: Path) -> None:
+        if destination.name == "transcript.json":
+            destination.write_text("foreign", encoding="utf-8")
+            raise FileExistsError(destination)
+        original_hardlink_to(destination, target)
+
+    monkeypatch.setattr(Path, "hardlink_to", collide_on_second_artifact)
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="output directory changed during publication",
+    ):
+        transcribe_and_export(source, output, FakeBackend(_result()))
+
+    assert (output / "transcript.txt").read_text(encoding="utf-8") == "Hallo Welt\n"
+    assert (output / "transcript.json").read_text(encoding="utf-8") == "foreign"
+    assert (output / INCOMPLETE_MARKER).is_file()
+    assert not (output / "manifest.json").exists()
+    assert list(tmp_path.glob(".export.staging-*")) == []
+
+
 def test_export_detects_same_name_replacement_during_staging_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -555,7 +598,7 @@ def test_export_detects_same_name_replacement_during_staging_cleanup(
     assert swapped is True
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
     assert (output / INCOMPLETE_MARKER).is_file()
-    assert not (output / "manifest.json").exists()
+    assert (output / "manifest.json").is_file()
     assert list(tmp_path.glob(".export.staging-*")) == []
 
 

@@ -63,7 +63,7 @@ def _stable_source_hash(path: Path) -> tuple[str, os.stat_result]:
 def _json_text(payload: object) -> str:
     return json.dumps(
         payload,
-        ensure_ascii=False,
+        ensure_ascii=True,
         indent=2,
         sort_keys=True,
     ) + "\n"
@@ -270,13 +270,14 @@ def _cleanup_reserved_output(
     marker_fingerprint: FileFingerprint,
     published: dict[Path, FileFingerprint],
 ) -> None:
-    for destination, identity in reversed(tuple(published.items())):
-        if _path_matches_fingerprint(destination, identity):
-            try:
-                destination.unlink()
-            except FileNotFoundError:
-                pass
     shutil.rmtree(staging_dir, ignore_errors=True)
+
+    # Once any artifact reached final_dir, failure cleanup must be non-destructive.
+    # A same-user process can replace a pathname between any identity check and
+    # unlink(2); keeping the incomplete marker and partial final state is safer
+    # than risking deletion of foreign data.
+    if published:
+        return
 
     try:
         entries = list(final_dir.iterdir())
