@@ -18,7 +18,7 @@ class TranscriptionWorkflowError(RuntimeError):
     """Raised when a transcription session cannot be finalized safely."""
 
 
-INCOMPLETE_MARKER = ".digitalisierer-incomplete"
+COMPLETE_MARKER = ".digitalisierer-complete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +185,7 @@ def _path_matches_fingerprint(path: Path, fingerprint: FileFingerprint) -> bool:
         return False
 
 
-def _reserve_output_dir(final_dir: Path) -> tuple[Path, Path, FileFingerprint]:
+def _reserve_output_dir(final_dir: Path) -> Path:
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
         final_dir.mkdir(mode=0o700)
@@ -194,108 +194,72 @@ def _reserve_output_dir(final_dir: Path) -> tuple[Path, Path, FileFingerprint]:
             f"output directory already exists: {final_dir}"
         ) from exc
 
-    marker = final_dir / INCOMPLETE_MARKER
-    marker_fingerprint: FileFingerprint | None = None
     staging_dir: Path | None = None
     try:
-        with marker.open("x", encoding="utf-8") as handle:
-            handle.write("digitalisierer transcription in progress\n")
-        marker_fingerprint = _path_fingerprint(marker)
         staging_dir = Path(
             tempfile.mkdtemp(
                 prefix=f".{final_dir.name}.staging-",
                 dir=final_dir.parent,
             )
         )
-    except Exception:
+    except BaseException:
         if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
-        if marker_fingerprint is not None and _path_matches_fingerprint(
-            marker, marker_fingerprint
-        ):
-            try:
-                marker.unlink()
-            except FileNotFoundError:
-                pass
         try:
             final_dir.rmdir()
         except OSError:
             pass
         raise
     assert staging_dir is not None
-    assert marker_fingerprint is not None
-    return staging_dir, marker, marker_fingerprint
-
-
-def _restore_incomplete_marker(marker: Path) -> FileFingerprint | None:
-    try:
-        with marker.open("x", encoding="utf-8") as handle:
-            handle.write("digitalisierer transcription publication failed\n")
-    except (FileExistsError, OSError):
-        return None
-    return _path_fingerprint(marker)
+    return staging_dir
 
 
 def _verify_published_artifacts(
     final_dir: Path,
-    marker: Path,
-    marker_fingerprint: FileFingerprint,
     published: dict[Path, FileFingerprint],
     *,
-    marker_required: bool,
+    complete_marker: tuple[Path, FileFingerprint] | None = None,
 ) -> None:
     expected_names = {destination.name for destination in published}
-    if marker_required:
-        expected_names.add(marker.name)
+    if complete_marker is not None:
+        expected_names.add(complete_marker[0].name)
     actual_names = {entry.name for entry in final_dir.iterdir()}
     if actual_names != expected_names:
         raise TranscriptionWorkflowError(
             "output directory changed during publication"
         )
-    if marker_required and not _path_matches_fingerprint(marker, marker_fingerprint):
-        raise TranscriptionWorkflowError(
-            "output directory changed during publication"
-        )
-    for destination, identity in published.items():
-        if not _path_matches_fingerprint(destination, identity):
+    for destination, fingerprint in published.items():
+        if not _path_matches_fingerprint(destination, fingerprint):
             raise TranscriptionWorkflowError(
                 f"output directory changed during publication: {destination}"
+            )
+    if complete_marker is not None:
+        marker, fingerprint = complete_marker
+        if not _path_matches_fingerprint(marker, fingerprint):
+            raise TranscriptionWorkflowError(
+                f"output directory changed during publication: {marker}"
             )
 
 
 def _cleanup_reserved_output(
     final_dir: Path,
     staging_dir: Path,
-    marker: Path,
-    marker_fingerprint: FileFingerprint,
     published: dict[Path, FileFingerprint],
 ) -> None:
     shutil.rmtree(staging_dir, ignore_errors=True)
 
     # Once any artifact reached final_dir, failure cleanup must be non-destructive.
     # A same-user process can replace a pathname between any identity check and
-    # unlink(2); keeping the incomplete marker and partial final state is safer
-    # than risking deletion of foreign data.
+    # unlink(2), so never unlink final paths after publication has begun.
     if published:
         return
 
     try:
-        entries = list(final_dir.iterdir())
+        remaining = list(final_dir.iterdir())
     except FileNotFoundError:
         return
-    marker_is_ours = _path_matches_fingerprint(marker, marker_fingerprint)
-    remaining = [
-        entry
-        for entry in entries
-        if not (entry == marker and marker_is_ours)
-    ]
     if remaining:
         return
-    if marker_is_ours:
-        try:
-            marker.unlink()
-        except FileNotFoundError:
-            pass
     try:
         final_dir.rmdir()
     except OSError:
@@ -305,8 +269,6 @@ def _cleanup_reserved_output(
 def _publish_staged_artifacts(
     final_dir: Path,
     staging_dir: Path,
-    marker: Path,
-    marker_fingerprint: FileFingerprint,
     artifacts: list[ExportArtifact],
 ) -> None:
     published: dict[Path, FileFingerprint] = {}
@@ -324,47 +286,41 @@ def _publish_staged_artifacts(
                 artifact.sha256,
             )
 
-        _verify_published_artifacts(
-            final_dir,
-            marker,
-            marker_fingerprint,
-            published,
-            marker_required=True,
-        )
+        _verify_published_artifacts(final_dir, published)
 
         for artifact in artifacts:
             artifact.path.unlink()
         staging_dir.rmdir()
 
+        _verify_published_artifacts(final_dir, published)
+
+        manifest = final_dir / "manifest.json"
+        manifest_fingerprint = published.get(manifest)
+        if manifest_fingerprint is None:
+            raise TranscriptionWorkflowError(
+                "manifest was not published before commit"
+            )
+
+        complete_marker = final_dir / COMPLETE_MARKER
+        try:
+            complete_marker.hardlink_to(manifest)
+        except FileExistsError as exc:
+            raise TranscriptionWorkflowError(
+                f"output directory changed during publication: {complete_marker}"
+            ) from exc
+
         _verify_published_artifacts(
             final_dir,
-            marker,
-            marker_fingerprint,
             published,
-            marker_required=True,
-        )
-        marker.unlink()
-        _verify_published_artifacts(
-            final_dir,
-            marker,
-            marker_fingerprint,
-            published,
-            marker_required=False,
+            complete_marker=(complete_marker, manifest_fingerprint),
         )
     except BaseException:
-        if not _path_matches_fingerprint(marker, marker_fingerprint):
-            restored_identity = _restore_incomplete_marker(marker)
-            if restored_identity is not None:
-                marker_fingerprint = restored_identity
         _cleanup_reserved_output(
             final_dir,
             staging_dir,
-            marker,
-            marker_fingerprint,
             published,
         )
         raise
-
 
 def _result_payload(
     result: TranscriptionResult,
@@ -399,7 +355,7 @@ def transcribe_and_export(
         raise TranscriptionWorkflowError("transcription source must be a regular file")
 
     final_dir = output_dir.expanduser().absolute()
-    staging_dir, marker, marker_fingerprint = _reserve_output_dir(final_dir)
+    staging_dir = _reserve_output_dir(final_dir)
     artifacts: list[ExportArtifact] = []
 
     try:
@@ -500,16 +456,12 @@ def transcribe_and_export(
         _publish_staged_artifacts(
             final_dir,
             staging_dir,
-            marker,
-            marker_fingerprint,
             artifacts,
         )
     except BaseException:
         _cleanup_reserved_output(
             final_dir,
             staging_dir,
-            marker,
-            marker_fingerprint,
             {},
         )
         raise
