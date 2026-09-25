@@ -58,8 +58,9 @@ RULES = (
 
 _SENSITIVE_KEY = (
     r"(?:[A-Za-z_][A-Za-z0-9_.-]*[_.-])?"
-    r"(?:password|passwd|client[_-]?secret|secret[_-]?access[_-]?key|"
-    r"api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|secret)"
+    r"(?:password|passwd|passphrase|client[_-]?secret|secret[_-]?access[_-]?key|"
+    r"secret[_-]?key|signing[_-]?key|encryption[_-]?key|api[_-]?key|"
+    r"access[_-]?token|auth[_-]?token|private[_-]?key|secret)"
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
     rf"(?i)(?<![A-Za-z0-9_])"

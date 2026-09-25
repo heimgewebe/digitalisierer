@@ -30,18 +30,32 @@ def test_credential_assignment_supports_quoted_keys_values_and_prefixes() -> Non
     password_name = "pass" + "word"
     aws_name = "aws_" + "secret_access_key"
     client_name = "client_" + "secret"
+    secret_key_name = "SECRET_" + "KEY"
+    signing_key_name = "signing_" + "key"
+    encryption_key_name = "encryption_" + "key"
+    passphrase_name = "pass" + "phrase"
 
     unquoted = key_name + "=" + ("a" * 24)
     json_style = '"' + key_name + '": "' + ("b" * 24) + '"'
     inner_quote = password_name + '="' + "abc'defghijk" + '"'
     prefixed = aws_name + "=" + ("c" * 40)
     client = client_name + "=" + ("d" * 24)
+    case_one = secret_key_name + "=" + ("e" * 32)
+    case_two = "DJANGO_" + secret_key_name + "=" + ("f" * 32)
+    case_three = signing_key_name + "=" + ("g" * 32)
+    case_four = encryption_key_name + "=" + ("h" * 32)
+    case_five = passphrase_name + "=" + ("i" * 32)
 
     assert secret_scan.find_matches(unquoted) == [("credential-assignment", 1)]
     assert secret_scan.find_matches(json_style) == [("credential-assignment", 1)]
     assert secret_scan.find_matches(inner_quote) == [("credential-assignment", 1)]
     assert secret_scan.find_matches(prefixed) == [("credential-assignment", 1)]
     assert secret_scan.find_matches(client) == [("credential-assignment", 1)]
+    assert secret_scan.find_matches(case_one) == [("credential-assignment", 1)]
+    assert secret_scan.find_matches(case_two) == [("credential-assignment", 1)]
+    assert secret_scan.find_matches(case_three) == [("credential-assignment", 1)]
+    assert secret_scan.find_matches(case_four) == [("credential-assignment", 1)]
+    assert secret_scan.find_matches(case_five) == [("credential-assignment", 1)]
 
 
 def test_credential_assignment_rejects_mismatched_quotes_and_env_references() -> None:

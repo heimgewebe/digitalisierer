@@ -51,6 +51,7 @@ def test_active_assets_follow_review_sequence() -> None:
     )
 
     assert [asset.asset_id for asset in session.active_assets()] == ["early", "late"]
+    assert [item.asset.asset_id for item in session.active_items()] == ["early", "late"]
     assert session.active_assets() == session.ordered_assets()
 
 
@@ -116,6 +117,21 @@ def test_replacement_reference_must_exist_and_asset_ids_are_unique() -> None:
             "missing-target",
             Path("/tmp/missing"),
             items=[SessionAsset(replacement, replacement_for="missing")],
+        )
+
+
+def test_dangling_replacement_chain_fails_with_value_error_independent_of_order() -> None:
+    first = MediaAsset("first", Path("first.jpg"), MediaKind.DOCUMENT_IMAGE)
+    second = MediaAsset("second", Path("second.jpg"), MediaKind.DOCUMENT_IMAGE)
+
+    with pytest.raises(ValueError, match="replacement_for must reference"):
+        ProcessingSession(
+            "dangling-chain",
+            Path("/tmp/dangling-chain"),
+            items=[
+                SessionAsset(first, included=False, replacement_for="second"),
+                SessionAsset(second, included=False, replacement_for="missing"),
+            ],
         )
 
 

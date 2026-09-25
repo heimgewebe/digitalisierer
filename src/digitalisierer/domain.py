@@ -114,7 +114,13 @@ class ProcessingSession:
                 return current.sequence
             if current.replacement_for is None:
                 return None
-            current = item_by_id[current.replacement_for]
+            next_item = item_by_id.get(current.replacement_for)
+            if next_item is None:
+                raise ValueError(
+                    "replacement_for must reference an asset_id in the same session: "
+                    f"{current.replacement_for}"
+                )
+            current = next_item
 
     def validate(self) -> None:
         """Validate review-state invariants before processing or export."""
@@ -172,8 +178,8 @@ class ProcessingSession:
             sequence_owner[sequence] = item.asset.asset_id
 
     def active_items(self) -> list[SessionAsset]:
-        self.validate()
-        return [item for item in self.items if item.included]
+        """Return included session items in reviewed/export order."""
+        return self.ordered_items()
 
     def active_assets(self) -> list[MediaAsset]:
         """Return included assets in reviewed/export order."""
