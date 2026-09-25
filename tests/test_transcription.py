@@ -256,6 +256,38 @@ def test_locator_uses_installed_contract_and_rejects_cloud_authority(
         load_asr_locator(unsafe, home=home)
 
 
+def test_locator_rejects_nul_argv_entries_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _operator_entry(tmp_path / "operator-entry.json")
+    payload = json.loads(contract.read_text(encoding="utf-8"))
+    locators = payload["capabilityLocators"]
+    assert isinstance(locators, dict)
+    locator = locators["audioTranscription"]
+    assert isinstance(locator, dict)
+    locator["entryArgvPrefix"] = ["python3", "bad\x00script"]
+    contract.write_text(json.dumps(payload), encoding="utf-8")
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"synthetic-audio")
+
+    def forbidden_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        pytest.fail("subprocess must not run with a NUL-containing locator argv")
+
+    monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", forbidden_run)
+
+    with pytest.raises(AsrAdapterError, match="must not contain NUL bytes"):
+        load_asr_locator(contract)
+
+    status = HeimPcAsrBackend(contract).status()
+    assert status.ready is False
+    assert "must not contain NUL bytes" in status.detail
+
+    with pytest.raises(AsrAdapterError, match="must not contain NUL bytes"):
+        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
+
+
 def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

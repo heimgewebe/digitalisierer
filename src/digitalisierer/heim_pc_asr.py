@@ -85,6 +85,13 @@ def _expand_home(value: str, home: Path) -> str:
     return expanded
 
 
+def _argv_entry(value: object, *, field: str, home: Path) -> str:
+    expanded = _expand_home(_string(value, field=field), home)
+    if "\x00" in expanded:
+        raise AsrAdapterError(f"{field} must not contain NUL bytes")
+    return expanded
+
+
 def load_asr_locator(
     operator_entry_path: Path | None = None,
     *,
@@ -123,9 +130,10 @@ def load_asr_locator(
     argv: list[str] = []
     for index, item in enumerate(prefix):
         argv.append(
-            _expand_home(
-                _string(item, field=f"entryArgvPrefix[{index}]"),
-                home_dir,
+            _argv_entry(
+                item,
+                field=f"entryArgvPrefix[{index}]",
+                home=home_dir,
             )
         )
 
