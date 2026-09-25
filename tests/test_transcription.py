@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 from typing import Any
 
 import pytest
@@ -20,7 +19,6 @@ from digitalisierer.heim_pc_asr import (
     parse_route_result,
 )
 from digitalisierer.transcription import (
-    COMPLETE_MARKER,
     TranscriptionWorkflowError,
     transcribe_and_export,
 )
@@ -416,15 +414,13 @@ def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> No
     assert manifest["cloud_used"] is False
     assert manifest["parameters"] == {"strategy": "local-first"}
     assert manifest["subtitles_written"] is True
-    complete_marker = output / COMPLETE_MARKER
-    assert complete_marker.is_file()
-    manifest_stat = (output / "manifest.json").stat()
-    marker_stat = complete_marker.stat()
-    assert (manifest_stat.st_dev, manifest_stat.st_ino) == (
-        marker_stat.st_dev,
-        marker_stat.st_ino,
-    )
-    assert complete_marker.read_bytes() == (output / "manifest.json").read_bytes()
+    assert {entry.name for entry in output.iterdir()} == {
+        "transcript.txt",
+        "transcript.json",
+        "transcript.srt",
+        "transcript.vtt",
+        "manifest.json",
+    }
     assert manifest["source"]["sha256"] == hashlib.sha256(b"synthetic-audio").hexdigest()
     assert set(manifest["output_hashes"]) == {
         "transcript.txt",
@@ -544,19 +540,22 @@ def test_export_omits_subtitles_without_complete_timing(tmp_path: Path) -> None:
     assert manifest["subtitles_written"] is False
 
 
-def test_keyboard_interrupt_during_reservation_cleans_output(
+def test_keyboard_interrupt_during_staging_creation_cleans_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
+    original_mkdir = Path.mkdir
 
-    def interrupting_mkdtemp(*args: Any, **kwargs: Any) -> str:
-        del args, kwargs
-        raise KeyboardInterrupt
+    def interrupting_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.parent == tmp_path and path.name.startswith(".export.staging-"):
+            original_mkdir(path, *args, **kwargs)
+            raise KeyboardInterrupt
+        original_mkdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(tempfile, "mkdtemp", interrupting_mkdtemp)
+    monkeypatch.setattr(Path, "mkdir", interrupting_mkdir)
 
     with pytest.raises(KeyboardInterrupt):
         transcribe_and_export(source, output, FakeBackend(_result()))
@@ -575,8 +574,8 @@ def test_keyboard_interrupt_during_backend_cleans_reserved_output(
     class InterruptingBackend(FakeBackend):
         def transcribe(self, source: Path) -> TranscriptionResult:
             assert source.is_file()
-            assert output.is_dir()
-            assert not (output / COMPLETE_MARKER).exists()
+            assert not output.exists()
+            assert len(list(tmp_path.glob(".export.staging-*"))) == 1
             raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
@@ -628,8 +627,8 @@ def test_export_reservation_prevents_late_destination_clobber(
 
     class InterferingBackend(FakeBackend):
         def transcribe(self, source: Path) -> TranscriptionResult:
-            assert output.is_dir()
-            assert not (output / COMPLETE_MARKER).exists()
+            assert not output.exists()
+            output.mkdir()
             (output / "transcript.txt").write_text("foreign", encoding="utf-8")
             return self.result
 
@@ -640,7 +639,6 @@ def test_export_reservation_prevents_late_destination_clobber(
         transcribe_and_export(source, output, InterferingBackend(_result()))
 
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
-    assert not (output / COMPLETE_MARKER).exists()
     assert not (output / "manifest.json").exists()
 
 
@@ -669,44 +667,29 @@ def test_failed_partial_publication_never_deletes_final_entries(
 
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "Hallo Welt\n"
     assert (output / "transcript.json").read_text(encoding="utf-8") == "foreign"
-    assert not (output / COMPLETE_MARKER).exists()
     assert not (output / "manifest.json").exists()
     assert list(tmp_path.glob(".export.staging-*")) == []
 
 
-def test_complete_marker_collision_fails_without_deleting_foreign_marker(
+def test_keyboard_interrupt_before_first_publish_cleans_final_reservation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "sample.wav"
     source.write_bytes(b"synthetic-audio")
     output = tmp_path / "export"
-    original_hardlink_to = Path.hardlink_to
 
-    def collide_at_commit(destination: Path, target: Path) -> None:
-        if destination.name == COMPLETE_MARKER:
-            destination.write_text("foreign", encoding="utf-8")
-            raise FileExistsError(destination)
-        original_hardlink_to(destination, target)
+    def interrupting_hardlink(destination: Path, target: Path) -> None:
+        assert destination.parent == output
+        assert target.parent.name.startswith(".export.staging-")
+        raise KeyboardInterrupt
 
-    monkeypatch.setattr(Path, "hardlink_to", collide_at_commit)
+    monkeypatch.setattr(Path, "hardlink_to", interrupting_hardlink)
 
-    with pytest.raises(
-        TranscriptionWorkflowError,
-        match="output directory changed during publication",
-    ):
+    with pytest.raises(KeyboardInterrupt):
         transcribe_and_export(source, output, FakeBackend(_result()))
 
-    marker = output / COMPLETE_MARKER
-    manifest = output / "manifest.json"
-    assert marker.read_text(encoding="utf-8") == "foreign"
-    assert manifest.is_file()
-    marker_stat = marker.stat()
-    manifest_stat = manifest.stat()
-    assert (marker_stat.st_dev, marker_stat.st_ino) != (
-        manifest_stat.st_dev,
-        manifest_stat.st_ino,
-    )
+    assert not output.exists()
     assert list(tmp_path.glob(".export.staging-*")) == []
 
 
@@ -745,7 +728,6 @@ def test_export_detects_same_name_replacement_during_staging_cleanup(
 
     assert swapped is True
     assert (output / "transcript.txt").read_text(encoding="utf-8") == "foreign"
-    assert not (output / COMPLETE_MARKER).exists()
     assert (output / "manifest.json").is_file()
     assert list(tmp_path.glob(".export.staging-*")) == []
 

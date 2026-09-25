@@ -7,8 +7,8 @@ import json
 import math
 import os
 from pathlib import Path
+import secrets
 import shutil
-import tempfile
 
 from .domain import ExportArtifact, TranscriptSegment, TranscriptionResult
 from .ports import TranscriptionBackend
@@ -17,8 +17,6 @@ from .ports import TranscriptionBackend
 class TranscriptionWorkflowError(RuntimeError):
     """Raised when a transcription session cannot be finalized safely."""
 
-
-COMPLETE_MARKER = ".digitalisierer-complete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,44 +183,43 @@ def _path_matches_fingerprint(path: Path, fingerprint: FileFingerprint) -> bool:
         return False
 
 
-def _reserve_output_dir(final_dir: Path) -> Path:
-    final_dir.parent.mkdir(parents=True, exist_ok=True)
+def _path_exists(path: Path) -> bool:
     try:
-        final_dir.mkdir(mode=0o700)
-    except FileExistsError as exc:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _prepare_staging_dir(final_dir: Path) -> Path:
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    if _path_exists(final_dir):
         raise TranscriptionWorkflowError(
             f"output directory already exists: {final_dir}"
-        ) from exc
-
-    staging_dir: Path | None = None
-    try:
-        staging_dir = Path(
-            tempfile.mkdtemp(
-                prefix=f".{final_dir.name}.staging-",
-                dir=final_dir.parent,
-            )
         )
-    except BaseException:
-        if staging_dir is not None:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    for _ in range(16):
+        staging_dir = final_dir.parent / (
+            f".{final_dir.name}.staging-{secrets.token_hex(8)}"
+        )
         try:
-            final_dir.rmdir()
-        except OSError:
-            pass
-        raise
-    assert staging_dir is not None
-    return staging_dir
+            staging_dir.mkdir(mode=0o700)
+            return staging_dir
+        except FileExistsError:
+            continue
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+    raise TranscriptionWorkflowError(
+        f"unable to reserve staging directory for: {final_dir}"
+    )
 
 
 def _verify_published_artifacts(
     final_dir: Path,
     published: dict[Path, FileFingerprint],
-    *,
-    complete_marker: tuple[Path, FileFingerprint] | None = None,
 ) -> None:
     expected_names = {destination.name for destination in published}
-    if complete_marker is not None:
-        expected_names.add(complete_marker[0].name)
     actual_names = {entry.name for entry in final_dir.iterdir()}
     if actual_names != expected_names:
         raise TranscriptionWorkflowError(
@@ -233,25 +230,20 @@ def _verify_published_artifacts(
             raise TranscriptionWorkflowError(
                 f"output directory changed during publication: {destination}"
             )
-    if complete_marker is not None:
-        marker, fingerprint = complete_marker
-        if not _path_matches_fingerprint(marker, fingerprint):
-            raise TranscriptionWorkflowError(
-                f"output directory changed during publication: {marker}"
-            )
 
 
-def _cleanup_reserved_output(
+def _cleanup_failed_publication(
     final_dir: Path,
     staging_dir: Path,
     published: dict[Path, FileFingerprint],
+    *,
+    final_dir_created: bool,
 ) -> None:
     shutil.rmtree(staging_dir, ignore_errors=True)
 
-    # Once any artifact reached final_dir, failure cleanup must be non-destructive.
-    # A same-user process can replace a pathname between any identity check and
-    # unlink(2), so never unlink final paths after publication has begun.
-    if published:
+    # Once any artifact reached final_dir, failure cleanup must be
+    # non-destructive: leave the partial state for explicit inspection.
+    if published or not final_dir_created:
         return
 
     try:
@@ -272,7 +264,16 @@ def _publish_staged_artifacts(
     artifacts: list[ExportArtifact],
 ) -> None:
     published: dict[Path, FileFingerprint] = {}
+    final_dir_created = False
     try:
+        try:
+            final_dir.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise TranscriptionWorkflowError(
+                f"output directory changed during publication: {final_dir}"
+            ) from exc
+        final_dir_created = True
+
         for artifact in artifacts:
             destination = final_dir / artifact.path.name
             try:
@@ -292,33 +293,15 @@ def _publish_staged_artifacts(
             artifact.path.unlink()
         staging_dir.rmdir()
 
+        # This is the commit point: after this exact verification there are no
+        # further mutations in final_dir.
         _verify_published_artifacts(final_dir, published)
-
-        manifest = final_dir / "manifest.json"
-        manifest_fingerprint = published.get(manifest)
-        if manifest_fingerprint is None:
-            raise TranscriptionWorkflowError(
-                "manifest was not published before commit"
-            )
-
-        complete_marker = final_dir / COMPLETE_MARKER
-        try:
-            complete_marker.hardlink_to(manifest)
-        except FileExistsError as exc:
-            raise TranscriptionWorkflowError(
-                f"output directory changed during publication: {complete_marker}"
-            ) from exc
-
-        _verify_published_artifacts(
-            final_dir,
-            published,
-            complete_marker=(complete_marker, manifest_fingerprint),
-        )
     except BaseException:
-        _cleanup_reserved_output(
+        _cleanup_failed_publication(
             final_dir,
             staging_dir,
             published,
+            final_dir_created=final_dir_created,
         )
         raise
 
@@ -355,7 +338,7 @@ def transcribe_and_export(
         raise TranscriptionWorkflowError("transcription source must be a regular file")
 
     final_dir = output_dir.expanduser().absolute()
-    staging_dir = _reserve_output_dir(final_dir)
+    staging_dir = _prepare_staging_dir(final_dir)
     artifacts: list[ExportArtifact] = []
 
     try:
@@ -459,11 +442,9 @@ def transcribe_and_export(
             artifacts,
         )
     except BaseException:
-        _cleanup_reserved_output(
-            final_dir,
-            staging_dir,
-            {},
-        )
+        # Before publication final_dir does not exist. Publication owns any
+        # final-dir cleanup; this outer path only removes private staging.
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
     finalized_artifacts = tuple(
