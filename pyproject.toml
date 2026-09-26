@@ -12,7 +12,7 @@ keywords = ["digitization", "ocr", "transcription", "scanner", "local-first"]
 
 [project.optional-dependencies]
 dev = [
-  "mypy>=1.13,<2",
+  "mypy>=1.13,<3",
   "pytest>=8,<10",
 ]
 
