@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .domain import MediaAsset, ProcessingSession, QualityFinding
+from .domain import MediaAsset, ProcessingSession, QualityFinding, TranscriptionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,14 +12,6 @@ class CaptureStatus:
     connected: bool
     ready: bool
     detail: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptArtifact:
-    text_path: Path
-    json_path: Path | None = None
-    srt_path: Path | None = None
-    vtt_path: Path | None = None
 
 
 class CaptureBackend(Protocol):
@@ -54,14 +46,10 @@ class OCRBackend(Protocol):
 
 class TranscriptionBackend(Protocol):
     name: str
+    capability: str
+    authority: str
 
-    def transcribe(
-        self,
-        source: Path,
-        output_dir: Path,
-        *,
-        language: str | None = None,
-    ) -> TranscriptArtifact:
+    def transcribe(self, source: Path) -> TranscriptionResult:
         ...
 
 

@@ -41,12 +41,12 @@ Choose a workflow that is structurally different from page scanning:
 - [ ] import audio/video
 - [ ] ffprobe metadata
 - [ ] audio extraction/normalization
-- [ ] first local transcription adapter
-- [ ] timestamped transcript model
-- [ ] TXT/JSON/SRT/VTT export
+- [x] first local transcription adapter (reuses the Heim-PC ASR authority)
+- [x] timestamped transcript model with nullable timing/speaker/confidence
+- [x] TXT/JSON export plus SRT/VTT when complete timing is supplied
 - [ ] confidence/quality findings
 - [ ] transcript correction workflow
-- [ ] provenance records engine/model/version and parameters
+- [x] provenance records source hash, authority/adapter, engine/model/version, language, parameters and output hashes
 
 **Exit criterion:** one real recording can be imported, transcribed, corrected and exported with no scanner-specific assumptions in the core.
 
