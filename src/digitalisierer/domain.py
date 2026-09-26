@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from pathlib import Path
 
 
@@ -75,6 +76,57 @@ class ExportArtifact:
     kind: str
     path: Path
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSegment:
+    text: str
+    start: float | None = None
+    end: float | None = None
+    speaker: str | None = None
+    confidence: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.start is not None and (
+            isinstance(self.start, bool)
+            or not math.isfinite(self.start)
+            or self.start < 0
+        ):
+            raise ValueError("transcript segment start must be a finite non-negative number")
+        if self.end is not None and (
+            isinstance(self.end, bool)
+            or not math.isfinite(self.end)
+            or self.end < 0
+        ):
+            raise ValueError("transcript segment end must be a finite non-negative number")
+        if self.start is not None and self.end is not None and self.end < self.start:
+            raise ValueError("transcript segment end must not precede start")
+        if self.speaker is not None and not self.speaker.strip():
+            raise ValueError("transcript segment speaker must not be empty")
+        if self.confidence is not None and (
+            isinstance(self.confidence, bool)
+            or not math.isfinite(self.confidence)
+            or not 0.0 <= self.confidence <= 1.0
+        ):
+            raise ValueError("transcript segment confidence must be finite and between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class Transcript:
+    text: str
+    language: str | None = None
+    segments: tuple[TranscriptSegment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionResult:
+    transcript: Transcript
+    provider: str
+    engine: str
+    model: str
+    model_revision: str | None = None
+    backend_version: str | None = None
+    cloud_used: bool = False
 
 
 @dataclass(slots=True)

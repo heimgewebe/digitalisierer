@@ -93,7 +93,9 @@ Provenance
 
 ## Current status
 
-Very early foundation. The repository currently contains the domain/port skeleton, architectural decisions, CI and a `doctor` command. The existing working CZUR/OCR scripts on the development machine are migration input, not a reason to copy implementation accidents into the architecture.
+The public foundation is in place, and the first transcription integration now exercises the media-neutral capability boundary. The existing CZUR/OCR scripts on the development machine remain migration input rather than architecture.
+
+Transcription reuses the installed Heim-PC `audio.transcribe` authority. Digitalisierer does not install another ASR runtime, pin an engine, create a second model cache or authorize cloud use. It validates the structured transcript contract and owns the resulting export/provenance workflow.
 
 Install development dependencies and run the default readiness check:
 
@@ -109,7 +111,15 @@ digitalisierer doctor --require capture-czur
 digitalisierer doctor --require transcription
 ```
 
-The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities.
+The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities. Expensive optional probes are lazy: transcription reports `ready: null` unless it is explicitly required, so the default doctor does not invoke the Heim-PC ASR runtime.
+
+Transcribe one local media file through the canonical local ASR authority:
+
+```bash
+digitalisierer transcribe /path/to/recording.m4a
+```
+
+The output directory contains `transcript.txt`, `transcript.json`, `manifest.json` and, when complete segment timing is available, `transcript.srt` and `transcript.vtt`. The manifest records the source hash, adapter/authority, provider, engine/model/backend metadata, language when supplied, output hashes and whether cloud processing was used.
 
 ## Roadmap
 

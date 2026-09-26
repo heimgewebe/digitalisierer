@@ -10,6 +10,7 @@ from digitalisierer.domain import (
     ProcessingSession,
     QualityFinding,
     SessionAsset,
+    TranscriptSegment,
 )
 
 
@@ -229,6 +230,26 @@ def test_quality_finding_rejects_duplicate_asset_references() -> None:
             message="invalid duplicate references",
             asset_ids=("page-01", "page-01"),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start", float("nan")),
+        ("start", float("inf")),
+        ("end", float("-inf")),
+        ("confidence", float("nan")),
+    ],
+)
+def test_transcript_segment_rejects_non_finite_values(
+    field: str,
+    value: float,
+) -> None:
+    kwargs: dict[str, object] = {"text": "segment"}
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match="finite"):
+        TranscriptSegment(**kwargs)  # type: ignore[arg-type]
 
 
 def test_project_groups_sessions_without_owning_engine_state() -> None:
