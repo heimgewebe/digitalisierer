@@ -477,7 +477,19 @@ def observe_scan_folder(
     if not isinstance(review_items, dict):
         raise ScannerWorkflowError("scan review items must be an object")
 
-    for sequence, source in enumerate(selected, start=start):
+    existing_sequences: list[int] = []
+    for decision in review_items.values():
+        if not isinstance(decision, dict):
+            continue
+        sequence = decision.get("sequence")
+        if sequence is None:
+            continue
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise ScannerWorkflowError("scan review contains an invalid sequence")
+        existing_sequences.append(sequence)
+    next_sequence = max([start - 1, *existing_sequences]) + 1
+
+    for source in selected:
         sha256, source_stat = _stable_hash(source)
         asset_id = _asset_id(source.name, sha256)
         suffix = source.suffix.lower()
@@ -491,10 +503,11 @@ def observe_scan_folder(
                 )
             if not isinstance(review_items.get(asset_id), dict):
                 review_items[asset_id] = {
-                    "sequence": sequence,
+                    "sequence": next_sequence,
                     "included": True,
                     "replacement_for": None,
                 }
+                next_sequence += 1
             skipped.append(asset_id)
             continue
 
@@ -520,10 +533,11 @@ def observe_scan_folder(
         assets.append(record)
         known_by_id[asset_id] = record
         review_items[asset_id] = {
-            "sequence": sequence,
+            "sequence": next_sequence,
             "included": True,
             "replacement_for": None,
         }
+        next_sequence += 1
         imported.append(asset_id)
 
     after_signature = [

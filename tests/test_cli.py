@@ -257,3 +257,27 @@ def test_invalid_scanner_jobs_env_is_reported_by_scan_finalize(
         == 1
     )
     assert "scan failed:" in capsys.readouterr().err
+
+def test_invalid_scan_identity_is_reported_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        cli.main(
+            [
+                "scan",
+                "init",
+                "--project",
+                "../bad",
+                "--session",
+                "chapter",
+                "--library-root",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("scan failed: ")
+    assert "Traceback" not in captured.err

@@ -59,6 +59,28 @@ def test_observe_resume_skips_already_preserved_assets(tmp_path: Path) -> None:
     assert second.skipped_asset_ids == first.imported_asset_ids
 
 
+def test_observe_appends_sequences_for_a_second_capture_folder(
+    tmp_path: Path,
+) -> None:
+    first_capture = tmp_path / "capture-1"
+    second_capture = tmp_path / "capture-2"
+    first_capture.mkdir()
+    second_capture.mkdir()
+    _image(first_capture / "image00001.jpg", 40)
+    _image(first_capture / "image00002.jpg", 80)
+    _image(second_capture / "image00001.jpg", 120)
+    _image(second_capture / "image00002.jpg", 160)
+    paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
+
+    first = observe_scan_folder(paths, first_capture)
+    second = observe_scan_folder(paths, second_capture)
+    processing = load_processing_session(paths)
+
+    assert len(first.imported_asset_ids) == 2
+    assert len(second.imported_asset_ids) == 2
+    assert [asset.sequence for asset in processing.ordered_items()] == [1, 2, 3, 4]
+
+
 def test_review_state_controls_export_order_without_mutating_sources(
     tmp_path: Path,
 ) -> None:

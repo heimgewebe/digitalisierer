@@ -265,12 +265,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return doctor(required)
     if args.command == "scan":
-        paths = scan_session_paths(
-            args.project,
-            args.session,
-            args.library_root.expanduser() if args.library_root is not None else None,
-        )
         try:
+            paths = scan_session_paths(
+                args.project,
+                args.session,
+                args.library_root.expanduser()
+                if args.library_root is not None
+                else None,
+            )
             if args.scan_command == "init":
                 paths = create_or_resume_scan_session(
                     args.project,
