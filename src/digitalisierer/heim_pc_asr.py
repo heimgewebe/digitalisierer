@@ -12,9 +12,9 @@ from .domain import Transcript, TranscriptSegment, TranscriptionResult
 
 
 ASR_CAPABILITY = "audio.transcribe"
-ASR_AUTHORITY = "heim_pc_asr_open_engine"
-TRANSCRIPT_KIND = "heim-pc.asr-transcript"
-ROUTE_RESULT_KIND = "heim-pc.asr-route-result"
+ASR_AUTHORITY = "heimgewebe_asr_open_engine"
+TRANSCRIPT_KIND = "heimgewebe.asr-transcript"
+ROUTE_RESULT_KIND = "heimgewebe.asr-route-result"
 
 
 class AsrAdapterError(RuntimeError):
@@ -261,8 +261,8 @@ def parse_route_result(payload: object) -> TranscriptionResult:
     return _parse_transcript(route.get("selected"))
 
 
-class HeimPcAsrBackend:
-    name = "heim-pc-asr"
+class HeimgewebeAsrBackend:
+    name = "heimgewebe-asr"
     capability = ASR_CAPABILITY
     authority = ASR_AUTHORITY
 
@@ -299,23 +299,23 @@ class HeimPcAsrBackend:
         except AsrAdapterError as exc:
             return AsrBackendStatus(
                 ready=False,
-                detail=f"heim-pc ASR authority is not ready: {exc}",
+                detail=f"heimgewebe ASR authority is not ready: {exc}",
                 entrypoint=None,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeError):
             return AsrBackendStatus(
                 ready=False,
-                detail="heim-pc ASR authority is not ready",
+                detail="heimgewebe ASR authority is not ready",
                 entrypoint=None,
             )
         detail = _diagnostic_tail(completed.stderr)
         return AsrBackendStatus(
             ready=completed.returncode == 0,
             detail=(
-                "heim-pc audio.transcribe authority ready"
+                "heimgewebe audio.transcribe authority ready"
                 if completed.returncode == 0
                 else (
-                    f"heim-pc ASR doctor exited with status {completed.returncode}"
+                    f"heimgewebe ASR doctor exited with status {completed.returncode}"
                     + (f": {detail}" if detail else "")
                 )
             ),
@@ -343,15 +343,19 @@ class HeimPcAsrBackend:
                 timeout=self._timeout_seconds,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
-            raise AsrAdapterError("heim-pc ASR invocation failed") from exc
+            raise AsrAdapterError("heimgewebe ASR invocation failed") from exc
         if completed.returncode != 0:
             detail = _diagnostic_tail(completed.stderr)
             raise AsrAdapterError(
-                f"heim-pc ASR exited with status {completed.returncode}"
+                f"heimgewebe ASR exited with status {completed.returncode}"
                 + (f": {detail}" if detail else "")
             )
         try:
             payload: object = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise AsrAdapterError("heim-pc ASR returned invalid JSON") from exc
+            raise AsrAdapterError("heimgewebe ASR returned invalid JSON") from exc
         return parse_route_result(payload)
+
+
+# Compatibility alias for callers that still import the legacy host-shaped name.
+HeimPcAsrBackend = HeimgewebeAsrBackend

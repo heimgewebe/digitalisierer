@@ -38,11 +38,13 @@ Use the already proven ET24 path to exercise real capture, review and export:
 
 Choose a workflow that is structurally different from page scanning:
 
-- [ ] import audio/video
+- [x] import/preserve audio for one-shot transcription bundles
+- [ ] video import
 - [ ] ffprobe metadata
 - [ ] audio extraction/normalization
-- [x] first local transcription adapter (reuses the Heim-PC ASR authority)
+- [x] first local transcription adapter (reuses the generic `heimgewebe/asr` authority)
 - [x] timestamped transcript model with nullable timing/speaker/confidence
+- [x] standardized `~/Digitalisierer/projects/<project>/sessions/<session>` storage with preserved source
 - [x] TXT/JSON export plus SRT/VTT when complete timing is supplied
 - [ ] confidence/quality findings
 - [ ] transcript correction workflow

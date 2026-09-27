@@ -9,7 +9,9 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 
 from .domain import ExportArtifact, TranscriptSegment, TranscriptionResult
 from .ports import TranscriptionBackend
@@ -19,6 +21,11 @@ class TranscriptionWorkflowError(RuntimeError):
     """Raised when a transcription session cannot be finalized safely."""
 
 
+DEFAULT_LIBRARY_DIRNAME = "Digitalisierer"
+DEFAULT_PROJECT_ID = "inbox"
+TRANSCRIPTION_BUNDLE_LAYOUT = "digitalisierer.transcription-bundle.v1"
+PRESERVED_SOURCE_NAME = "source.original"
+
 
 @dataclass(frozen=True, slots=True)
 class TranscriptionExport:
@@ -26,9 +33,23 @@ class TranscriptionExport:
     artifacts: tuple[ExportArtifact, ...]
 
 
-def default_output_dir(source: Path) -> Path:
-    source_path = source.expanduser()
-    return source_path.parent / f"{source_path.stem}.digitalisierer-transcript"
+@dataclass(frozen=True, slots=True)
+class TranscriptionSourceIdentity:
+    path: Path
+    sha256: str
+    stat_identity: tuple[int, int, int, int]
+
+
+def default_library_root() -> Path:
+    configured = os.environ.get("DIGITALISIERER_LIBRARY_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / DEFAULT_LIBRARY_DIRNAME
+
+
+def _safe_session_stem(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return normalized or "source"
 
 
 def _sha256_file(path: Path) -> str:
@@ -57,6 +78,36 @@ def _stable_source_hash(path: Path) -> tuple[str, os.stat_result]:
             "transcription source changed while hashing"
         )
     return digest, after
+
+
+def transcription_source_identity(source: Path) -> TranscriptionSourceIdentity:
+    source_path = source.expanduser().resolve(strict=True)
+    if not source_path.is_file():
+        raise TranscriptionWorkflowError("transcription source must be a regular file")
+    source_sha256, source_stat = _stable_source_hash(source_path)
+    return TranscriptionSourceIdentity(
+        path=source_path,
+        sha256=source_sha256,
+        stat_identity=_stat_identity(source_stat),
+    )
+
+
+def _default_output_dir_from_identity(
+    identity: TranscriptionSourceIdentity,
+    library_root: Path | None = None,
+) -> Path:
+    session_id = (
+        f"{_safe_session_stem(identity.path.stem)}--{identity.sha256[:12]}"
+    )
+    root = (library_root or default_library_root()).expanduser()
+    return root / "projects" / DEFAULT_PROJECT_ID / "sessions" / session_id
+
+
+def default_output_dir(source: Path, library_root: Path | None = None) -> Path:
+    return _default_output_dir_from_identity(
+        transcription_source_identity(source),
+        library_root,
+    )
 
 
 def _json_text(payload: object) -> str:
@@ -163,6 +214,32 @@ def _write_artifact(
     return ExportArtifact(kind=kind, path=path, sha256=_sha256_file(path))
 
 
+def _copy_source_artifact(
+    root: Path,
+    source: Path,
+    *,
+    expected_sha256: str,
+    expected_stat: os.stat_result,
+) -> ExportArtifact:
+    target = root / PRESERVED_SOURCE_NAME
+    with source.open("rb") as source_handle, target.open("xb") as target_handle:
+        shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+    copied_sha256 = _sha256_file(target)
+    after = source.stat()
+    if (
+        copied_sha256 != expected_sha256
+        or _stat_identity(after) != _stat_identity(expected_stat)
+    ):
+        raise TranscriptionWorkflowError(
+            "transcription source changed while preserving the source asset"
+        )
+    return ExportArtifact(
+        kind="source-preserved",
+        path=target,
+        sha256=copied_sha256,
+    )
+
+
 FileIdentity = tuple[int, int]
 FileFingerprint = tuple[FileIdentity, str]
 
@@ -198,6 +275,7 @@ _STAGED_ARTIFACT_NAMES = frozenset(
         "transcript.srt",
         "transcript.vtt",
         "manifest.json",
+        PRESERVED_SOURCE_NAME,
     }
 )
 
@@ -529,10 +607,22 @@ def transcribe_and_export(
     source: Path,
     output_dir: Path,
     backend: TranscriptionBackend,
+    *,
+    expected_source_identity: TranscriptionSourceIdentity | None = None,
 ) -> TranscriptionExport:
     source_path = source.expanduser().resolve(strict=True)
     if not source_path.is_file():
         raise TranscriptionWorkflowError("transcription source must be a regular file")
+
+    source_sha256, source_stat = _stable_source_hash(source_path)
+    if expected_source_identity is not None and (
+        source_path != expected_source_identity.path
+        or source_sha256 != expected_source_identity.sha256
+        or _stat_identity(source_stat) != expected_source_identity.stat_identity
+    ):
+        raise TranscriptionWorkflowError(
+            "transcription source changed after default bundle identity was prepared"
+        )
 
     final_dir = output_dir.expanduser().absolute()
     staging_dir, staging_fd, staging_identity = _prepare_staging_dir(final_dir)
@@ -540,7 +630,6 @@ def transcribe_and_export(
     exposed = False
 
     try:
-        source_sha256, source_stat = _stable_source_hash(source_path)
         result = backend.transcribe(source_path)
         verified_sha256, verified_stat = _stable_source_hash(source_path)
         if (
@@ -556,6 +645,14 @@ def transcribe_and_export(
                 "transcription backend used cloud without Digitalisierer authorization"
             )
 
+        artifacts.append(
+            _copy_source_artifact(
+                staging_dir,
+                source_path,
+                expected_sha256=source_sha256,
+                expected_stat=source_stat,
+            )
+        )
         artifacts.append(
             _write_artifact(
                 staging_dir,
@@ -597,6 +694,7 @@ def transcribe_and_export(
         output_hashes = {
             artifact.path.name: artifact.sha256
             for artifact in artifacts
+            if artifact.kind != "source-preserved"
         }
         manifest = {
             "schema_version": 1,
@@ -604,10 +702,16 @@ def transcribe_and_export(
             "source": {
                 "file_name": source_path.name,
                 "sha256": source_sha256,
+                "preserved_as": PRESERVED_SOURCE_NAME,
+                "preserved_sha256": source_sha256,
                 "media_metadata": {
                     "bytes": source_stat.st_size,
                     "suffix": source_path.suffix.casefold(),
                 },
+            },
+            "storage": {
+                "layout": TRANSCRIPTION_BUNDLE_LAYOUT,
+                "bundle_id": final_dir.name,
             },
             "capability": backend.capability,
             "adapter": backend.name,
@@ -678,3 +782,18 @@ def transcribe_and_export(
         for artifact in artifacts
     )
     return TranscriptionExport(output_dir=final_dir, artifacts=finalized_artifacts)
+
+
+def transcribe_to_library(
+    source: Path,
+    backend: TranscriptionBackend,
+    library_root: Path | None = None,
+) -> TranscriptionExport:
+    identity = transcription_source_identity(source)
+    output_dir = _default_output_dir_from_identity(identity, library_root)
+    return transcribe_and_export(
+        identity.path,
+        output_dir,
+        backend,
+        expected_source_identity=identity,
+    )

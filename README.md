@@ -95,7 +95,7 @@ Provenance
 
 The public foundation is in place, and the first transcription integration now exercises the media-neutral capability boundary. The existing CZUR/OCR scripts on the development machine remain migration input rather than architecture.
 
-Transcription reuses the installed Heim-PC `audio.transcribe` authority. Digitalisierer does not install another ASR runtime, pin an engine, create a second model cache or authorize cloud use. It validates the structured transcript contract and owns the resulting export/provenance workflow.
+Transcription reuses the installed generic `audio.transcribe` authority from `heimgewebe/asr`. Digitalisierer does not install another ASR runtime, pin an engine, create a second model cache or authorize cloud use. It validates the structured transcript contract and owns source preservation, export and provenance.
 
 Install development dependencies and run the default readiness check:
 
@@ -111,7 +111,7 @@ digitalisierer doctor --require capture-czur
 digitalisierer doctor --require transcription
 ```
 
-The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities. Expensive optional probes are lazy: transcription reports `ready: null` unless it is explicitly required, so the default doctor does not invoke the Heim-PC ASR runtime.
+The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities. Expensive optional probes are lazy: transcription reports `ready: null` unless it is explicitly required, so the default doctor does not invoke the shared ASR runtime.
 
 Transcribe one local media file through the canonical local ASR authority:
 
@@ -119,7 +119,24 @@ Transcribe one local media file through the canonical local ASR authority:
 digitalisierer transcribe /path/to/recording.m4a
 ```
 
-The output directory contains `transcript.txt`, `transcript.json`, `manifest.json` and, when complete segment timing is available, `transcript.srt` and `transcript.vtt`. The manifest records the source hash, adapter/authority, provider, engine/model/backend metadata, language when supplied, output hashes and whether cloud processing was used.
+By default, Digitalisierer publishes one immutable session bundle below
+`$DIGITALISIERER_LIBRARY_ROOT` or `~/Digitalisierer`:
+
+```
+~/Digitalisierer/
+  projects/
+    inbox/
+      sessions/
+        <source-stem>--<sha256-prefix>/
+          source.original
+          transcript.txt
+          transcript.json
+          transcript.srt      # when complete timing exists
+          transcript.vtt      # when complete timing exists
+          manifest.json
+```
+
+The exact source bytes are preserved as `source.original`. The manifest binds the original file name and SHA-256, the storage-layout version, ASR authority/adapter, provider, engine/model/backend metadata, language, output hashes and whether cloud processing was used. An existing session directory is never silently overwritten. Use `--output-dir` for an intentional alternate bundle or `--library-root` to select another library root.
 
 ## Roadmap
 
