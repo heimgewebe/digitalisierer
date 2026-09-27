@@ -9,7 +9,7 @@ import sys
 from typing import TypedDict
 
 from . import __version__
-from .heim_pc_asr import AsrAdapterError, HeimPcAsrBackend
+from .heim_pc_asr import AsrAdapterError, HeimgewebeAsrBackend
 from .ports import TranscriptionBackend
 from .transcription import (
     TranscriptionWorkflowError,
@@ -48,15 +48,15 @@ def _czur_app_path() -> Path:
 
 
 def _transcription_backend() -> TranscriptionBackend:
-    return HeimPcAsrBackend()
+    return HeimgewebeAsrBackend()
 
 
 def _transcription_capability() -> CapabilityStatus:
-    status = HeimPcAsrBackend().status()
+    status = HeimgewebeAsrBackend().status()
     return {
         "ready": status.ready,
         "checks": {
-            "heim-pc-asr": {
+            "heimgewebe-asr": {
                 "found": status.ready,
                 "path": status.entrypoint,
             }
@@ -137,13 +137,22 @@ def main(argv: list[str] | None = None) -> int:
 
     transcribe_parser = sub.add_parser(
         "transcribe",
-        help="transcribe one local media file through the canonical heim-pc ASR authority",
+        help="transcribe one local media file through the canonical heimgewebe/asr authority",
     )
     transcribe_parser.add_argument("source", type=Path)
-    transcribe_parser.add_argument(
+    storage_group = transcribe_parser.add_mutually_exclusive_group()
+    storage_group.add_argument(
         "--output-dir",
         type=Path,
-        help="output directory; default: <source>.digitalisierer-transcript",
+        help="explicit bundle directory; must not already exist",
+    )
+    storage_group.add_argument(
+        "--library-root",
+        type=Path,
+        help=(
+            "Digitalisierer library root; default: $DIGITALISIERER_LIBRARY_ROOT "
+            "or ~/Digitalisierer"
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -156,12 +165,19 @@ def main(argv: list[str] | None = None) -> int:
         return doctor(required)
     if args.command == "transcribe":
         source = args.source.expanduser()
-        output_dir = (
-            args.output_dir.expanduser()
-            if args.output_dir is not None
-            else default_output_dir(source)
-        )
         try:
+            output_dir = (
+                args.output_dir.expanduser()
+                if args.output_dir is not None
+                else default_output_dir(
+                    source,
+                    (
+                        args.library_root.expanduser()
+                        if args.library_root is not None
+                        else None
+                    ),
+                )
+            )
             exported = transcribe_and_export(
                 source,
                 output_dir,

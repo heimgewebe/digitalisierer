@@ -9,7 +9,9 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 
 from .domain import ExportArtifact, TranscriptSegment, TranscriptionResult
 from .ports import TranscriptionBackend
@@ -19,6 +21,11 @@ class TranscriptionWorkflowError(RuntimeError):
     """Raised when a transcription session cannot be finalized safely."""
 
 
+DEFAULT_LIBRARY_DIRNAME = "Digitalisierer"
+DEFAULT_PROJECT_ID = "inbox"
+TRANSCRIPTION_BUNDLE_LAYOUT = "digitalisierer.transcription-bundle.v1"
+PRESERVED_SOURCE_NAME = "source.original"
+
 
 @dataclass(frozen=True, slots=True)
 class TranscriptionExport:
@@ -26,9 +33,26 @@ class TranscriptionExport:
     artifacts: tuple[ExportArtifact, ...]
 
 
-def default_output_dir(source: Path) -> Path:
-    source_path = source.expanduser()
-    return source_path.parent / f"{source_path.stem}.digitalisierer-transcript"
+def default_library_root() -> Path:
+    configured = os.environ.get("DIGITALISIERER_LIBRARY_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / DEFAULT_LIBRARY_DIRNAME
+
+
+def _safe_session_stem(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return normalized or "source"
+
+
+def default_output_dir(source: Path, library_root: Path | None = None) -> Path:
+    source_path = source.expanduser().resolve(strict=True)
+    if not source_path.is_file():
+        raise TranscriptionWorkflowError("transcription source must be a regular file")
+    source_sha256 = _sha256_file(source_path)
+    session_id = f"{_safe_session_stem(source_path.stem)}--{source_sha256[:12]}"
+    root = (library_root or default_library_root()).expanduser()
+    return root / "projects" / DEFAULT_PROJECT_ID / "sessions" / session_id
 
 
 def _sha256_file(path: Path) -> str:
@@ -163,6 +187,32 @@ def _write_artifact(
     return ExportArtifact(kind=kind, path=path, sha256=_sha256_file(path))
 
 
+def _copy_source_artifact(
+    root: Path,
+    source: Path,
+    *,
+    expected_sha256: str,
+    expected_stat: os.stat_result,
+) -> ExportArtifact:
+    target = root / PRESERVED_SOURCE_NAME
+    with source.open("rb") as source_handle, target.open("xb") as target_handle:
+        shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+    copied_sha256 = _sha256_file(target)
+    after = source.stat()
+    if (
+        copied_sha256 != expected_sha256
+        or _stat_identity(after) != _stat_identity(expected_stat)
+    ):
+        raise TranscriptionWorkflowError(
+            "transcription source changed while preserving the source asset"
+        )
+    return ExportArtifact(
+        kind="source-preserved",
+        path=target,
+        sha256=copied_sha256,
+    )
+
+
 FileIdentity = tuple[int, int]
 FileFingerprint = tuple[FileIdentity, str]
 
@@ -198,6 +248,7 @@ _STAGED_ARTIFACT_NAMES = frozenset(
         "transcript.srt",
         "transcript.vtt",
         "manifest.json",
+        PRESERVED_SOURCE_NAME,
     }
 )
 
@@ -557,6 +608,14 @@ def transcribe_and_export(
             )
 
         artifacts.append(
+            _copy_source_artifact(
+                staging_dir,
+                source_path,
+                expected_sha256=source_sha256,
+                expected_stat=source_stat,
+            )
+        )
+        artifacts.append(
             _write_artifact(
                 staging_dir,
                 name="transcript.txt",
@@ -597,6 +656,7 @@ def transcribe_and_export(
         output_hashes = {
             artifact.path.name: artifact.sha256
             for artifact in artifacts
+            if artifact.kind != "source-preserved"
         }
         manifest = {
             "schema_version": 1,
@@ -604,10 +664,16 @@ def transcribe_and_export(
             "source": {
                 "file_name": source_path.name,
                 "sha256": source_sha256,
+                "preserved_as": PRESERVED_SOURCE_NAME,
+                "preserved_sha256": source_sha256,
                 "media_metadata": {
                     "bytes": source_stat.st_size,
                     "suffix": source_path.suffix.casefold(),
                 },
+            },
+            "storage": {
+                "layout": TRANSCRIPTION_BUNDLE_LAYOUT,
+                "bundle_id": final_dir.name,
             },
             "capability": backend.capability,
             "adapter": backend.name,

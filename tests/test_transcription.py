@@ -15,7 +15,7 @@ from digitalisierer.domain import Transcript, TranscriptSegment, TranscriptionRe
 from digitalisierer.heim_pc_asr import (
     ASR_AUTHORITY,
     AsrAdapterError,
-    HeimPcAsrBackend,
+    HeimgewebeAsrBackend,
     load_asr_locator,
     parse_route_result,
 )
@@ -32,11 +32,11 @@ def _route_payload(
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "kind": "heim-pc.asr-route-result",
+        "kind": "heimgewebe.asr-route-result",
         "strategy": "local-first",
         "selected": {
             "schema_version": 1,
-            "kind": "heim-pc.asr-transcript",
+            "kind": "heimgewebe.asr-transcript",
             "provider": "local",
             "engine": "faster-whisper",
             "model": "Systran/faster-whisper-large-v3",
@@ -280,12 +280,12 @@ def test_locator_rejects_nul_argv_entries_before_subprocess(
     with pytest.raises(AsrAdapterError, match="must not contain NUL bytes"):
         load_asr_locator(contract)
 
-    status = HeimPcAsrBackend(contract).status()
+    status = HeimgewebeAsrBackend(contract).status()
     assert status.ready is False
     assert "must not contain NUL bytes" in status.detail
 
     with pytest.raises(AsrAdapterError, match="must not contain NUL bytes"):
-        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
+        HeimgewebeAsrBackend(contract, timeout_seconds=10).transcribe(source)
 
 
 def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
@@ -316,7 +316,7 @@ def test_backend_invokes_local_first_route_without_engine_or_cloud_flags(
 
     monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
 
-    backend = HeimPcAsrBackend(contract, timeout_seconds=10)
+    backend = HeimgewebeAsrBackend(contract, timeout_seconds=10)
     result = backend.transcribe(source)
 
     assert result.engine == "faster-whisper"
@@ -349,8 +349,8 @@ def test_backend_invalid_utf8_is_controlled_error(
 
     monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
 
-    with pytest.raises(AsrAdapterError, match="heim-pc ASR invocation failed"):
-        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
+    with pytest.raises(AsrAdapterError, match="heimgewebe ASR invocation failed"):
+        HeimgewebeAsrBackend(contract, timeout_seconds=10).transcribe(source)
 
 
 def test_backend_error_includes_sanitized_stderr_tail(
@@ -382,7 +382,7 @@ def test_backend_error_includes_sanitized_stderr_tail(
         AsrAdapterError,
         match="status 7: backend failed model cache unavailable",
     ):
-        HeimPcAsrBackend(contract, timeout_seconds=10).transcribe(source)
+        HeimgewebeAsrBackend(contract, timeout_seconds=10).transcribe(source)
 
 
 def test_backend_status_preserves_locator_error_detail(tmp_path: Path) -> None:
@@ -391,7 +391,7 @@ def test_backend_status_preserves_locator_error_detail(tmp_path: Path) -> None:
         cloud_authorized=True,
     )
 
-    status = HeimPcAsrBackend(unsafe).status()
+    status = HeimgewebeAsrBackend(unsafe).status()
 
     assert status.ready is False
     assert "must not authorize cloud" in status.detail
@@ -422,10 +422,10 @@ def test_backend_status_includes_doctor_stderr(
 
     monkeypatch.setattr("digitalisierer.heim_pc_asr.subprocess.run", fake_run)
 
-    status = HeimPcAsrBackend(contract, timeout_seconds=10).status()
+    status = HeimgewebeAsrBackend(contract, timeout_seconds=10).status()
 
     assert status.ready is False
-    assert status.detail == "heim-pc ASR doctor exited with status 3: runtime incomplete model missing"
+    assert status.detail == "heimgewebe ASR doctor exited with status 3: runtime incomplete model missing"
     assert captured_kwargs["text"] is True
     assert captured_kwargs["encoding"] == "utf-8"
 
@@ -439,6 +439,7 @@ def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> No
 
     names = {artifact.path.name for artifact in exported.artifacts}
     assert names == {
+        "source.original",
         "transcript.txt",
         "transcript.json",
         "transcript.srt",
@@ -455,13 +456,22 @@ def test_export_writes_manifest_hashes_and_timed_subtitles(tmp_path: Path) -> No
     assert manifest["parameters"] == {"strategy": "local-first"}
     assert manifest["subtitles_written"] is True
     assert {entry.name for entry in output.iterdir()} == {
+        "source.original",
         "transcript.txt",
         "transcript.json",
         "transcript.srt",
         "transcript.vtt",
         "manifest.json",
     }
-    assert manifest["source"]["sha256"] == hashlib.sha256(b"synthetic-audio").hexdigest()
+    expected_source_sha256 = hashlib.sha256(b"synthetic-audio").hexdigest()
+    assert manifest["source"]["sha256"] == expected_source_sha256
+    assert manifest["source"]["preserved_as"] == "source.original"
+    assert manifest["source"]["preserved_sha256"] == expected_source_sha256
+    assert manifest["storage"] == {
+        "layout": "digitalisierer.transcription-bundle.v1",
+        "bundle_id": "export",
+    }
+    assert (output / "source.original").read_bytes() == b"synthetic-audio"
     assert set(manifest["output_hashes"]) == {
         "transcript.txt",
         "transcript.json",
@@ -786,6 +796,7 @@ def test_failure_after_atomic_exposure_never_deletes_final_entries(
         transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert {entry.name for entry in output.iterdir()} == {
+        "source.original",
         "transcript.txt",
         "transcript.json",
         "transcript.srt",
@@ -820,6 +831,7 @@ def test_keyboard_interrupt_immediately_after_atomic_exposure_is_non_destructive
         transcribe_and_export(source, output, FakeBackend(_result()))
 
     assert {entry.name for entry in output.iterdir()} == {
+        "source.original",
         "transcript.txt",
         "transcript.json",
         "transcript.srt",

@@ -197,7 +197,7 @@ First adapter: OCRmyPDF/Tesseract.
 
 ### TranscriptionBackend
 
-Speech-to-text capability. The first adapter is `HeimPcAsrBackend`, which consumes the installed `audio.transcribe` locator for the external `heim_pc_asr_open_engine` authority. The adapter does not pin an ASR engine or authorize cloud use; it validates the returned `heim-pc.asr-transcript` contract and maps only supplied metadata into the domain. Engine/model/runtime policy and caches remain owned by the Heim-PC authority. See ADR 0007.
+Speech-to-text capability. The first adapter is `HeimgewebeAsrBackend`, which consumes the installed `audio.transcribe` locator for the external `heimgewebe_asr_open_engine` authority. The adapter does not pin an ASR engine or authorize cloud use; it validates the returned `heimgewebe.asr-transcript` contract and maps only supplied metadata into the domain. Engine/model/runtime policy and shared caches remain owned by `heimgewebe/asr`. See ADR 0007.
 
 ### MediaProbeBackend
 
@@ -215,7 +215,9 @@ Cross-asset/session quality inspection for comparisons, ordering/gap checks, and
 
 ### Storage
 
-Local filesystem first.
+Local filesystem first. User-visible digitization payloads live in one library root rather than next to arbitrary input files. The default root is `~/Digitalisierer`; `DIGITALISIERER_LIBRARY_ROOT` or an explicit CLI `--library-root` may select another root.
+
+The first standardized bundle is `digitalisierer.transcription-bundle.v1`. A default one-shot transcription uses the `inbox` project and a content-bound session id `<safe-source-stem>--<sha256-prefix>`. Every published bundle preserves the exact source bytes as `source.original`, emits derived/export artifacts under stable names, includes a manifest, and is committed with atomic no-replace semantics. Existing bundles are never silently overwritten.
 
 ## 5. Provenance
 
@@ -267,27 +269,32 @@ The UI toolkit is deliberately **not** locked in yet. The first vertical slice s
 
 ## 7. Data layout
 
-A project may contain several sessions and media types:
+The canonical user library begins at one root:
 
 ```
-<project>/
-  project.json
-  assets/
-    source/
-    derived/
-  sessions/
-    <session-id>/
-      session.json
-      review.json
-      jobs/
-      export/
-        <run-id>/
-          manifest.json
-          report.txt
+<library-root>/                     # default: ~/Digitalisierer
+  projects/
+    <project-id>/
+      sessions/
+        <session-id>/
           ...
 ```
 
-The exact layout may evolve, but source assets and derived/export artifacts remain distinct.
+For one-shot transcription without an explicitly managed project, `project-id` is `inbox` and the current v1 session bundle is:
+
+```
+projects/inbox/sessions/<source-stem>--<sha256-prefix>/
+  source.original
+  transcript.txt
+  transcript.json
+  transcript.srt       # only with complete timing
+  transcript.vtt       # only with complete timing
+  manifest.json
+```
+
+`source.original` is byte-identical to the input and its hash is bound in the manifest. The session id is content-bound, so moving the same input file does not change its default storage identity. A changed source produces a different session id. Existing session directories are fail-closed instead of overwritten.
+
+Scanner/OCR workflows must reuse the same library → project → session hierarchy and the same source-preservation/provenance invariants; they may add media-specific derived/export files without creating a parallel storage root.
 
 ## 8. Adapter rule
 

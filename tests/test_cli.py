@@ -21,9 +21,9 @@ def _transcription_status(ready: bool) -> cli.CapabilityStatus:
     return {
         "ready": ready,
         "checks": {
-            "heim-pc-asr": {
+            "heimgewebe-asr": {
                 "found": ready,
-                "path": "/tools/heim-pc-asr" if ready else None,
+                "path": "/tools/heimgewebe-asr" if ready else None,
             }
         },
         "detail": "ready" if ready else "not ready",
@@ -200,4 +200,21 @@ def test_transcribe_emits_ascii_json_for_non_utf8_paths(
     assert os.fsencode(payload["output_dir"]) == os.fsencode(expected_output)
     assert os.fsencode(payload["artifacts"][0]["path"]) == os.fsencode(
         str(Path(expected_output) / "transcript.json")
+    )
+
+
+def test_default_output_dir_uses_standard_library_layout(tmp_path: Path) -> None:
+    source = tmp_path / "My Recording.m4a"
+    source.write_bytes(b"synthetic-audio")
+    library_root = tmp_path / "Digitalisierer"
+
+    output = default_output_dir(source, library_root)
+
+    source_sha256 = __import__("hashlib").sha256(b"synthetic-audio").hexdigest()
+    assert output == (
+        library_root
+        / "projects"
+        / "inbox"
+        / "sessions"
+        / f"My-Recording--{source_sha256[:12]}"
     )
