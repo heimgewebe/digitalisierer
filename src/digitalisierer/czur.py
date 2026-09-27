@@ -58,11 +58,31 @@ class CzurCaptureBackend:
         self.xdotool = xdotool or shutil.which("xdotool") or "xdotool"
         self._session_output: Path | None = None
 
+    def _load_config_payload(self) -> dict[str, Any]:
+        if not self.config_path.is_file():
+            raise CzurAdapterError(f"CZUR config is missing: {self.config_path}")
+        raw = self.config_path.read_text(encoding="utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CzurAdapterError("CZUR config is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise CzurAdapterError("CZUR config root must be an object")
+        setting = payload.get("setting")
+        if setting is not None and not isinstance(setting, dict):
+            raise CzurAdapterError("CZUR config setting must be an object")
+        return payload
+
     def status(self) -> CaptureStatus:
         executable_ready = self.launcher.is_file() and os.access(
             self.launcher, os.X_OK
         )
-        config_ready = self.config_path.is_file()
+        try:
+            self._load_config_payload()
+        except CzurAdapterError:
+            config_ready = False
+        else:
+            config_ready = True
         xdotool_ready = shutil.which(self.xdotool) is not None or Path(
             self.xdotool
         ).is_file()
@@ -76,15 +96,7 @@ class CzurCaptureBackend:
         )
 
     def apply_curved_books_preset(self) -> dict[str, object]:
-        if not self.config_path.is_file():
-            raise CzurAdapterError(f"CZUR config is missing: {self.config_path}")
-        raw = self.config_path.read_text(encoding="utf-8")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise CzurAdapterError("CZUR config is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise CzurAdapterError("CZUR config root must be an object")
+        payload = self._load_config_payload()
         setting = payload.setdefault("setting", {})
         if not isinstance(setting, dict):
             raise CzurAdapterError("CZUR config setting must be an object")

@@ -360,3 +360,87 @@ def test_review_updates_are_serialized_without_lost_decisions(
         10,
         20,
     ]
+
+def test_observe_rejects_malformed_existing_asset_record(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-malformed"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session("book", "malformed", tmp_path / "library")
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    session["assets"] = ["not-an-object"]
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(ScannerWorkflowError, match="asset record must be an object"):
+        observe_scan_folder(paths, capture)
+
+    persisted = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert persisted["assets"] == ["not-an-object"]
+
+
+def test_finalize_serializes_review_update_through_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import digitalisierer.scanner as scanner_module
+
+    capture = tmp_path / "capture-publish-race"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 50)
+    _image(capture / "image00002.jpg", 150)
+    paths = create_or_resume_scan_session("book", "publish-race", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    first, _second = observed.imported_asset_ids
+
+    original_rename = scanner_module._rename_noreplace
+    rename_reached = threading.Event()
+    allow_rename = threading.Event()
+    review_update_done = threading.Event()
+    failures: list[BaseException] = []
+    exports = []
+
+    def delayed_rename(source: Path, target: Path) -> None:
+        rename_reached.set()
+        assert allow_rename.wait(timeout=2.0)
+        original_rename(source, target)
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", delayed_rename)
+
+    def finalize() -> None:
+        try:
+            exports.append(
+                finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    def change_review() -> None:
+        try:
+            update_review_item(paths, first, included=False)
+            review_update_done.set()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    finalize_thread = threading.Thread(target=finalize)
+    finalize_thread.start()
+    assert rename_reached.wait(timeout=2.0)
+
+    update_thread = threading.Thread(target=change_review)
+    update_thread.start()
+    assert not review_update_done.wait(timeout=0.1)
+
+    allow_rename.set()
+    finalize_thread.join(timeout=2.0)
+    update_thread.join(timeout=2.0)
+
+    assert not finalize_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert failures == []
+    assert review_update_done.is_set()
+    assert len(exports) == 1
+
+    manifest = json.loads(
+        (exports[0].export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["review"]["items"][first]["included"] is True
+    current_review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert current_review["items"][first]["included"] is False

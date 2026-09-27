@@ -484,9 +484,11 @@ def _observe_scan_folder_unlocked(
     raw_assets = session.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")
-    assets: list[dict[str, Any]] = [
-        dict(item) for item in raw_assets if isinstance(item, dict)
-    ]
+    assets: list[dict[str, Any]] = []
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            raise ScannerWorkflowError("scan asset record must be an object")
+        assets.append(dict(item))
     known_by_id = {
         str(item.get("asset_id")): item
         for item in assets
@@ -985,19 +987,23 @@ def finalize_scan_session(
                     f"scanner output changed before publication: {name}"
                 )
 
-        _, current_session_sha = _stable_json_snapshot(paths.session_file)
-        _, current_review_sha = _stable_json_snapshot(paths.review_file)
-        _, current_findings_sha = _stable_json_snapshot(paths.findings_file)
-        if (
-            current_session_sha != session_file_sha
-            or current_review_sha != review_file_sha
-            or current_findings_sha != findings_file_sha
-        ):
-            raise ScannerWorkflowError(
-                "scanner session metadata changed while finalizing"
-            )
+        # Commit the export against one serialized metadata boundary. A review or
+        # observation update that began earlier is visible to the hash check; one
+        # that begins later waits until the export directory has been published.
+        with _review_update_lock(paths):
+            _, current_session_sha = _stable_json_snapshot(paths.session_file)
+            _, current_review_sha = _stable_json_snapshot(paths.review_file)
+            _, current_findings_sha = _stable_json_snapshot(paths.findings_file)
+            if (
+                current_session_sha != session_file_sha
+                or current_review_sha != review_file_sha
+                or current_findings_sha != findings_file_sha
+            ):
+                raise ScannerWorkflowError(
+                    "scanner session metadata changed while finalizing"
+                )
 
-        _rename_noreplace(staging, final_dir)
+            _rename_noreplace(staging, final_dir)
         staging = Path()
         return ScanExport(
             session_root=paths.root,

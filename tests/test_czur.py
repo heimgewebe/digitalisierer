@@ -112,3 +112,37 @@ def test_start_activates_curved_books_in_existing_window(
     backend.start(tmp_path / "session")
 
     assert calls == [("focus", "123"), (CURVED_BOOKS_HOTKEY, "123")]
+
+@pytest.mark.parametrize(
+    ("raw_config", "message"),
+    [
+        ("{not-json", "not valid JSON"),
+        ("[]", "root must be an object"),
+        ('{"setting": []}', "setting must be an object"),
+    ],
+)
+def test_status_rejects_config_that_start_would_reject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_config: str,
+    message: str,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(raw_config, encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match=message):
+        backend.apply_curved_books_preset()

@@ -202,6 +202,30 @@ code {{ word-break: break-all; }}
 """
 
 
+def _review_asset_paths(
+    paths: ScanSessionPaths,
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    session_payload = _read_json(paths.session_file)
+    raw_assets = session_payload.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+    thumbnail_by_id: dict[str, Path] = {}
+    source_by_id: dict[str, Path] = {}
+    for asset in raw_assets:
+        if not isinstance(asset, dict):
+            raise ScannerWorkflowError("scan asset record must be an object")
+        asset_id = asset.get("asset_id")
+        thumbnail = asset.get("thumbnail_path")
+        preserved = asset.get("preserved_path")
+        if not isinstance(asset_id, str) or not asset_id:
+            raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+        if not isinstance(thumbnail, str) or not isinstance(preserved, str):
+            raise ScannerWorkflowError("scan asset record has invalid review paths")
+        thumbnail_by_id[asset_id] = paths.root / thumbnail
+        source_by_id[asset_id] = paths.root / preserved
+    return thumbnail_by_id, source_by_id
+
+
 def build_review_server(
     paths: ScanSessionPaths,
     *,
@@ -213,23 +237,6 @@ def build_review_server(
     if isinstance(port, bool) or not 0 <= port <= 65535:
         raise ValueError("review UI port must be between 0 and 65535")
     csrf_token = secrets.token_urlsafe(32)
-
-    session_payload = _read_json(paths.session_file)
-    raw_assets = session_payload.get("assets")
-    if not isinstance(raw_assets, list):
-        raise ScannerWorkflowError("scan session assets must be a list")
-    thumbnail_by_id: dict[str, Path] = {}
-    source_by_id: dict[str, Path] = {}
-    for asset in raw_assets:
-        if not isinstance(asset, dict):
-            continue
-        asset_id = asset.get("asset_id")
-        thumbnail = asset.get("thumbnail_path")
-        preserved = asset.get("preserved_path")
-        if isinstance(asset_id, str) and isinstance(thumbnail, str):
-            thumbnail_by_id[asset_id] = paths.root / thumbnail
-        if isinstance(asset_id, str) and isinstance(preserved, str):
-            source_by_id[asset_id] = paths.root / preserved
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "DigitalisiererReview/1"
@@ -266,6 +273,11 @@ def build_review_server(
                     content_length=len(payload),
                 )
                 self.wfile.write(payload)
+                return
+            try:
+                thumbnail_by_id, source_by_id = _review_asset_paths(paths)
+            except ScannerWorkflowError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
             for prefix, assets in (
                 ("/thumbnail/", thumbnail_by_id),
@@ -313,6 +325,11 @@ def build_review_server(
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             asset_id = fields.get("asset_id", [""])[0]
+            try:
+                thumbnail_by_id, _ = _review_asset_paths(paths)
+            except ScannerWorkflowError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
             if asset_id not in thumbnail_by_id:
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return

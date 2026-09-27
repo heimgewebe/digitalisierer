@@ -205,3 +205,59 @@ def test_review_replacement_preserves_explicit_position_change(tmp_path: Path) -
         ]
     finally:
         review_server.server.server_close()
+
+def test_review_server_refreshes_asset_maps_after_observe(tmp_path: Path) -> None:
+    first_capture = tmp_path / "capture-first"
+    second_capture = tmp_path / "capture-second"
+    first_capture.mkdir()
+    second_capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        first_capture / "page1.jpg",
+        format="JPEG",
+    )
+    Image.new("RGB", (100, 140), color="gray").save(
+        second_capture / "page2.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session("book", "live-review", tmp_path / "library")
+    observe_scan_folder(paths, first_capture)
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        observed = observe_scan_folder(paths, second_capture)
+        new_asset = observed.imported_asset_ids[0]
+
+        client, handler_socket = socket.socketpair()
+        try:
+            client.sendall(
+                f"GET /source/{new_asset} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode()
+            )
+            server = review_server.server
+            handler = server.RequestHandlerClass
+            handler(handler_socket, ("127.0.0.1", 1), server)
+            handler_socket.close()
+            response = b""
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+            assert b" 200 " in response.splitlines()[0]
+        finally:
+            client.close()
+            handler_socket.close()
+
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": new_asset,
+                "included": "1",
+                "sequence": "2",
+                "original_sequence": "2",
+                "replacement_for": "",
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 303 " in response.splitlines()[0]
+    finally:
+        review_server.server.server_close()
