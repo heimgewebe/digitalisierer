@@ -243,9 +243,16 @@ def _pillow_modules() -> tuple[Any, Any]:
     return Image, ImageStat
 
 
+def _pixel_values(image: Any) -> list[int]:
+    flattened = getattr(image, "get_flattened_data", None)
+    if callable(flattened):
+        return [int(value) for value in flattened()]
+    return [int(value) for value in image.getdata()]
+
+
 def _average_hash(image: Any) -> str:
     small = image.convert("L").resize((32, 32))
-    values = list(small.getdata())
+    values = _pixel_values(small)
     mean = sum(values) / max(1, len(values))
     bits = "".join("1" if value > mean else "0" for value in values)
     return f"{int(bits, 2):0256x}"
@@ -260,7 +267,7 @@ def _inspect_image(path: Path) -> dict[str, object]:
         work = image.convert("L")
         work.thumbnail((256, 256))
         stat = ImageStat.Stat(work)
-        values = list(work.getdata())
+        values = _pixel_values(work)
         dark_ratio = sum(value < 210 for value in values) / max(1, len(values))
         average_hash = _average_hash(image)
     dpi_x = float(dpi_raw[0]) if len(dpi_raw) >= 1 else 0.0
@@ -558,9 +565,29 @@ def observe_scan_folder(
     )
 
 
-def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
-    session = _load_json(paths.session_file)
-    review = _load_json(paths.review_file)
+def _stable_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        before = path.stat()
+        raw = path.read_bytes()
+        after = path.stat()
+    except FileNotFoundError as exc:
+        raise ScannerWorkflowError(f"scanner session file is missing: {path}") from exc
+    if _stat_identity(before) != _stat_identity(after):
+        raise ScannerWorkflowError(f"scanner session file changed while reading: {path}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScannerWorkflowError(f"scanner session JSON is invalid: {path}") from exc
+    if not isinstance(value, dict):
+        raise ScannerWorkflowError(f"scanner session JSON must be an object: {path}")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _processing_session_from_payload(
+    paths: ScanSessionPaths,
+    session: dict[str, Any],
+    review: dict[str, Any],
+) -> ProcessingSession:
     raw_assets = session.get("assets")
     raw_review = review.get("items")
     if not isinstance(raw_assets, list) or not isinstance(raw_review, dict):
@@ -616,6 +643,12 @@ def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
         raise ScannerWorkflowError(f"invalid scanner review state: {exc}") from exc
 
 
+def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
+    session, _ = _stable_json_snapshot(paths.session_file)
+    review, _ = _stable_json_snapshot(paths.review_file)
+    return _processing_session_from_payload(paths, session, review)
+
+
 _UNSET = object()
 
 
@@ -657,8 +690,10 @@ def update_review_item(
     return processing
 
 
-def _verify_preserved_sources(paths: ScanSessionPaths) -> list[dict[str, object]]:
-    session = _load_json(paths.session_file)
+def _verify_preserved_sources(
+    paths: ScanSessionPaths,
+    session: dict[str, Any],
+) -> list[dict[str, object]]:
     raw_assets = session.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")
@@ -704,8 +739,7 @@ def _default_pdf_builder(images: list[Path], output: Path) -> None:
         os.fsync(handle.fileno())
 
 
-def _review_digest(paths: ScanSessionPaths) -> str:
-    review = _load_json(paths.review_file)
+def _review_digest(review: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
             review,
@@ -758,13 +792,16 @@ def finalize_scan_session(
     language: str = "deu",
     pdf_builder: ImageToPdf = _default_pdf_builder,
 ) -> ScanExport:
-    processing = load_processing_session(paths)
+    session, session_file_sha = _stable_json_snapshot(paths.session_file)
+    review, review_file_sha = _stable_json_snapshot(paths.review_file)
+    findings_payload, findings_file_sha = _stable_json_snapshot(paths.findings_file)
+    processing = _processing_session_from_payload(paths, session, review)
     active = processing.ordered_assets()
     if not active:
         raise ScannerWorkflowError("scanner session has no included pages")
 
-    verified_sources = _verify_preserved_sources(paths)
-    review_sha = _review_digest(paths)
+    verified_sources = _verify_preserved_sources(paths, session)
+    review_sha = _review_digest(review)
     export_identity = hashlib.sha256(
         _json_text(
             {
@@ -801,7 +838,6 @@ def finalize_scan_session(
             language=language,
         )
 
-        findings_payload = _load_json(paths.findings_file)
         raw_findings = findings_payload.get("findings")
         findings_count = len(raw_findings) if isinstance(raw_findings, list) else 0
         report.write_text(
@@ -830,8 +866,6 @@ def finalize_scan_session(
             name: _sha256_file(staging / name)
             for name in ("master.pdf", "searchable.pdf", "text.txt", "report.txt")
         }
-        session = _load_json(paths.session_file)
-        review = _load_json(paths.review_file)
         version_method = getattr(ocr_backend, "version", None)
         manifest: dict[str, object] = {
             "schema_version": 1,
@@ -860,7 +894,7 @@ def finalize_scan_session(
         os.chmod(manifest_path, 0o600)
 
         # Re-verify preserved inputs after all processing and before publication.
-        after_sources = _verify_preserved_sources(paths)
+        after_sources = _verify_preserved_sources(paths, session)
         if after_sources != verified_sources:
             raise ScannerWorkflowError(
                 "preserved scanner sources changed while finalizing"
@@ -870,6 +904,19 @@ def finalize_scan_session(
                 raise ScannerWorkflowError(
                     f"scanner output changed before publication: {name}"
                 )
+
+        _, current_session_sha = _stable_json_snapshot(paths.session_file)
+        _, current_review_sha = _stable_json_snapshot(paths.review_file)
+        _, current_findings_sha = _stable_json_snapshot(paths.findings_file)
+        if (
+            current_session_sha != session_file_sha
+            or current_review_sha != review_file_sha
+            or current_findings_sha != findings_file_sha
+        ):
+            raise ScannerWorkflowError(
+                "scanner session metadata changed while finalizing"
+            )
+
         _rename_noreplace(staging, final_dir)
         staging = Path()
         return ScanExport(

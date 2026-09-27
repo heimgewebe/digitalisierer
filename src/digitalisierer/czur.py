@@ -16,6 +16,7 @@ class CzurAdapterError(RuntimeError):
     """Raised when the official CZUR application cannot be prepared safely."""
 
 
+CURVED_BOOKS_HOTKEY = "alt+2"
 CURVED_BOOKS_SETTINGS: dict[str, object] = {
     "scan_preview_capture_type": "mul_page",
     "scan_preview_parameter_setting_mul_flatten": True,
@@ -144,6 +145,27 @@ class CzurCaptureBackend:
                 f"{(completed.stderr or '').strip()}"
             )
 
+    def _activate_curved_books_mode(self, window_id: str) -> None:
+        completed = subprocess.run(
+            [
+                self.xdotool,
+                "key",
+                "--window",
+                window_id,
+                "--clearmodifiers",
+                CURVED_BOOKS_HOTKEY,
+            ],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise CzurAdapterError(
+                f"cannot activate CZUR Curved Books mode in window {window_id}: "
+                f"{(completed.stderr or '').strip()}"
+            )
+
     def start(self, output_dir: Path) -> None:
         self._session_output = output_dir.expanduser()
         self._session_output.mkdir(parents=True, exist_ok=True)
@@ -153,6 +175,7 @@ class CzurCaptureBackend:
         windows = self._visible_windows()
         if windows:
             self._focus(windows[-1])
+            self._activate_curved_books_mode(windows[-1])
             return
 
         if not self.launcher.is_file() or not os.access(self.launcher, os.X_OK):
@@ -169,6 +192,7 @@ class CzurCaptureBackend:
             windows = self._visible_windows()
             if windows:
                 self._focus(windows[-1])
+                self._activate_curved_books_mode(windows[-1])
                 return
             time.sleep(0.25)
         raise CzurAdapterError("CZUR application did not expose a visible window")

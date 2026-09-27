@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from digitalisierer.czur import CURVED_BOOKS_SETTINGS, CzurAdapterError, CzurCaptureBackend
+from digitalisierer.czur import (
+    CURVED_BOOKS_HOTKEY,
+    CURVED_BOOKS_SETTINGS,
+    CzurAdapterError,
+    CzurCaptureBackend,
+)
 
 
 def test_curved_books_preset_is_atomic_and_preserves_unrelated_settings(
@@ -79,3 +84,31 @@ def test_newest_scan_folder_can_select_capture_root(tmp_path: Path) -> None:
     backend = CzurCaptureBackend(capture_root=tmp_path)
 
     assert backend.newest_scan_folder() == tmp_path.resolve()
+
+def test_start_activates_curved_books_in_existing_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"setting": {}}), encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool="/usr/bin/xdotool",
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "_visible_windows", lambda: ["123"])
+    monkeypatch.setattr(backend, "_focus", lambda window_id: calls.append(("focus", window_id)))
+    monkeypatch.setattr(
+        backend,
+        "_activate_curved_books_mode",
+        lambda window_id: calls.append((CURVED_BOOKS_HOTKEY, window_id)),
+    )
+
+    backend.start(tmp_path / "session")
+
+    assert calls == [("focus", "123"), (CURVED_BOOKS_HOTKEY, "123")]

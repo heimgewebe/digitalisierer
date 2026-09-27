@@ -165,3 +165,50 @@ def test_finalize_rejects_modified_preserved_source(tmp_path: Path) -> None:
 
     with pytest.raises(ScannerWorkflowError, match="hash mismatch"):
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+def test_finalize_uses_one_review_snapshot_when_review_changes_during_ocr(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 30)
+    _image(capture / "image00002.jpg", 200)
+    paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    first, second = observed.imported_asset_ids
+
+    class _ReviewMutatingOcr(_FakeOcr):
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            super().searchable_pdf(
+                master_pdf,
+                output_pdf,
+                sidecar_txt,
+                language=language,
+            )
+            review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+            review["items"][first]["included"] = False
+            paths.review_file.write_text(
+                json.dumps(review, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner session metadata changed while finalizing",
+    ):
+        finalize_scan_session(
+            paths,
+            _ReviewMutatingOcr(),
+            pdf_builder=_fake_pdf,
+        )
+
+    current_review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert current_review["items"][first]["included"] is False
+    assert list(paths.exports.iterdir()) == []
