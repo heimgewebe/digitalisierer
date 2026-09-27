@@ -590,11 +590,11 @@ def _observe_scan_folder_unlocked(
         }
     )
     review["items"] = review_items
-    # Publish review state first. If the following session write fails, a retry can
-    # safely re-import/reconcile the assets; the inverse order can strand a session
-    # whose assets have no review decisions.
+    # Publish dependent metadata before session.json, which is the commit point.
+    # If either earlier write succeeds and a later write fails, the session remains
+    # on the previous asset set; orphan review state then blocks processing/finalize
+    # until a retry reconstructs the complete observation.
     _atomic_write_text(paths.review_file, _json_text(review))
-    _atomic_write_text(paths.session_file, _json_text(session))
     _atomic_write_text(
         paths.findings_file,
         _json_text(
@@ -605,6 +605,7 @@ def _observe_scan_folder_unlocked(
             }
         ),
     )
+    _atomic_write_text(paths.session_file, _json_text(session))
     return ScanObservation(
         session_root=paths.root,
         imported_asset_ids=tuple(imported),

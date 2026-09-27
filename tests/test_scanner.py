@@ -494,3 +494,54 @@ def test_default_pdf_builder_streams_to_img2pdf_output(
     scanner_module._default_pdf_builder([image], output)
 
     assert output.read_bytes() == b"streamed-pdf"
+
+def test_observe_findings_failure_does_not_publish_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import digitalisierer.scanner as scanner_module
+
+    capture = tmp_path / "capture-findings-failure"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "findings-failure",
+        tmp_path / "library",
+    )
+    original_write = scanner_module._atomic_write_text
+    failed = False
+
+    def fail_findings_once(path: Path, content: str) -> None:
+        nonlocal failed
+        if path == paths.findings_file and not failed:
+            failed = True
+            raise OSError("synthetic findings write failure")
+        original_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_findings_once)
+    with pytest.raises(OSError, match="synthetic findings write failure"):
+        observe_scan_folder(paths, capture)
+
+    session_after_failure = json.loads(
+        paths.session_file.read_text(encoding="utf-8")
+    )
+    assert session_after_failure["assets"] == []
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="review state contains assets missing from scan session",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+    assert list(paths.exports.iterdir()) == []
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    resumed = observe_scan_folder(paths, capture)
+    processing = load_processing_session(paths)
+
+    assert len(resumed.imported_asset_ids) == 1
+    assert len(processing.ordered_assets()) == 1
+    session_after_retry = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    review_after_retry = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert {item["asset_id"] for item in session_after_retry["assets"]} == set(
+        review_after_retry["items"]
+    )

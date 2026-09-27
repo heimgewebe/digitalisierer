@@ -73,8 +73,7 @@ class CzurCaptureBackend:
             raise CzurAdapterError("CZUR config is not valid JSON") from exc
         if not isinstance(payload, dict):
             raise CzurAdapterError("CZUR config root must be an object")
-        setting = payload.get("setting")
-        if setting is not None and not isinstance(setting, dict):
+        if "setting" in payload and not isinstance(payload["setting"], dict):
             raise CzurAdapterError("CZUR config setting must be an object")
         return payload
 

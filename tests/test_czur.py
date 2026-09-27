@@ -119,6 +119,7 @@ def test_start_activates_curved_books_in_existing_window(
         ("{not-json", "not valid JSON"),
         ("[]", "root must be an object"),
         ('{"setting": []}', "setting must be an object"),
+        ('{"setting": null}', "setting must be an object"),
     ],
 )
 def test_status_rejects_config_that_start_would_reject(
