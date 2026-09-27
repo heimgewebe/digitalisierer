@@ -1,11 +1,51 @@
 from pathlib import Path
 import socket
+from urllib.parse import urlencode
 
 from PIL import Image
 import pytest
 
 from digitalisierer.review import build_review_server, render_review_html
-from digitalisierer.scanner import create_or_resume_scan_session, observe_scan_folder
+from digitalisierer.scanner import (
+    create_or_resume_scan_session,
+    load_processing_session,
+    observe_scan_folder,
+    update_review_item,
+)
+
+
+def _post_review_form(
+    review_server: object,
+    fields: dict[str, str],
+) -> bytes:
+    body = urlencode(fields).encode("utf-8")
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                "POST /save HTTP/1.0\r\n"
+                "Host: localhost\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+                "\r\n"
+            ).encode("ascii")
+            + body
+        )
+        server = review_server.server  # type: ignore[attr-defined]
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        return response
+    finally:
+        client.close()
+        handler_socket.close()
 
 
 def test_review_html_is_large_preview_and_escapes_source_names(tmp_path: Path) -> None:
@@ -80,4 +120,88 @@ def test_review_server_serves_preserved_source_for_hidpi(
     finally:
         client.close()
         handler_socket.close()
+        review_server.server.server_close()
+
+
+def test_review_replacement_defaults_to_replaced_page_position(tmp_path: Path) -> None:
+    capture = tmp_path / "replacement-default"
+    capture.mkdir()
+    for index, value in enumerate((40, 100, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session("book", "replacement", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    first, second, replacement = observed.imported_asset_ids
+    update_review_item(paths, first, included=False)
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": replacement,
+                "included": "1",
+                "sequence": "3",
+                "original_sequence": "3",
+                "replacement_for": first,
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 303 " in response.splitlines()[0]
+        processing = load_processing_session(paths)
+        replacement_item = next(
+            item for item in processing.items if item.asset.asset_id == replacement
+        )
+        assert replacement_item.sequence is None
+        assert replacement_item.replacement_for == first
+        assert [asset.asset_id for asset in processing.ordered_assets()] == [
+            replacement,
+            second,
+        ]
+    finally:
+        review_server.server.server_close()
+
+
+def test_review_replacement_preserves_explicit_position_change(tmp_path: Path) -> None:
+    capture = tmp_path / "replacement-explicit"
+    capture.mkdir()
+    for index, value in enumerate((40, 100, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session("book", "replacement-explicit", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    first, second, replacement = observed.imported_asset_ids
+    update_review_item(paths, first, included=False)
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": replacement,
+                "included": "1",
+                "sequence": "20",
+                "original_sequence": "3",
+                "replacement_for": first,
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 303 " in response.splitlines()[0]
+        processing = load_processing_session(paths)
+        replacement_item = next(
+            item for item in processing.items if item.asset.asset_id == replacement
+        )
+        assert replacement_item.sequence == 20
+        assert replacement_item.replacement_for == first
+        assert [asset.asset_id for asset in processing.ordered_assets()] == [
+            second,
+            replacement,
+        ]
+    finally:
         review_server.server.server_close()

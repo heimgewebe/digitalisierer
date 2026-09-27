@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 from PIL import Image
@@ -290,3 +291,72 @@ def test_observe_is_recoverable_if_session_write_fails_after_review(
 
     assert len(resumed.imported_asset_ids) == 1
     assert len(processing.ordered_assets()) == 1
+
+
+def test_review_updates_are_serialized_without_lost_decisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import digitalisierer.scanner as scanner_module
+
+    capture = tmp_path / "capture-concurrent"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 80)
+    _image(capture / "image00002.jpg", 160)
+    paths = create_or_resume_scan_session("book", "concurrent", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    first, second = observed.imported_asset_ids
+
+    original_write = scanner_module._atomic_write_text
+    first_write_reached = threading.Event()
+    second_write_reached = threading.Event()
+    release_first_write = threading.Event()
+    counter_lock = threading.Lock()
+    review_write_count = 0
+
+    def delayed_review_write(path: Path, content: str) -> None:
+        nonlocal review_write_count
+        call = 0
+        if path == paths.review_file:
+            with counter_lock:
+                review_write_count += 1
+                call = review_write_count
+            if call == 1:
+                first_write_reached.set()
+                assert release_first_write.wait(timeout=2.0)
+            elif call == 2:
+                second_write_reached.set()
+        original_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", delayed_review_write)
+    failures: list[BaseException] = []
+
+    def change(asset_id: str, sequence: int) -> None:
+        try:
+            update_review_item(paths, asset_id, sequence=sequence)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    first_thread = threading.Thread(target=change, args=(first, 10))
+    second_thread = threading.Thread(target=change, args=(second, 20))
+    first_thread.start()
+    assert first_write_reached.wait(timeout=2.0)
+    second_thread.start()
+
+    # Without the session lock, the second writer reaches publication while the
+    # first still holds a stale review snapshot and one accepted edit is lost.
+    second_write_reached.wait(timeout=0.1)
+    release_first_write.set()
+    first_thread.join(timeout=2.0)
+    second_thread.join(timeout=2.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert review["items"][first]["sequence"] == 10
+    assert review["items"][second]["sequence"] == 20
+    assert [item.sequence for item in load_processing_session(paths).ordered_items()] == [
+        10,
+        20,
+    ]

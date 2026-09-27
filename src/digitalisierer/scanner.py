@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import math
@@ -11,7 +13,7 @@ import re
 import secrets
 import shutil
 import statistics
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from .domain import MediaAsset, MediaKind, ProcessingSession, QualityFinding, SessionAsset
 from .library import session_root
@@ -22,6 +24,7 @@ SCAN_SESSION_LAYOUT = "digitalisierer.scan-session.v1"
 SCAN_EXPORT_LAYOUT = "digitalisierer.scan-export.v1"
 SESSION_FILE = "session.json"
 REVIEW_FILE = "review.json"
+REVIEW_LOCK_FILE = ".review.lock"
 FINDINGS_FILE = "findings.json"
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 MAX_SOURCE_IMAGE_BYTES = 512 * 1024 * 1024
@@ -112,6 +115,26 @@ def _atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+@contextmanager
+def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
+    lock_path = paths.root / REVIEW_LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -433,7 +456,7 @@ def _findings_from_assets(assets: list[dict[str, Any]]) -> list[QualityFinding]:
     return findings
 
 
-def observe_scan_folder(
+def _observe_scan_folder_unlocked(
     paths: ScanSessionPaths,
     folder: Path,
     *,
@@ -588,6 +611,22 @@ def observe_scan_folder(
     )
 
 
+def observe_scan_folder(
+    paths: ScanSessionPaths,
+    folder: Path,
+    *,
+    start: int = 1,
+    limit: int | None = None,
+) -> ScanObservation:
+    with _review_update_lock(paths):
+        return _observe_scan_folder_unlocked(
+            paths,
+            folder,
+            start=start,
+            limit=limit,
+        )
+
+
 def _stable_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     try:
         before = path.stat()
@@ -675,7 +714,7 @@ def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
 _UNSET = object()
 
 
-def update_review_item(
+def _update_review_item_unlocked(
     paths: ScanSessionPaths,
     asset_id: str,
     *,
@@ -711,6 +750,24 @@ def update_review_item(
         _atomic_write_text(paths.review_file, old_text)
         raise
     return processing
+
+
+def update_review_item(
+    paths: ScanSessionPaths,
+    asset_id: str,
+    *,
+    included: bool | None = None,
+    sequence: int | None | object = _UNSET,
+    replacement_for: str | None | object = _UNSET,
+) -> ProcessingSession:
+    with _review_update_lock(paths):
+        return _update_review_item_unlocked(
+            paths,
+            asset_id,
+            included=included,
+            sequence=sequence,
+            replacement_for=replacement_for,
+        )
 
 
 def _verify_preserved_sources(

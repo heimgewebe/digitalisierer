@@ -137,6 +137,9 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
             )
         checked = " checked" if included else ""
         sequence_value = "" if sequence is None else html.escape(str(sequence))
+        replacement_value = (
+            "" if replacement_for is None else html.escape(replacement_for, quote=True)
+        )
         cards.append(
             f"""
 <article class="page-card">
@@ -150,6 +153,8 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
     <form method="post" action="/save">
       <input type="hidden" name="csrf" value="{html.escape(csrf_token, quote=True)}">
       <input type="hidden" name="asset_id" value="{html.escape(asset_id, quote=True)}">
+      <input type="hidden" name="original_sequence" value="{sequence_value}">
+      <input type="hidden" name="original_replacement_for" value="{replacement_value}">
       <label><input type="checkbox" name="included" value="1"{checked}> enthalten</label>
       <label>Position <input name="sequence" inputmode="numeric" value="{sequence_value}"></label>
       <label>Ersatz für
@@ -312,9 +317,19 @@ def build_review_server(
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             sequence_raw = fields.get("sequence", [""])[0].strip()
+            original_sequence_raw = fields.get("original_sequence", [""])[0].strip()
             replacement = fields.get("replacement_for", [""])[0].strip()
+            original_replacement = fields.get(
+                "original_replacement_for", [""]
+            )[0].strip()
             try:
                 sequence = int(sequence_raw) if sequence_raw else None
+                if (
+                    replacement
+                    and replacement != original_replacement
+                    and sequence_raw == original_sequence_raw
+                ):
+                    sequence = None
                 update_review_item(
                     paths,
                     asset_id,

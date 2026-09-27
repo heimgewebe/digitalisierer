@@ -371,6 +371,8 @@ def main(argv: list[str] | None = None) -> int:
                     kwargs["sequence"] = None
                 if args.replacement_for is not None:
                     kwargs["replacement_for"] = args.replacement_for
+                    if args.sequence is None and not args.clear_sequence:
+                        kwargs["sequence"] = None
                 elif args.clear_replacement:
                     kwargs["replacement_for"] = None
                 if not kwargs:
