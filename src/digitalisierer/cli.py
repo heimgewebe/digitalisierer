@@ -13,8 +13,8 @@ from .heim_pc_asr import AsrAdapterError, HeimgewebeAsrBackend
 from .ports import TranscriptionBackend
 from .transcription import (
     TranscriptionWorkflowError,
-    default_output_dir,
     transcribe_and_export,
+    transcribe_to_library,
 )
 
 
@@ -166,23 +166,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "transcribe":
         source = args.source.expanduser()
         try:
-            output_dir = (
-                args.output_dir.expanduser()
-                if args.output_dir is not None
-                else default_output_dir(
+            backend = _transcription_backend()
+            if args.output_dir is not None:
+                exported = transcribe_and_export(
                     source,
+                    args.output_dir.expanduser(),
+                    backend,
+                )
+            else:
+                exported = transcribe_to_library(
+                    source,
+                    backend,
                     (
                         args.library_root.expanduser()
                         if args.library_root is not None
                         else None
                     ),
                 )
-            )
-            exported = transcribe_and_export(
-                source,
-                output_dir,
-                _transcription_backend(),
-            )
         except (AsrAdapterError, TranscriptionWorkflowError, OSError) as exc:
             print(f"transcription failed: {exc}", file=sys.stderr)
             return 1

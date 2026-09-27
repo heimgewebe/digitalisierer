@@ -22,6 +22,7 @@ from digitalisierer.heim_pc_asr import (
 from digitalisierer.transcription import (
     TranscriptionWorkflowError,
     transcribe_and_export,
+    transcribe_to_library,
 )
 
 
@@ -983,6 +984,57 @@ def test_export_fails_if_source_changes_during_initial_hash(
 
     assert mutated is True
     assert not output.exists()
+
+
+def test_library_export_rejects_source_change_after_bundle_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.wav"
+    source.write_bytes(b"before")
+    library = tmp_path / "Digitalisierer"
+    expected_sha256 = hashlib.sha256(b"before").hexdigest()
+    expected_bundle = (
+        library
+        / "projects"
+        / "inbox"
+        / "sessions"
+        / f"sample--{expected_sha256[:12]}"
+    )
+    original_stable_hash = transcription_module._stable_source_hash
+    calls = 0
+
+    def changing_stable_hash(path: Path) -> tuple[str, os.stat_result]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            path.write_bytes(b"after")
+        return original_stable_hash(path)
+
+    class MustNotRunBackend(FakeBackend):
+        def transcribe(self, source: Path) -> TranscriptionResult:
+            pytest.fail(
+                "backend must not run when source changed after bundle identity preparation"
+            )
+
+    monkeypatch.setattr(
+        transcription_module,
+        "_stable_source_hash",
+        changing_stable_hash,
+    )
+
+    with pytest.raises(
+        TranscriptionWorkflowError,
+        match="changed after default bundle identity was prepared",
+    ):
+        transcribe_to_library(
+            source,
+            MustNotRunBackend(_result()),
+            library,
+        )
+
+    assert calls == 2
+    assert not expected_bundle.exists()
 
 
 def test_export_fails_closed_if_source_changes_during_transcription(

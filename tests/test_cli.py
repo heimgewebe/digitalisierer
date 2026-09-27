@@ -171,13 +171,16 @@ def test_transcribe_emits_ascii_json_for_non_utf8_paths(
 
     monkeypatch.setattr(cli, "_transcription_backend", lambda: object())
 
-    def fake_export(
+    library_root = tmp_path / "library"
+
+    def fake_library_export(
         source_path: Path,
-        output_dir: Path,
         _backend: object,
+        selected_library_root: Path | None = None,
     ) -> TranscriptionExport:
         assert source_path == source
-        final_dir = output_dir.absolute()
+        assert selected_library_root == library_root
+        final_dir = default_output_dir(source, library_root).absolute()
         return TranscriptionExport(
             output_dir=final_dir,
             artifacts=(
@@ -189,14 +192,16 @@ def test_transcribe_emits_ascii_json_for_non_utf8_paths(
             ),
         )
 
-    monkeypatch.setattr(cli, "transcribe_and_export", fake_export)
+    monkeypatch.setattr(cli, "transcribe_to_library", fake_library_export)
 
-    assert cli.main(["transcribe", str(source)]) == 0
+    assert cli.main(
+        ["transcribe", str(source), "--library-root", str(library_root)]
+    ) == 0
     output = capsys.readouterr().out
     output.encode("ascii")
     payload = json.loads(output)
 
-    expected_output = str(default_output_dir(source).absolute())
+    expected_output = str(default_output_dir(source, library_root).absolute())
     assert os.fsencode(payload["output_dir"]) == os.fsencode(expected_output)
     assert os.fsencode(payload["artifacts"][0]["path"]) == os.fsencode(
         str(Path(expected_output) / "transcript.json")
