@@ -93,7 +93,9 @@ Provenance
 
 ## Current status
 
-The public foundation is in place, and the first transcription integration now exercises the media-neutral capability boundary. The existing CZUR/OCR scripts on the development machine remain migration input rather than architecture.
+The public foundation and the first two real vertical slices are now in place: the CZUR ET24 scanner workflow and the generic local transcription workflow.
+
+Scanner M1 owns the workflow around the official CZUR application instead of replacing the vendor capture layer. Digitalisierer can create/resume a project session, apply the Curved Books preset, launch/focus CZUR, observe captured pages, preserve byte-identical source images, generate thumbnails and quality findings, review include/order/replacement state in a loopback-only large-preview UI, and publish hash-bound master/OCR/text exports without silently overwriting an existing export.
 
 Transcription reuses the installed generic `audio.transcribe` authority from `heimgewebe/asr`. Digitalisierer does not install another ASR runtime, pin an engine, create a second model cache or authorize cloud use. It validates the structured transcript contract and owns source preservation, export and provenance.
 
@@ -112,6 +114,34 @@ digitalisierer doctor --require transcription
 ```
 
 The JSON output always reports all known capabilities, while the exit status is determined only by the selected required capabilities. Expensive optional probes are lazy: transcription reports `ready: null` unless it is explicitly required, so the default doctor does not invoke the shared ASR runtime.
+
+Run one scanner session through the canonical library:
+```bash
+digitalisierer scan init --project book --session chapter-01
+digitalisierer scan start --project book --session chapter-01
+digitalisierer scan observe --project book --session chapter-01 --source ~/CZURScannerDoc/<capture-folder>
+digitalisierer scan review --project book --session chapter-01
+digitalisierer scan finalize --project book --session chapter-01 --lang deu
+```
+
+The scanner session stays below the same `projects/<project>/sessions/<session>/` hierarchy used by other workflows:
+```
+<session>/
+  sources/                    # byte-identical preserved page images
+  thumbnails/                 # derived review proxies
+  session.json                # immutable source identity/provenance records
+  review.json                 # mutable include/order/replacement decisions
+  findings.json               # blank/duplicate/size findings
+  exports/
+    export--<digest>/
+      master.pdf
+      searchable.pdf
+      text.txt
+      report.txt
+      manifest.json
+```
+
+Quality findings never delete pages automatically. Review changes metadata only; every published export is bound to the exact reviewed order and source hashes and is created with no-replace semantics.
 
 Transcribe one local media file through the canonical local ASR authority:
 
@@ -140,10 +170,10 @@ The exact source bytes are preserved as `source.original`. The manifest binds th
 
 ## Roadmap
 
-The scanner flow remains the first vertical slice:
+The scanner flow is the completed first vertical slice:
 
 ```
-CZUR capture -> page review -> QA -> master PDF -> OCR -> searchable PDF
+CZUR capture -> preserve -> page review -> QA -> master PDF -> OCR -> searchable PDF + text + manifest
 ```
 
 The second vertical slice is deliberately different:

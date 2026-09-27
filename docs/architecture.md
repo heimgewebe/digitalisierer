@@ -265,7 +265,7 @@ Examples:
 - review findings;
 - finalize outputs.
 
-The UI toolkit is deliberately **not** locked in yet. The first vertical slice should establish interaction requirements before choosing a long-lived desktop/web framework.
+Scanner M1 uses a deliberately small loopback-only HTML review server from the Python standard library. It provides large page previews and explicit include/order/replacement controls without selecting a long-lived desktop or web framework. A future UI toolkit remains replaceable behind the same session/review model.
 
 ## 7. Data layout
 
@@ -294,7 +294,25 @@ projects/inbox/sessions/<source-stem>--<sha256-prefix>/
 
 `source.original` is byte-identical to the input and its hash is bound in the manifest. The session id is content-bound, so moving the same input file does not change its default storage identity. A changed source produces a different session id. Existing session directories are fail-closed instead of overwritten.
 
-Scanner/OCR workflows must reuse the same library → project → session hierarchy and the same source-preservation/provenance invariants; they may add media-specific derived/export files without creating a parallel storage root.
+Scanner/OCR workflows reuse the same library → project → session hierarchy and the same source-preservation/provenance invariants. Scanner M1 uses:
+
+```
+projects/<project-id>/sessions/<session-id>/
+  sources/
+  thumbnails/
+  session.json
+  review.json
+  findings.json
+  exports/
+    export--<review-and-source-digest>/
+      master.pdf
+      searchable.pdf
+      text.txt
+      report.txt
+      manifest.json
+```
+
+`sources/` contains byte-identical preserved page images. Review decisions are stored separately from source identity. Findings are advisory only. Every export snapshot is bound to the reviewed active order, verified source hashes, OCR adapter/language/version, and exact output hashes; publication is atomic and refuses replacement of an existing export.
 
 ## 8. Adapter rule
 

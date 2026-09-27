@@ -8,6 +8,10 @@ version = "0.1.0"
 description = "Local-first workbench for scanning, OCR, transcription and reproducible digitization workflows."
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=9,<13",
+  "img2pdf>=0.4,<1",
+]
 keywords = ["digitization", "ocr", "transcription", "scanner", "local-first"]
 
 [project.optional-dependencies]
