@@ -62,7 +62,6 @@ def test_doctor_reports_uniform_capability_json(
 ) -> None:
     monkeypatch.setattr(cli, "_which", _all_tools_present)
     monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
-    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
