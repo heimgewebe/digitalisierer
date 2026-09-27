@@ -241,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     scan_finalize.add_argument(
         "--jobs",
         type=int,
-        default=int(os.environ.get("CZUR_OCR_JOBS", "4")),
+        default=None,
+        help="OCR worker count; default: $CZUR_OCR_JOBS or 4",
     )
 
     args = parser.parse_args(argv)
@@ -387,7 +388,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.scan_command == "finalize":
-                ocr_backend = OcrmypdfBackend(jobs=args.jobs)
+                jobs = (
+                    args.jobs
+                    if args.jobs is not None
+                    else int(os.environ.get("CZUR_OCR_JOBS", "4"))
+                )
+                ocr_backend = OcrmypdfBackend(jobs=jobs)
                 scan_export = finalize_scan_session(
                     paths,
                     ocr_backend,

@@ -39,7 +39,10 @@ def test_review_server_is_loopback_only(tmp_path: Path) -> None:
         review_server.server.server_close()
 
 
-def test_review_server_serves_preserved_source_for_hidpi(tmp_path: Path) -> None:
+def test_review_server_serves_preserved_source_for_hidpi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     capture = tmp_path / "capture"
     capture.mkdir()
     image_path = capture / "page.jpg"
@@ -47,8 +50,14 @@ def test_review_server_serves_preserved_source_for_hidpi(tmp_path: Path) -> None
     paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
     observed = observe_scan_folder(paths, capture)
     asset_id = observed.imported_asset_ids[0]
+    expected = image_path.read_bytes()
 
     review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _self: pytest.fail("review image responses must stream from file handles"),
+    )
     client, handler_socket = socket.socketpair()
     try:
         client.sendall(
@@ -67,7 +76,7 @@ def test_review_server_serves_preserved_source_for_hidpi(tmp_path: Path) -> None
         headers, _, body = response.partition(b"\r\n\r\n")
         assert b" 200 " in headers.splitlines()[0]
         assert b"Content-Type: image/jpeg" in headers
-        assert body == image_path.read_bytes()
+        assert body == expected
     finally:
         client.close()
         handler_socket.close()

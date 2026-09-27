@@ -223,3 +223,36 @@ def test_default_output_dir_uses_standard_library_layout(tmp_path: Path) -> None
         / "sessions"
         / f"My-Recording--{source_sha256[:12]}"
     )
+
+def test_invalid_scanner_jobs_env_does_not_break_unrelated_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CZUR_OCR_JOBS", "not-an-integer")
+    monkeypatch.setattr(cli, "_which", _all_tools_present)
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
+
+    assert cli.main(["doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["ready"] is True
+
+
+def test_invalid_scanner_jobs_env_is_reported_by_scan_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CZUR_OCR_JOBS", "not-an-integer")
+
+    assert (
+        cli.main(
+            [
+                "scan",
+                "finalize",
+                "--project",
+                "book",
+                "--session",
+                "chapter",
+            ]
+        )
+        == 1
+    )
+    assert "scan failed:" in capsys.readouterr().err

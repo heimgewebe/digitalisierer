@@ -6,6 +6,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import os
 from pathlib import Path
 import secrets
 from typing import Any
@@ -272,16 +273,18 @@ def build_review_server(
                 if target is None or not target.is_file():
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
-                payload = target.read_bytes()
                 content_type = (
                     "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
                 )
-                self._headers(
-                    HTTPStatus.OK,
-                    content_type=content_type,
-                    content_length=len(payload),
-                )
-                self.wfile.write(payload)
+                with target.open("rb") as source:
+                    content_length = os.fstat(source.fileno()).st_size
+                    self._headers(
+                        HTTPStatus.OK,
+                        content_type=content_type,
+                        content_length=content_length,
+                    )
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        self.wfile.write(chunk)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
