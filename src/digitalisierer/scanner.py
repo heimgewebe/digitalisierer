@@ -489,6 +489,12 @@ def observe_scan_folder(
                 raise ScannerWorkflowError(
                     f"asset identity collision for {asset_id}"
                 )
+            if not isinstance(review_items.get(asset_id), dict):
+                review_items[asset_id] = {
+                    "sequence": sequence,
+                    "included": True,
+                    "replacement_for": None,
+                }
             skipped.append(asset_id)
             continue
 
@@ -545,8 +551,11 @@ def observe_scan_folder(
         }
     )
     review["items"] = review_items
-    _atomic_write_text(paths.session_file, _json_text(session))
+    # Publish review state first. If the following session write fails, a retry can
+    # safely re-import/reconcile the assets; the inverse order can strand a session
+    # whose assets have no review decisions.
     _atomic_write_text(paths.review_file, _json_text(review))
+    _atomic_write_text(paths.session_file, _json_text(session))
     _atomic_write_text(
         paths.findings_file,
         _json_text(

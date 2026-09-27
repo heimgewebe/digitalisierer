@@ -30,6 +30,27 @@ def _transcription_status(ready: bool) -> cli.CapabilityStatus:
     }
 
 
+def _capture_status(ready: bool) -> cli.CapabilityStatus:
+    return {
+        "ready": ready,
+        "checks": {
+            "xdotool": {
+                "found": ready,
+                "path": "/tools/xdotool" if ready else None,
+            },
+            "czur-launcher": {
+                "found": ready,
+                "path": "/tools/czur-scanner" if ready else None,
+            },
+            "czur-config": {
+                "found": ready,
+                "path": "/config/czur.json" if ready else None,
+            },
+        },
+        "detail": "ready" if ready else "not ready",
+    }
+
+
 def test_cli_entrypoint_is_callable() -> None:
     assert callable(cli.main)
 
@@ -39,12 +60,9 @@ def test_doctor_reports_uniform_capability_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    app.chmod(0o755)
-
     monkeypatch.setattr(cli, "_which", _all_tools_present)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
+    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
@@ -55,10 +73,7 @@ def test_doctor_reports_uniform_capability_json(
     assert payload["capabilities"]["media"]["ready"] is True
     assert payload["capabilities"]["ocr"]["ready"] is True
     assert payload["capabilities"]["capture-czur"]["ready"] is True
-    assert payload["capabilities"]["capture-czur"]["checks"]["czur-app"] == {
-        "found": True,
-        "path": str(app),
-    }
+    assert payload["capabilities"]["capture-czur"] == _capture_status(True)
     assert payload["capabilities"]["transcription"] == {
         "ready": None,
         "checks": {},
@@ -66,17 +81,12 @@ def test_doctor_reports_uniform_capability_json(
     }
 
 
-def test_doctor_can_require_executable_czur_app(
-    tmp_path: Path,
+def test_doctor_capture_czur_uses_backend_readiness(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("not executable\n", encoding="utf-8")
-    app.chmod(0o644)
-
     monkeypatch.setattr(cli, "_which", _all_tools_present)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(False))
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor", "--require", "capture-czur"]) == 1
@@ -84,11 +94,7 @@ def test_doctor_can_require_executable_czur_app(
 
     assert payload["ready"] is False
     assert payload["required_capabilities"] == ["capture-czur"]
-    assert payload["capabilities"]["capture-czur"]["ready"] is False
-    assert (
-        payload["capabilities"]["capture-czur"]["checks"]["czur-app"]["found"]
-        is False
-    )
+    assert payload["capabilities"]["capture-czur"] == _capture_status(False)
 
 
 def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
@@ -96,17 +102,13 @@ def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    app.chmod(0o755)
-
     def missing_tesseract(name: str) -> cli.ToolCheck:
         if name == "tesseract":
             return {"found": False, "path": None}
         return {"found": True, "path": f"/tools/{name}"}
 
     monkeypatch.setattr(cli, "_which", missing_tesseract)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 1

@@ -33,7 +33,7 @@ from .transcription import (
 CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
     "media": ("ffmpeg", "ffprobe"),
     "ocr": ("ocrmypdf", "tesseract"),
-    "capture-czur": ("xdotool", "v4l2-ctl"),
+    "capture-czur": (),
 }
 CAPABILITY_NAMES = (*CAPABILITY_TOOLS, "transcription")
 DEFAULT_REQUIRED_CAPABILITIES = ("media", "ocr")
@@ -55,8 +55,25 @@ def _which(name: str) -> ToolCheck:
     return {"found": path is not None, "path": path}
 
 
-def _czur_app_path() -> Path:
-    return Path.home() / ".local/opt/czur-scanner/CzurScanner"
+def _czur_capture_capability() -> CapabilityStatus:
+    backend = CzurCaptureBackend()
+    status = backend.status()
+    return {
+        "ready": status.ready,
+        "checks": {
+            "xdotool": _which(backend.xdotool),
+            "czur-launcher": {
+                "found": backend.launcher.is_file()
+                and os.access(backend.launcher, os.X_OK),
+                "path": str(backend.launcher),
+            },
+            "czur-config": {
+                "found": backend.config_path.is_file(),
+                "path": str(backend.config_path),
+            },
+        },
+        "detail": status.detail,
+    }
 
 
 def _transcription_backend() -> TranscriptionBackend:
@@ -81,21 +98,15 @@ def _capabilities(required: tuple[str, ...]) -> dict[str, CapabilityStatus]:
     capabilities: dict[str, CapabilityStatus] = {}
 
     for capability, tools in CAPABILITY_TOOLS.items():
-        checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
-        detail = ""
-
         if capability == "capture-czur":
-            app_path = _czur_app_path()
-            checks["czur-app"] = {
-                "found": app_path.is_file() and os.access(app_path, os.X_OK),
-                "path": str(app_path),
-            }
-            detail = "CZUR capture adapter prerequisites"
+            capabilities[capability] = _czur_capture_capability()
+            continue
 
+        checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
         capabilities[capability] = {
             "ready": all(item["found"] for item in checks.values()),
             "checks": checks,
-            "detail": detail,
+            "detail": "",
         }
 
     capabilities["transcription"] = (

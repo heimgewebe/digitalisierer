@@ -212,3 +212,59 @@ def test_finalize_uses_one_review_snapshot_when_review_changes_during_ocr(
     current_review = json.loads(paths.review_file.read_text(encoding="utf-8"))
     assert current_review["items"][first]["included"] is False
     assert list(paths.exports.iterdir()) == []
+
+def test_observe_resume_repairs_known_asset_missing_review_state(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    review["items"].pop(asset_id)
+    paths.review_file.write_text(
+        json.dumps(review, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    resumed = observe_scan_folder(paths, capture)
+    processing = load_processing_session(paths)
+
+    assert resumed.imported_asset_ids == ()
+    assert resumed.skipped_asset_ids == (asset_id,)
+    assert [asset.asset_id for asset in processing.ordered_assets()] == [asset_id]
+
+
+def test_observe_is_recoverable_if_session_write_fails_after_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import digitalisierer.scanner as scanner_module
+
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
+    original_write = scanner_module._atomic_write_text
+    failed = False
+
+    def fail_session_once(path: Path, content: str) -> None:
+        nonlocal failed
+        if path == paths.session_file and not failed:
+            failed = True
+            raise OSError("synthetic session write failure")
+        original_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_session_once)
+    with pytest.raises(OSError, match="synthetic session write failure"):
+        observe_scan_folder(paths, capture)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    resumed = observe_scan_folder(paths, capture)
+    processing = load_processing_session(paths)
+
+    assert len(resumed.imported_asset_ids) == 1
+    assert len(processing.ordered_assets()) == 1
