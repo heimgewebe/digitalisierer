@@ -14,17 +14,30 @@ from digitalisierer.scanner import (
 )
 
 
+def _review_host_header(review_server: object) -> str:
+    server = review_server.server  # type: ignore[attr-defined]
+    host_value, port_value = server.server_address[:2]
+    host = (
+        host_value.decode("ascii")
+        if isinstance(host_value, bytes)
+        else str(host_value)
+    )
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{rendered_host}:{int(port_value)}"
+
+
 def _post_review_form(
     review_server: object,
     fields: dict[str, str],
 ) -> bytes:
     body = urlencode(fields).encode("utf-8")
+    host_header = _review_host_header(review_server)
     client, handler_socket = socket.socketpair()
     try:
         client.sendall(
             (
                 "POST /save HTTP/1.0\r\n"
-                "Host: localhost\r\n"
+                f"Host: {host_header}\r\n"
                 f"Content-Length: {len(body)}\r\n"
                 "Content-Type: application/x-www-form-urlencoded\r\n"
                 "\r\n"
@@ -101,7 +114,7 @@ def test_review_server_serves_preserved_source_for_hidpi(
     client, handler_socket = socket.socketpair()
     try:
         client.sendall(
-            f"GET /source/{asset_id} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode()
+            f"GET /source/{asset_id} HTTP/1.0\r\nHost: {_review_host_header(review_server)}\r\n\r\n".encode()
         )
         handler = review_server.server.RequestHandlerClass
         handler(handler_socket, ("127.0.0.1", 1), review_server.server)
@@ -229,7 +242,7 @@ def test_review_server_refreshes_asset_maps_after_observe(tmp_path: Path) -> Non
         client, handler_socket = socket.socketpair()
         try:
             client.sendall(
-                f"GET /source/{new_asset} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode()
+                f"GET /source/{new_asset} HTTP/1.0\r\nHost: {_review_host_header(review_server)}\r\n\r\n".encode()
             )
             server = review_server.server
             handler = server.RequestHandlerClass
@@ -260,4 +273,104 @@ def test_review_server_refreshes_asset_maps_after_observe(tmp_path: Path) -> Non
         )
         assert b" 303 " in response.splitlines()[0]
     finally:
+        review_server.server.server_close()
+
+@pytest.mark.parametrize(
+    "host_lines",
+    [
+        "Host: attacker.example\r\n",
+        "Host: 127.0.0.1\r\nHost: attacker.example\r\n",
+        "Host: [::1\r\n",
+    ],
+)
+def test_review_server_rejects_untrusted_or_ambiguous_host_headers(
+    tmp_path: Path,
+    host_lines: str,
+) -> None:
+    paths = create_or_resume_scan_session("book", "host-check", tmp_path / "library")
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                "GET / HTTP/1.0\r\n"
+                + host_lines
+                + "\r\n"
+            ).encode("ascii")
+        )
+        server = review_server.server
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        status_line, _, body = response.partition(b"\r\n")
+        assert b" 421 " in status_line
+        assert review_server.csrf_token.encode("ascii") not in body
+        assert b"Scan-Review" not in body
+    finally:
+        client.close()
+        handler_socket.close()
+        review_server.server.server_close()
+
+
+def test_review_server_rejects_untrusted_host_before_post_mutation(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "host-post"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session("book", "host-post", tmp_path / "library")
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    before = paths.review_file.read_bytes()
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+
+    body = urlencode(
+        {
+            "csrf": review_server.csrf_token,
+            "asset_id": asset_id,
+            "included": "",
+            "sequence": "1",
+            "original_sequence": "1",
+            "replacement_for": "",
+            "original_replacement_for": "",
+        }
+    ).encode("utf-8")
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                "POST /save HTTP/1.0\r\n"
+                "Host: attacker.example\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+                "\r\n"
+            ).encode("ascii")
+            + body
+        )
+        server = review_server.server
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        assert b" 421 " in response.splitlines()[0]
+        assert paths.review_file.read_bytes() == before
+    finally:
+        client.close()
+        handler_socket.close()
         review_server.server.server_close()

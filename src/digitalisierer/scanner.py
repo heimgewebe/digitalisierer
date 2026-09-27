@@ -893,12 +893,18 @@ def finalize_scan_session(
 
     verified_sources = _verify_preserved_sources(paths, session)
     review_sha = _review_digest(review)
+    version_method = getattr(ocr_backend, "version", None)
+    ocr_provenance: dict[str, object] = {
+        "adapter": getattr(ocr_backend, "name", type(ocr_backend).__name__),
+        "language": language,
+        "version": version_method() if callable(version_method) else None,
+    }
     export_identity = hashlib.sha256(
         _json_text(
             {
                 "layout": SCAN_EXPORT_LAYOUT,
                 "review_sha256": review_sha,
-                "language": language,
+                "ocr": ocr_provenance,
                 "active": [
                     {"asset_id": asset.asset_id, "sha256": asset.sha256}
                     for asset in active
@@ -957,7 +963,6 @@ def finalize_scan_session(
             name: _sha256_file(staging / name)
             for name in ("master.pdf", "searchable.pdf", "text.txt", "report.txt")
         }
-        version_method = getattr(ocr_backend, "version", None)
         manifest: dict[str, object] = {
             "schema_version": 1,
             "kind": "digitalisierer.scan-manifest",
@@ -968,11 +973,7 @@ def finalize_scan_session(
             "export_id": export_id,
             "review_sha256": review_sha,
             "review": review,
-            "ocr": {
-                "adapter": getattr(ocr_backend, "name", type(ocr_backend).__name__),
-                "language": language,
-                "version": version_method() if callable(version_method) else None,
-            },
+            "ocr": ocr_provenance,
             "sources": verified_sources,
             "active_order": [
                 {"asset_id": asset.asset_id, "sha256": asset.sha256}

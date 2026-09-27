@@ -545,3 +545,49 @@ def test_observe_findings_failure_does_not_publish_session(
     assert {item["asset_id"] for item in session_after_retry["assets"]} == set(
         review_after_retry["items"]
     )
+
+def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-ocr-identity"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "ocr-identity",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    class _VersionedFakeOcr(_FakeOcr):
+        def __init__(self, version_value: str) -> None:
+            self.version_value = version_value
+
+        def version(self) -> str:
+            return self.version_value
+
+    first = finalize_scan_session(
+        paths,
+        _VersionedFakeOcr("1.0"),
+        pdf_builder=_fake_pdf,
+    )
+    second = finalize_scan_session(
+        paths,
+        _VersionedFakeOcr("2.0"),
+        pdf_builder=_fake_pdf,
+    )
+
+    assert first.export_dir != second.export_dir
+    first_manifest = json.loads(
+        (first.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    second_manifest = json.loads(
+        (second.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert first_manifest["ocr"]["version"] == "1.0"
+    assert second_manifest["ocr"]["version"] == "2.0"
+
+    with pytest.raises(ScannerWorkflowError, match="already exists"):
+        finalize_scan_session(
+            paths,
+            _VersionedFakeOcr("2.0"),
+            pdf_builder=_fake_pdf,
+        )

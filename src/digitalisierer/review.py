@@ -226,6 +226,39 @@ def _review_asset_paths(
     return thumbnail_by_id, source_by_id
 
 
+def _trusted_host_header(
+    raw_values: list[str],
+    *,
+    configured_host: str,
+    bound_host: str,
+    bound_port: int,
+) -> bool:
+    if len(raw_values) != 1:
+        return False
+    raw_host = raw_values[0]
+    if not raw_host or raw_host != raw_host.strip():
+        return False
+    try:
+        parsed = urlparse(f"//{raw_host}")
+        requested_port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    allowed_hosts = {configured_host.lower(), bound_host.lower()}
+    if parsed.hostname.lower() not in allowed_hosts:
+        return False
+    return requested_port is None or requested_port == bound_port
+
+
 def build_review_server(
     paths: ScanSessionPaths,
     *,
@@ -261,7 +294,27 @@ def build_review_server(
             )
             self.end_headers()
 
+        def _request_host_is_trusted(self) -> bool:
+            server_address = self.server.server_address
+            if not isinstance(server_address, tuple) or len(server_address) < 2:
+                return False
+            bound_host_value, bound_port_value = server_address[:2]
+            bound_host = (
+                bound_host_value.decode("ascii")
+                if isinstance(bound_host_value, bytes)
+                else str(bound_host_value)
+            )
+            return _trusted_host_header(
+                list(self.headers.get_all("Host", [])),
+                configured_host=host,
+                bound_host=bound_host,
+                bound_port=int(bound_port_value),
+            )
+
         def do_GET(self) -> None:  # noqa: N802
+            if not self._request_host_is_trusted():
+                self.send_error(HTTPStatus.MISDIRECTED_REQUEST)
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 payload = render_review_html(paths, csrf_token=csrf_token).encode(
@@ -306,6 +359,9 @@ def build_review_server(
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._request_host_is_trusted():
+                self.send_error(HTTPStatus.MISDIRECTED_REQUEST)
+                return
             if urlparse(self.path).path != "/save":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
