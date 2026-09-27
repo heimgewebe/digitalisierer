@@ -61,7 +61,12 @@ class CzurCaptureBackend:
     def _load_config_payload(self) -> dict[str, Any]:
         if not self.config_path.is_file():
             raise CzurAdapterError(f"CZUR config is missing: {self.config_path}")
-        raw = self.config_path.read_text(encoding="utf-8")
+        try:
+            raw = self.config_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise CzurAdapterError(
+                f"CZUR config cannot be read as UTF-8: {self.config_path}"
+            ) from exc
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:

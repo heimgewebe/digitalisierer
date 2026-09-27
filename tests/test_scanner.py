@@ -444,3 +444,53 @@ def test_finalize_serializes_review_update_through_publication(
     assert manifest["review"]["items"][first]["included"] is True
     current_review = json.loads(paths.review_file.read_text(encoding="utf-8"))
     assert current_review["items"][first]["included"] is False
+
+def test_finalize_rejects_orphan_review_entries(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-orphan-review"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 90)
+    paths = create_or_resume_scan_session("book", "orphan-review", tmp_path / "library")
+    observe_scan_folder(paths, capture)
+
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    review["items"]["orphan-asset"] = {
+        "sequence": 2,
+        "included": True,
+        "replacement_for": None,
+    }
+    paths.review_file.write_text(json.dumps(review) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="review state contains assets missing from scan session",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
+
+def test_default_pdf_builder_streams_to_img2pdf_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import digitalisierer.scanner as scanner_module
+    import img2pdf  # type: ignore[import-untyped]
+
+    image = tmp_path / "page.jpg"
+    _image(image, 100)
+    output = tmp_path / "master.pdf"
+
+    def fake_convert(
+        images: list[str],
+        *,
+        outputstream: object,
+    ) -> bytes:
+        assert images == [str(image)]
+        write = getattr(outputstream, "write")
+        write(b"streamed-pdf")
+        return b"buffered-return-must-not-be-used"
+
+    monkeypatch.setattr(img2pdf, "convert", fake_convert)
+    scanner_module._default_pdf_builder([image], output)
+
+    assert output.read_bytes() == b"streamed-pdf"

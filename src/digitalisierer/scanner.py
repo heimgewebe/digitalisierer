@@ -697,6 +697,14 @@ def _processing_session_from_payload(
                 replacement_for=replacement_for,
             )
         )
+
+    asset_ids = {item.asset.asset_id for item in items}
+    orphan_review_ids = set(raw_review).difference(asset_ids)
+    if orphan_review_ids:
+        raise ScannerWorkflowError(
+            "review state contains assets missing from scan session: "
+            + ", ".join(sorted(orphan_review_ids))
+        )
     try:
         return ProcessingSession(
             session_id=str(session.get("session_id")),
@@ -816,7 +824,7 @@ def _default_pdf_builder(images: list[Path], output: Path) -> None:
             "scanner PDF export requires img2pdf; install Digitalisierer scanner dependencies"
         ) from exc
     with output.open("xb") as handle:
-        handle.write(img2pdf.convert([str(path) for path in images]))
+        img2pdf.convert([str(path) for path in images], outputstream=handle)
         handle.flush()
         os.fsync(handle.fileno())
 

@@ -146,3 +146,59 @@ def test_status_rejects_config_that_start_would_reject(
     assert backend.status().ready is False
     with pytest.raises(CzurAdapterError, match=message):
         backend.apply_curved_books_preset()
+
+def test_status_handles_non_utf8_config_without_traceback(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    config.write_bytes(b"\xff")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="cannot be read as UTF-8"):
+        backend.apply_curved_books_preset()
+
+
+def test_status_handles_config_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    original_read_text = Path.read_text
+
+    def fail_config_read(
+        self: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if self == config:
+            raise OSError("synthetic config read failure")
+        return original_read_text(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", fail_config_read)
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="cannot be read as UTF-8"):
+        backend.apply_curved_books_preset()
