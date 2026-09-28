@@ -148,6 +148,41 @@ def test_status_rejects_config_that_start_would_reject(
     with pytest.raises(CzurAdapterError, match=message):
         backend.apply_curved_books_preset()
 
+def test_status_rejects_unwritable_config_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config-dir"
+    config_dir.mkdir()
+    config = config_dir / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_access = os.access
+
+    def access(path: os.PathLike[str] | str, mode: int) -> bool:
+        if Path(path) == config_dir and mode == (os.W_OK | os.X_OK):
+            return False
+        return original_access(path, mode)
+
+    monkeypatch.setattr(os, "access", access)
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="config directory is not writable"):
+        backend.apply_curved_books_preset()
+
+
 def test_status_handles_non_utf8_config_without_traceback(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
     config.write_bytes(b"\xff")

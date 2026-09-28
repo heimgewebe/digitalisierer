@@ -930,6 +930,21 @@ def _pdf_builder_provenance(pdf_builder: ImageToPdf) -> dict[str, str]:
     return {"adapter": name, "version": version}
 
 
+def _ocr_provenance(ocr_backend: OCRBackend, language: str) -> dict[str, str]:
+    name = getattr(ocr_backend, "name", None)
+    version_method = getattr(ocr_backend, "version", None)
+    if not isinstance(name, str) or not name or not callable(version_method):
+        raise ScannerWorkflowError(
+            "OCR backend must expose stable name/version provenance"
+        )
+    version = version_method()
+    if not isinstance(version, str) or not version:
+        raise ScannerWorkflowError(
+            "OCR backend must expose stable name/version provenance"
+        )
+    return {"adapter": name, "language": language, "version": version}
+
+
 def _review_digest(review: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -996,12 +1011,7 @@ def finalize_scan_session(
     verified_sources = _verify_preserved_sources(paths, session)
     review_sha = _review_digest(review)
     pdf_builder_provenance = _pdf_builder_provenance(pdf_builder)
-    version_method = getattr(ocr_backend, "version", None)
-    ocr_provenance: dict[str, object] = {
-        "adapter": getattr(ocr_backend, "name", type(ocr_backend).__name__),
-        "language": language,
-        "version": version_method() if callable(version_method) else None,
-    }
+    ocr_provenance = _ocr_provenance(ocr_backend, language)
     export_identity = hashlib.sha256(
         _json_text(
             {

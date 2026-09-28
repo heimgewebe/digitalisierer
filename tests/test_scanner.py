@@ -713,6 +713,87 @@ def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> Non
             pdf_builder=_fake_pdf,
         )
 
+@pytest.mark.parametrize("version_value", [None, ""])
+def test_finalize_rejects_missing_ocr_provenance(
+    tmp_path: Path,
+    version_value: str | None,
+) -> None:
+    capture = tmp_path / "capture-missing-ocr-provenance"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "missing-ocr-provenance",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    class _MissingVersionOcr:
+        name = "fake-ocr"
+
+        def version(self) -> str | None:
+            return version_value
+
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            raise AssertionError("OCR execution must not start without provenance")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="OCR backend must expose stable name/version provenance",
+    ):
+        finalize_scan_session(
+            paths,
+            _MissingVersionOcr(),
+            pdf_builder=_fake_pdf,
+        )
+
+    assert list(paths.exports.iterdir()) == []
+
+
+def test_finalize_rejects_ocr_backend_without_version_method(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-unversioned-ocr"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "unversioned-ocr",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    class _UnversionedOcr:
+        name = "fake-ocr"
+
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            raise AssertionError("OCR execution must not start without provenance")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="OCR backend must expose stable name/version provenance",
+    ):
+        finalize_scan_session(
+            paths,
+            _UnversionedOcr(),
+            pdf_builder=_fake_pdf,
+        )
+
+    assert list(paths.exports.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [

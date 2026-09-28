@@ -77,6 +77,16 @@ class CzurCaptureBackend:
             raise CzurAdapterError("CZUR config setting must be an object")
         return payload
 
+    def _config_write_ready(self) -> bool:
+        parent = self.config_path.parent
+        return parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+
+    def _require_config_write_ready(self) -> None:
+        if not self._config_write_ready():
+            raise CzurAdapterError(
+                f"CZUR config directory is not writable: {self.config_path.parent}"
+            )
+
     def status(self) -> CaptureStatus:
         executable_ready = self.launcher.is_file() and os.access(
             self.launcher, os.X_OK
@@ -86,7 +96,7 @@ class CzurCaptureBackend:
         except CzurAdapterError:
             config_ready = False
         else:
-            config_ready = True
+            config_ready = self._config_write_ready()
         xdotool_ready = shutil.which(self.xdotool) is not None or Path(
             self.xdotool
         ).is_file()
@@ -101,6 +111,7 @@ class CzurCaptureBackend:
 
     def apply_curved_books_preset(self) -> dict[str, object]:
         payload = self._load_config_payload()
+        self._require_config_write_ready()
         setting = payload.setdefault("setting", {})
         if not isinstance(setting, dict):
             raise CzurAdapterError("CZUR config setting must be an object")
