@@ -5,6 +5,7 @@ import ctypes
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -39,6 +40,11 @@ class ImageDependencyError(ScannerWorkflowError):
 
 
 class ImageToPdf(Protocol):
+    name: str
+
+    def version(self) -> str:
+        ...
+
     def __call__(self, images: list[Path], output: Path) -> None:
         ...
 
@@ -102,6 +108,49 @@ def _validate_session_identity(paths: ScanSessionPaths, session: dict[str, Any])
         raise ScannerWorkflowError(
             "scan session identity/layout does not match the session path"
         )
+
+
+def _validate_review_payload(review: dict[str, Any]) -> None:
+    if (
+        review.get("schema_version") != 1
+        or review.get("kind") != "digitalisierer.scan-review"
+    ):
+        raise ScannerWorkflowError("scan review metadata contract is incompatible")
+    if not isinstance(review.get("items"), dict):
+        raise ScannerWorkflowError("scan review items must be an object")
+
+
+def _validate_findings_payload(findings: dict[str, Any]) -> None:
+    if (
+        findings.get("schema_version") != 1
+        or findings.get("kind") != "digitalisierer.scan-findings"
+    ):
+        raise ScannerWorkflowError("scan findings metadata contract is incompatible")
+    raw_findings = findings.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ScannerWorkflowError("scan findings must be a list")
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            raise ScannerWorkflowError("scan finding entry must be an object")
+        asset_ids = finding.get("asset_ids")
+        evidence = finding.get("evidence")
+        confidence = finding.get("confidence")
+        if (
+            not isinstance(finding.get("kind"), str)
+            or not isinstance(finding.get("message"), str)
+            or not isinstance(asset_ids, list)
+            or any(not isinstance(asset_id, str) for asset_id in asset_ids)
+            or not isinstance(evidence, list)
+            or any(not isinstance(item, str) for item in evidence)
+            or (
+                confidence is not None
+                and (
+                    isinstance(confidence, bool)
+                    or not isinstance(confidence, (int, float))
+                )
+            )
+        ):
+            raise ScannerWorkflowError("scan finding entry has invalid shape")
 
 
 def _json_text(payload: object) -> str:
@@ -221,9 +270,16 @@ def create_or_resume_scan_session(
     library_root: Path | None = None,
 ) -> ScanSessionPaths:
     paths = scan_session_paths(project_id, session_id, library_root)
-    paths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for directory in (paths.sources, paths.thumbnails, paths.exports):
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    paths.root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        paths.root.mkdir(mode=0o700)
+    except FileExistsError:
+        if not paths.root.is_dir():
+            raise ScannerWorkflowError("scan session root is not a directory")
+        if not paths.session_file.exists() and any(paths.root.iterdir()):
+            raise ScannerWorkflowError(
+                "scan session root is already occupied by non-scanner content"
+            )
 
     if paths.session_file.exists():
         session = _load_json(paths.session_file)
@@ -239,6 +295,9 @@ def create_or_resume_scan_session(
             "capture_observations": [],
         }
         _atomic_write_text(paths.session_file, _json_text(session))
+
+    for directory in (paths.sources, paths.thumbnails, paths.exports):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     if not paths.review_file.exists():
         _atomic_write_text(
@@ -507,6 +566,7 @@ def _observe_scan_folder_unlocked(
     skipped: list[str] = []
 
     review = _load_json(paths.review_file)
+    _validate_review_payload(review)
     review_items = review.get("items")
     if not isinstance(review_items, dict):
         raise ScannerWorkflowError("scan review items must be an object")
@@ -662,6 +722,7 @@ def _processing_session_from_payload(
     session: dict[str, Any],
     review: dict[str, Any],
 ) -> ProcessingSession:
+    _validate_review_payload(review)
     raw_assets = session.get("assets")
     raw_review = review.get("items")
     if not isinstance(raw_assets, list) or not isinstance(raw_review, dict):
@@ -743,6 +804,7 @@ def _update_review_item_unlocked(
     replacement_for: str | None | object = _UNSET,
 ) -> ProcessingSession:
     review = _load_json(paths.review_file)
+    _validate_review_payload(review)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
@@ -826,17 +888,46 @@ def _verify_preserved_sources(
     return verified
 
 
-def _default_pdf_builder(images: list[Path], output: Path) -> None:
-    try:
-        import img2pdf  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise ImageDependencyError(
-            "scanner PDF export requires img2pdf; install Digitalisierer scanner dependencies"
-        ) from exc
-    with output.open("xb") as handle:
-        img2pdf.convert([str(path) for path in images], outputstream=handle)
-        handle.flush()
-        os.fsync(handle.fileno())
+class _Img2PdfBuilder:
+    name = "img2pdf"
+
+    def version(self) -> str:
+        try:
+            return importlib.metadata.version("img2pdf")
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise ImageDependencyError(
+                "scanner PDF export requires img2pdf; install Digitalisierer scanner dependencies"
+            ) from exc
+
+    def __call__(self, images: list[Path], output: Path) -> None:
+        try:
+            import img2pdf  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImageDependencyError(
+                "scanner PDF export requires img2pdf; install Digitalisierer scanner dependencies"
+            ) from exc
+        with output.open("xb") as handle:
+            img2pdf.convert([str(path) for path in images], outputstream=handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+_default_pdf_builder: ImageToPdf = _Img2PdfBuilder()
+
+
+def _pdf_builder_provenance(pdf_builder: ImageToPdf) -> dict[str, str]:
+    name = getattr(pdf_builder, "name", None)
+    version_method = getattr(pdf_builder, "version", None)
+    if not isinstance(name, str) or not name or not callable(version_method):
+        raise ScannerWorkflowError(
+            "PDF builder must expose stable name/version provenance"
+        )
+    version = version_method()
+    if not isinstance(version, str) or not version:
+        raise ScannerWorkflowError(
+            "PDF builder must expose stable name/version provenance"
+        )
+    return {"adapter": name, "version": version}
 
 
 def _review_digest(review: dict[str, Any]) -> str:
@@ -896,6 +987,7 @@ def finalize_scan_session(
     _validate_session_identity(paths, session)
     review, review_file_sha = _stable_json_snapshot(paths.review_file)
     findings_payload, findings_file_sha = _stable_json_snapshot(paths.findings_file)
+    _validate_findings_payload(findings_payload)
     processing = _processing_session_from_payload(paths, session, review)
     active = processing.ordered_assets()
     if not active:
@@ -903,6 +995,7 @@ def finalize_scan_session(
 
     verified_sources = _verify_preserved_sources(paths, session)
     review_sha = _review_digest(review)
+    pdf_builder_provenance = _pdf_builder_provenance(pdf_builder)
     version_method = getattr(ocr_backend, "version", None)
     ocr_provenance: dict[str, object] = {
         "adapter": getattr(ocr_backend, "name", type(ocr_backend).__name__),
@@ -914,6 +1007,7 @@ def finalize_scan_session(
             {
                 "layout": SCAN_EXPORT_LAYOUT,
                 "review_sha256": review_sha,
+                "pdf_builder": pdf_builder_provenance,
                 "ocr": ocr_provenance,
                 "active": [
                     {"asset_id": asset.asset_id, "sha256": asset.sha256}
@@ -983,6 +1077,7 @@ def finalize_scan_session(
             "export_id": export_id,
             "review_sha256": review_sha,
             "review": review,
+            "pdf_builder": pdf_builder_provenance,
             "ocr": ocr_provenance,
             "sources": verified_sources,
             "active_order": [

@@ -21,6 +21,40 @@ def _image(path: Path, value: int, *, size: tuple[int, int] = (120, 160)) -> Non
     image.save(path, format="JPEG")
 
 
+def test_init_rejects_occupied_non_scanner_session_root(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    foreign_root = library / "projects" / "inbox" / "sessions" / "shared"
+    foreign_root.mkdir(parents=True)
+    foreign = foreign_root / "transcription.json"
+    foreign.write_text('{"kind":"digitalisierer.transcription"}\n', encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="already occupied by non-scanner content",
+    ):
+        create_or_resume_scan_session("inbox", "shared", library)
+
+    assert foreign.read_text(encoding="utf-8") == (
+        '{"kind":"digitalisierer.transcription"}\n'
+    )
+    assert not (foreign_root / "session.json").exists()
+    assert sorted(path.name for path in foreign_root.iterdir()) == ["transcription.json"]
+
+
+def test_init_claims_preexisting_empty_session_root(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    root = library / "projects" / "book" / "sessions" / "empty"
+    root.mkdir(parents=True)
+
+    paths = create_or_resume_scan_session("book", "empty", library)
+
+    assert paths.root == root
+    assert paths.session_file.is_file()
+    assert paths.sources.is_dir()
+    assert paths.thumbnails.is_dir()
+    assert paths.exports.is_dir()
+
+
 def test_observe_preserves_sources_and_generates_review_and_findings(
     tmp_path: Path,
 ) -> None:
@@ -137,10 +171,23 @@ class _FakeOcr:
         return "test"
 
 
-def _fake_pdf(images: list[Path], output: Path) -> None:
-    output.write_bytes(
-        b"PDF:" + b"|".join(hashlib.sha256(path.read_bytes()).digest() for path in images)
-    )
+class _FakePdf:
+    name = "fake-pdf"
+
+    def __init__(self, version_value: str = "test") -> None:
+        self.version_value = version_value
+
+    def version(self) -> str:
+        return self.version_value
+
+    def __call__(self, images: list[Path], output: Path) -> None:
+        output.write_bytes(
+            b"PDF:"
+            + b"|".join(hashlib.sha256(path.read_bytes()).digest() for path in images)
+        )
+
+
+_fake_pdf = _FakePdf()
 
 
 def test_finalize_is_review_bound_hash_bound_and_no_replace(tmp_path: Path) -> None:
@@ -164,6 +211,7 @@ def test_finalize_is_review_bound_hash_bound_and_no_replace(tmp_path: Path) -> N
     )
 
     assert manifest["layout"] == "digitalisierer.scan-export.v1"
+    assert manifest["pdf_builder"] == {"adapter": "fake-pdf", "version": "test"}
     assert [item["asset_id"] for item in manifest["active_order"]] == [second, first]
     for name, expected in manifest["output_hashes"].items():
         actual = hashlib.sha256((exported.export_dir / name).read_bytes()).hexdigest()
@@ -546,6 +594,79 @@ def test_observe_findings_failure_does_not_publish_session(
         review_after_retry["items"]
     )
 
+def test_finalize_export_identity_includes_pdf_builder_provenance(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-pdf-builder-identity"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "pdf-builder-identity",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    first = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_FakePdf("1.0"),
+    )
+    second = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_FakePdf("2.0"),
+    )
+
+    assert first.export_dir != second.export_dir
+    first_manifest = json.loads(
+        (first.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    second_manifest = json.loads(
+        (second.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert first_manifest["pdf_builder"] == {
+        "adapter": "fake-pdf",
+        "version": "1.0",
+    }
+    assert second_manifest["pdf_builder"] == {
+        "adapter": "fake-pdf",
+        "version": "2.0",
+    }
+
+    with pytest.raises(ScannerWorkflowError, match="already exists"):
+        finalize_scan_session(
+            paths,
+            _FakeOcr(),
+            pdf_builder=_FakePdf("2.0"),
+        )
+
+
+def test_finalize_rejects_pdf_builder_without_provenance(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-unversioned-pdf-builder"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "unversioned-pdf-builder",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    def unversioned_builder(images: list[Path], output: Path) -> None:
+        _fake_pdf(images, output)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="PDF builder must expose stable name/version provenance",
+    ):
+        finalize_scan_session(
+            paths,
+            _FakeOcr(),
+            pdf_builder=unversioned_builder,  # type: ignore[arg-type]
+        )
+
+    assert list(paths.exports.iterdir()) == []
+
+
 def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> None:
     capture = tmp_path / "capture-ocr-identity"
     capture.mkdir()
@@ -591,6 +712,87 @@ def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> Non
             _VersionedFakeOcr("2.0"),
             pdf_builder=_fake_pdf,
         )
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("schema_version", 999),
+        ("kind", "foreign.scan-review"),
+    ],
+)
+def test_finalize_rejects_incompatible_review_metadata_contract(
+    tmp_path: Path,
+    field: str,
+    bad_value: object,
+) -> None:
+    capture = tmp_path / "capture-review-contract"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "review-contract",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    review[field] = bad_value
+    paths.review_file.write_text(json.dumps(review) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scan review metadata contract is incompatible",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "message"),
+    [
+        ("schema_version", 999, "scan findings metadata contract is incompatible"),
+        ("kind", "foreign.scan-findings", "scan findings metadata contract is incompatible"),
+        ("findings", "not-a-list", "scan findings must be a list"),
+        ("findings", ["not-an-object"], "scan finding entry must be an object"),
+        (
+            "findings",
+            [
+                {
+                    "kind": "blank-or-near-blank",
+                    "message": "bad asset_ids shape",
+                    "asset_ids": "not-a-list",
+                    "confidence": None,
+                    "evidence": [],
+                }
+            ],
+            "scan finding entry has invalid shape",
+        ),
+    ],
+)
+def test_finalize_rejects_incompatible_findings_metadata_contract(
+    tmp_path: Path,
+    field: str,
+    bad_value: object,
+    message: str,
+) -> None:
+    capture = tmp_path / "capture-findings-contract"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "findings-contract",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+    findings[field] = bad_value
+    paths.findings_file.write_text(json.dumps(findings) + "\n", encoding="utf-8")
+
+    with pytest.raises(ScannerWorkflowError, match=message):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
 
 @pytest.mark.parametrize(
     ("field", "bad_value"),
