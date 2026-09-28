@@ -591,3 +591,39 @@ def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> Non
             _VersionedFakeOcr("2.0"),
             pdf_builder=_fake_pdf,
         )
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("project_id", "other-project"),
+        ("session_id", "other-session"),
+        ("layout", "digitalisierer.scan-session.v999"),
+        ("kind", "foreign.scan-session"),
+        ("schema_version", 999),
+    ],
+)
+def test_finalize_rejects_session_identity_or_layout_mismatch(
+    tmp_path: Path,
+    field: str,
+    bad_value: object,
+) -> None:
+    capture = tmp_path / "capture-session-identity"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "identity",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    session[field] = bad_value
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="identity/layout does not match the session path",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []

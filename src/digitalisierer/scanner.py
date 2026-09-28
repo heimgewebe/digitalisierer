@@ -86,6 +86,24 @@ def scan_session_paths(
     )
 
 
+def _validate_session_identity(paths: ScanSessionPaths, session: dict[str, Any]) -> None:
+    sessions_dir = paths.root.parent
+    project_dir = sessions_dir.parent
+    projects_dir = project_dir.parent
+    if sessions_dir.name != "sessions" or projects_dir.name != "projects":
+        raise ScannerWorkflowError("scan session path does not use the canonical layout")
+    if (
+        session.get("schema_version") != 1
+        or session.get("kind") != "digitalisierer.scan-session"
+        or session.get("layout") != SCAN_SESSION_LAYOUT
+        or session.get("project_id") != project_dir.name
+        or session.get("session_id") != paths.root.name
+    ):
+        raise ScannerWorkflowError(
+            "scan session identity/layout does not match the session path"
+        )
+
+
 def _json_text(payload: object) -> str:
     return json.dumps(
         payload,
@@ -209,16 +227,7 @@ def create_or_resume_scan_session(
 
     if paths.session_file.exists():
         session = _load_json(paths.session_file)
-        if (
-            session.get("schema_version") != 1
-            or session.get("kind") != "digitalisierer.scan-session"
-            or session.get("layout") != SCAN_SESSION_LAYOUT
-            or session.get("project_id") != project_id
-            or session.get("session_id") != session_id
-        ):
-            raise ScannerWorkflowError(
-                "existing scan session identity/layout does not match request"
-            )
+        _validate_session_identity(paths, session)
     else:
         session = {
             "schema_version": 1,
@@ -884,6 +893,7 @@ def finalize_scan_session(
     pdf_builder: ImageToPdf = _default_pdf_builder,
 ) -> ScanExport:
     session, session_file_sha = _stable_json_snapshot(paths.session_file)
+    _validate_session_identity(paths, session)
     review, review_file_sha = _stable_json_snapshot(paths.review_file)
     findings_payload, findings_file_sha = _stable_json_snapshot(paths.findings_file)
     processing = _processing_session_from_payload(paths, session, review)
