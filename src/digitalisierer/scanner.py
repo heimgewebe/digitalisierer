@@ -766,11 +766,12 @@ def _observe_scan_folder_unlocked(
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
     try:
+        previous_session_text = paths.session_file.read_text(encoding="utf-8")
         previous_review_text = paths.review_file.read_text(encoding="utf-8")
         previous_findings_text = paths.findings_file.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ScannerWorkflowError(
-            "scan dependent metadata cannot be snapshotted before observation"
+            "scan metadata cannot be snapshotted before observation"
         ) from exc
     review_items = review.get("items")
     if not isinstance(review_items, dict):
@@ -906,25 +907,32 @@ def _observe_scan_folder_unlocked(
     )
     try:
         # review/findings depend on the prospective session.json asset set.
-        # session.json remains the commit point; rollback dependent metadata
-        # if either publication or the final capture-boundary check fails.
+        # Keep the final session commit in the same rollback boundary so any
+        # reported observation failure leaves the previous coherent snapshot.
         _atomic_write_text(paths.review_file, _json_text(review))
         _atomic_write_text(paths.findings_file, findings_text)
         if current_capture_signature() != before_signature:
             raise ScannerWorkflowError(
                 "capture folder changed while Digitalisierer observed it"
             )
+        _atomic_write_text(paths.session_file, _json_text(session))
     except Exception:
-        try:
-            _atomic_write_text(paths.review_file, previous_review_text)
-            _atomic_write_text(paths.findings_file, previous_findings_text)
-        except Exception as rollback_exc:
+        rollback_error: Exception | None = None
+        for metadata_path, previous_text in (
+            (paths.session_file, previous_session_text),
+            (paths.review_file, previous_review_text),
+            (paths.findings_file, previous_findings_text),
+        ):
+            try:
+                _atomic_write_text(metadata_path, previous_text)
+            except Exception as exc:
+                if rollback_error is None:
+                    rollback_error = exc
+        if rollback_error is not None:
             raise ScannerWorkflowError(
-                "failed to restore scanner dependent metadata after observation failure"
-            ) from rollback_exc
+                "failed to restore scanner metadata after observation failure"
+            ) from rollback_error
         raise
-
-    _atomic_write_text(paths.session_file, _json_text(session))
     return ScanObservation(
         session_root=paths.root,
         imported_asset_ids=tuple(imported),

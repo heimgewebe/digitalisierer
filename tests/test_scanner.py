@@ -888,6 +888,56 @@ def test_observe_findings_failure_does_not_publish_session(
         review_after_retry["items"]
     )
 
+def test_observe_session_commit_failure_restores_previous_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-session-commit-failure"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "session-commit-failure",
+        tmp_path / "library",
+    )
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    original_write = scanner_module._atomic_write_text
+    failed = False
+
+    def fail_session_after_replace(path: Path, content: str) -> None:
+        nonlocal failed
+        original_write(path, content)
+        if path == paths.session_file and not failed:
+            failed = True
+            raise OSError("synthetic session commit failure after replace")
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        fail_session_after_replace,
+    )
+
+    with pytest.raises(
+        OSError,
+        match="synthetic session commit failure after replace",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert failed is True
+    for metadata_path, expected in before.items():
+        assert metadata_path.read_bytes() == expected
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    resumed = observe_scan_folder(paths, capture)
+    assert len(resumed.imported_asset_ids) == 1
+    processing = load_processing_session(paths)
+    assert len(processing.ordered_assets()) == 1
+
+
 def test_observe_rejects_capture_membership_change_at_commit_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
