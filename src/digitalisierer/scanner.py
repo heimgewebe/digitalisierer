@@ -132,14 +132,22 @@ def _validate_findings_payload(findings: dict[str, Any]) -> None:
     for finding in raw_findings:
         if not isinstance(finding, dict):
             raise ScannerWorkflowError("scan finding entry must be an object")
+        kind = finding.get("kind")
+        message = finding.get("message")
         asset_ids = finding.get("asset_ids")
         evidence = finding.get("evidence")
         confidence = finding.get("confidence")
         if (
-            not isinstance(finding.get("kind"), str)
-            or not isinstance(finding.get("message"), str)
+            not isinstance(kind, str)
+            or not kind.strip()
+            or not isinstance(message, str)
+            or not message.strip()
             or not isinstance(asset_ids, list)
-            or any(not isinstance(asset_id, str) for asset_id in asset_ids)
+            or any(
+                not isinstance(asset_id, str) or not asset_id.strip()
+                for asset_id in asset_ids
+            )
+            or len(set(asset_ids)) != len(asset_ids)
             or not isinstance(evidence, list)
             or any(not isinstance(item, str) for item in evidence)
             or (
@@ -269,6 +277,45 @@ def image_files(folder: Path) -> list[Path]:
     )
 
 
+def _validate_session_root(paths: ScanSessionPaths) -> Path:
+    if paths.root.is_symlink():
+        raise ScannerWorkflowError("scan session root must not be a symlink")
+    try:
+        root = paths.root.resolve(strict=True)
+        expected_root = paths.root.parent.resolve(strict=True) / paths.root.name
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError("scan session root is invalid") from exc
+    if root != expected_root or not root.is_dir():
+        raise ScannerWorkflowError("scan session root is not canonical")
+    return root
+
+
+def _validate_session_storage_directory(
+    paths: ScanSessionPaths,
+    directory: Path,
+    expected_name: str,
+) -> None:
+    root = _validate_session_root(paths)
+    if directory.name != expected_name or directory.is_symlink():
+        raise ScannerWorkflowError(
+            f"scanner {expected_name} directory must be a canonical direct child"
+        )
+    try:
+        resolved = directory.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError(
+            f"scanner {expected_name} directory is invalid"
+        ) from exc
+    if (
+        not resolved.is_dir()
+        or resolved.parent != root
+        or resolved.name != expected_name
+    ):
+        raise ScannerWorkflowError(
+            f"scanner {expected_name} directory must be a canonical direct child"
+        )
+
+
 def create_or_resume_scan_session(
     project_id: str,
     session_id: str,
@@ -276,6 +323,8 @@ def create_or_resume_scan_session(
 ) -> ScanSessionPaths:
     paths = scan_session_paths(project_id, session_id, library_root)
     paths.root.parent.mkdir(parents=True, exist_ok=True)
+    if paths.root.is_symlink():
+        raise ScannerWorkflowError("scan session root must not be a symlink")
     try:
         paths.root.mkdir(mode=0o700)
     except FileExistsError:
@@ -285,6 +334,7 @@ def create_or_resume_scan_session(
             raise ScannerWorkflowError(
                 "scan session root is already occupied by non-scanner content"
             )
+    _validate_session_root(paths)
 
     if paths.session_file.exists():
         session = _load_json(paths.session_file)
@@ -301,8 +351,17 @@ def create_or_resume_scan_session(
         }
         _atomic_write_text(paths.session_file, _json_text(session))
 
-    for directory in (paths.sources, paths.thumbnails, paths.exports):
+    for directory, expected_name in (
+        (paths.sources, "sources"),
+        (paths.thumbnails, "thumbnails"),
+        (paths.exports, "exports"),
+    ):
+        if directory.is_symlink():
+            raise ScannerWorkflowError(
+                f"scanner {expected_name} directory must be a canonical direct child"
+            )
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _validate_session_storage_directory(paths, directory, expected_name)
 
     if not paths.review_file.exists():
         _atomic_write_text(

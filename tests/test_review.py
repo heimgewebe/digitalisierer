@@ -6,8 +6,10 @@ from urllib.parse import urlencode
 from PIL import Image
 import pytest
 
+import digitalisierer.review as review_module
 from digitalisierer.review import build_review_server, render_review_html
 from digitalisierer.scanner import (
+    ScanSessionPaths,
     ScannerWorkflowError,
     create_or_resume_scan_session,
     load_processing_session,
@@ -131,6 +133,12 @@ def test_review_render_rejects_foreign_session_identity(tmp_path: Path) -> None:
         ({"schema_version": 999}, "metadata contract is incompatible"),
         ({"kind": "foreign.scan-findings"}, "metadata contract is incompatible"),
         ({"findings": "not-a-list"}, "findings must be a list"),
+        ({"findings": [{"kind": "", "message": "valid", "asset_ids": ["asset"], "confidence": None, "evidence": []}]}, "invalid shape"),
+        ({"findings": [{"kind": "   ", "message": "valid", "asset_ids": ["asset"], "confidence": None, "evidence": []}]}, "invalid shape"),
+        ({"findings": [{"kind": "manual-note", "message": "", "asset_ids": ["asset"], "confidence": None, "evidence": []}]}, "invalid shape"),
+        ({"findings": [{"kind": "manual-note", "message": "   ", "asset_ids": ["asset"], "confidence": None, "evidence": []}]}, "invalid shape"),
+        ({"findings": [{"kind": "manual-note", "message": "valid", "asset_ids": ["   "], "confidence": None, "evidence": []}]}, "invalid shape"),
+        ({"findings": [{"kind": "manual-note", "message": "valid", "asset_ids": ["asset","asset"], "confidence": None, "evidence": []}]}, "invalid shape"),
     ],
 )
 def test_review_render_rejects_invalid_findings_contract(
@@ -691,6 +699,129 @@ def test_review_server_rejects_untrusted_host_before_post_mutation(
     finally:
         client.close()
         handler_socket.close()
+        review_server.server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("request_kind", "expected_thumbnail_checks"),
+    [
+        ("thumbnail", 1),
+        ("source", 0),
+    ],
+)
+def test_review_asset_request_validates_only_requested_thumbnail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_kind: str,
+    expected_thumbnail_checks: int,
+) -> None:
+    capture = tmp_path / "requested-asset-validation"
+    capture.mkdir()
+    for index, value in enumerate((50, 120, 200), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session(
+        "book",
+        "requested-asset-validation",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    requested_asset = observed.imported_asset_ids[0]
+    checked_assets: list[str] = []
+    original = review_module._review_thumbnail_path
+
+    def traced_thumbnail_path(
+        scan_paths: ScanSessionPaths,
+        asset_id: str,
+        relative: str,
+        expected_sha256: str,
+    ) -> Path:
+        checked_assets.append(asset_id)
+        return original(scan_paths, asset_id, relative, expected_sha256)
+
+    monkeypatch.setattr(review_module, "_review_thumbnail_path", traced_thumbnail_path)
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                f"GET /{request_kind}/{requested_asset} HTTP/1.0\r\n"
+                f"Host: {_review_host_header(review_server)}\r\n\r\n"
+            ).encode()
+        )
+        server = review_server.server
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+
+        assert b" 200 " in response.splitlines()[0]
+        assert checked_assets == (
+            [requested_asset] if expected_thumbnail_checks else []
+        )
+    finally:
+        client.close()
+        handler_socket.close()
+        review_server.server.server_close()
+
+
+def test_review_save_does_not_hash_thumbnails_for_asset_existence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "save-requested-asset"
+    capture.mkdir()
+    for index, value in enumerate((70, 170), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session(
+        "book",
+        "save-requested-asset",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+
+    def reject_thumbnail_validation(
+        scan_paths: ScanSessionPaths,
+        requested_asset_id: str,
+        relative: str,
+        expected_sha256: str,
+    ) -> Path:
+        pytest.fail(
+            f"POST /save must not hash thumbnail for {requested_asset_id}"
+        )
+
+    monkeypatch.setattr(
+        review_module,
+        "_review_thumbnail_path",
+        reject_thumbnail_validation,
+    )
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": asset_id,
+                "included": "1",
+                "sequence": "1",
+                "original_sequence": "1",
+                "replacement_for": "",
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 303 " in response.splitlines()[0]
+    finally:
         review_server.server.server_close()
 
 

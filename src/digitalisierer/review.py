@@ -296,33 +296,62 @@ def _review_asset_paths_from_session(
     return thumbnail_by_id, source_by_id
 
 
-def _review_asset_paths(
+def _review_asset_path(
     paths: ScanSessionPaths,
-) -> tuple[dict[str, Path], dict[str, Path], dict[str, str]]:
-    session_payload, _, _, _ = load_review_state(paths)
-    thumbnail_by_id, source_by_id = _review_asset_paths_from_session(
-        paths,
-        session_payload,
-    )
+    asset_id: str,
+    *,
+    kind: str,
+) -> tuple[Path, str | None] | None:
+    session_payload, _, _, processing = load_review_state(paths)
     raw_assets = session_payload.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")
-    source_sha256_by_id: dict[str, str] = {}
-    for asset in raw_assets:
-        if not isinstance(asset, dict):
-            raise ScannerWorkflowError("scan asset record must be an object")
-        asset_id = asset.get("asset_id")
-        source_sha256 = asset.get("sha256")
-        if (
-            not isinstance(asset_id, str)
-            or not asset_id
-            or not isinstance(source_sha256, str)
-            or len(source_sha256) != 64
-            or any(char not in "0123456789abcdef" for char in source_sha256)
-        ):
-            raise ScannerWorkflowError("scan asset record has invalid source digest")
-        source_sha256_by_id[asset_id] = source_sha256
-    return thumbnail_by_id, source_by_id, source_sha256_by_id
+    asset = next(
+        (
+            item
+            for item in raw_assets
+            if isinstance(item, dict) and item.get("asset_id") == asset_id
+        ),
+        None,
+    )
+    if asset is None:
+        return None
+
+    if kind == "thumbnail":
+        thumbnail = asset.get("thumbnail_path")
+        thumbnail_sha256 = asset.get("thumbnail_sha256")
+        if not isinstance(thumbnail, str) or not isinstance(thumbnail_sha256, str):
+            raise ScannerWorkflowError("scan asset record has invalid review paths")
+        return (
+            _review_thumbnail_path(
+                paths,
+                asset_id,
+                thumbnail,
+                thumbnail_sha256,
+            ),
+            None,
+        )
+
+    if kind != "source":
+        raise ValueError(f"unsupported review asset kind: {kind}")
+    source_sha256 = asset.get("sha256")
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_sha256)
+    ):
+        raise ScannerWorkflowError("scan asset record has invalid source digest")
+    processing_item = next(
+        (
+            item
+            for item in processing.items
+            if item.asset.asset_id == asset_id
+        ),
+        None,
+    )
+    if processing_item is None:
+        raise ScannerWorkflowError(f"review state missing for {asset_id}")
+    return processing_item.asset.path, source_sha256
 
 
 def _trusted_host_header(
@@ -426,59 +455,64 @@ def build_review_server(
                 )
                 self.wfile.write(payload)
                 return
+            requested: tuple[str, str] | None = None
+            for prefix, kind in (
+                ("/thumbnail/", "thumbnail"),
+                ("/source/", "source"),
+            ):
+                if parsed.path.startswith(prefix):
+                    requested = (parsed.path[len(prefix) :], kind)
+                    break
+            if requested is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            asset_id, kind = requested
             try:
-                thumbnail_by_id, source_by_id, source_sha256_by_id = _review_asset_paths(
-                    paths
-                )
+                resolved = _review_asset_path(paths, asset_id, kind=kind)
             except ScannerWorkflowError:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
-            for prefix, assets in (
-                ("/thumbnail/", thumbnail_by_id),
-                ("/source/", source_by_id),
-            ):
-                if not parsed.path.startswith(prefix):
-                    continue
-                asset_id = parsed.path[len(prefix) :]
-                target = assets.get(asset_id)
-                if target is None or not target.is_file():
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
-                content_type = (
-                    "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
-                )
-                with target.open("rb") as source:
-                    if prefix == "/source/":
-                        expected_sha256 = source_sha256_by_id.get(asset_id)
-                        if expected_sha256 is None:
-                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                            return
-                        before = os.fstat(source.fileno())
-                        digest = hashlib.sha256()
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                        after = os.fstat(source.fileno())
-                        if (
-                            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                            or not secrets.compare_digest(
-                                digest.hexdigest(),
-                                expected_sha256,
-                            )
-                        ):
-                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                            return
-                        source.seek(0)
-                    content_length = os.fstat(source.fileno()).st_size
-                    self._headers(
-                        HTTPStatus.OK,
-                        content_type=content_type,
-                        content_length=content_length,
-                    )
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        self.wfile.write(chunk)
+            if resolved is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            self.send_error(HTTPStatus.NOT_FOUND)
+            target, expected_sha256 = resolved
+            if not target.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            content_type = (
+                "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
+            )
+            with target.open("rb") as source:
+                if kind == "source":
+                    if expected_sha256 is None:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    before = os.fstat(source.fileno())
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                    after = os.fstat(source.fileno())
+                    if (
+                        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                        or not secrets.compare_digest(
+                            digest.hexdigest(),
+                            expected_sha256,
+                        )
+                    ):
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    source.seek(0)
+                content_length = os.fstat(source.fileno()).st_size
+                self._headers(
+                    HTTPStatus.OK,
+                    content_type=content_type,
+                    content_length=content_length,
+                )
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    self.wfile.write(chunk)
+            return
 
         def do_POST(self) -> None:  # noqa: N802
             if not self._request_host_is_trusted():
@@ -504,11 +538,13 @@ def build_review_server(
                 return
             asset_id = fields.get("asset_id", [""])[0]
             try:
-                thumbnail_by_id, _, _ = _review_asset_paths(paths)
+                _, _, _, processing = load_review_state(paths)
             except ScannerWorkflowError:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
-            if asset_id not in thumbnail_by_id:
+            if not any(
+                item.asset.asset_id == asset_id for item in processing.items
+            ):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             sequence_raw = fields.get("sequence", [""])[0].strip()

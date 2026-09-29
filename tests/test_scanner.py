@@ -57,6 +57,45 @@ def test_init_claims_preexisting_empty_session_root(tmp_path: Path) -> None:
     assert paths.exports.is_dir()
 
 
+@pytest.mark.parametrize("storage_name", ["sources", "thumbnails", "exports"])
+def test_resume_rejects_symlinked_storage_directory(
+    tmp_path: Path,
+    storage_name: str,
+) -> None:
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", "symlink-storage", library)
+    storage = getattr(paths, storage_name)
+    outside = tmp_path / f"outside-{storage_name}"
+    outside.mkdir()
+    storage.rmdir()
+    storage.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match=rf"scanner {storage_name} directory must be a canonical direct child",
+    ):
+        create_or_resume_scan_session("book", "symlink-storage", library)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_init_rejects_symlinked_session_root_before_writing(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    root = library / "projects" / "book" / "sessions" / "symlink-root"
+    outside = tmp_path / "outside-session-root"
+    outside.mkdir()
+    root.parent.mkdir(parents=True)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scan session root must not be a symlink",
+    ):
+        create_or_resume_scan_session("book", "symlink-root", library)
+
+    assert list(outside.iterdir()) == []
+
+
 def test_observe_preserves_sources_and_generates_review_and_findings(
     tmp_path: Path,
 ) -> None:
@@ -192,6 +231,52 @@ class _FakePdf:
 
 
 _fake_pdf = _FakePdf()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"kind": ""},
+        {"kind": "   "},
+        {"message": ""},
+        {"message": "   "},
+        {"asset_ids": ["   "]},
+        {"asset_ids": ["duplicate", "duplicate"]},
+    ],
+)
+def test_finalize_rejects_findings_that_violate_domain_contract(
+    tmp_path: Path,
+    mutation: dict[str, object],
+) -> None:
+    capture = tmp_path / "invalid-findings"
+    capture.mkdir()
+    _image(capture / "page.jpg", 90)
+    paths = create_or_resume_scan_session(
+        "book",
+        "invalid-findings",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    finding: dict[str, object] = {
+        "kind": "manual-note",
+        "message": "valid finding",
+        "asset_ids": [asset_id],
+        "confidence": 0.5,
+        "evidence": ["manual"],
+    }
+    finding.update(mutation)
+    findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+    findings["findings"] = [finding]
+    paths.findings_file.write_text(
+        json.dumps(findings) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ScannerWorkflowError, match="invalid shape"):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
 
 
 def test_finalize_is_review_bound_hash_bound_and_no_replace(tmp_path: Path) -> None:
