@@ -683,31 +683,57 @@ def _findings_from_assets(assets: list[dict[str, Any]]) -> list[QualityFinding]:
                 )
             )
 
-    for index, first in enumerate(assets):
-        first_image = first.get("image")
-        if not isinstance(first_image, dict):
-            continue
-        first_hash = str(first_image["average_hash"])
-        for second in assets[index + 1 :]:
-            second_image = second.get("image")
-            if not isinstance(second_image, dict):
+    near_duplicate_assets = [
+        (str(asset["asset_id"]), int(str(asset["image"]["average_hash"]), 16))
+        for asset in assets
+        if isinstance(asset.get("image"), dict)
+    ]
+    parents = list(range(len(near_duplicate_assets)))
+    similar_pair_counts = [0] * len(near_duplicate_assets)
+
+    def find_root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    for first_index, (_, first_hash) in enumerate(near_duplicate_assets):
+        for second_index in range(first_index + 1, len(near_duplicate_assets)):
+            second_hash = near_duplicate_assets[second_index][1]
+            distance = (first_hash ^ second_hash).bit_count()
+            if distance > 20:
                 continue
-            second_hash = str(second_image["average_hash"])
-            distance = (
-                int(first_hash, 16) ^ int(second_hash, 16)
-            ).bit_count()
-            if distance <= 20:
-                findings.append(
-                    QualityFinding(
-                        kind="near-duplicate",
-                        message="two pages have very similar visual hashes",
-                        asset_ids=(
-                            str(first["asset_id"]),
-                            str(second["asset_id"]),
-                        ),
-                        evidence=(f"average_hash_distance={distance}",),
-                    )
-                )
+
+            first_root = find_root(first_index)
+            second_root = find_root(second_index)
+            if first_root == second_root:
+                similar_pair_counts[first_root] += 1
+                continue
+            if first_root > second_root:
+                first_root, second_root = second_root, first_root
+            parents[second_root] = first_root
+            similar_pair_counts[first_root] += similar_pair_counts[second_root] + 1
+            similar_pair_counts[second_root] = 0
+
+    near_duplicate_groups: dict[int, list[str]] = {}
+    for index, (asset_id, _) in enumerate(near_duplicate_assets):
+        root = find_root(index)
+        if similar_pair_counts[root]:
+            near_duplicate_groups.setdefault(root, []).append(asset_id)
+
+    for root, asset_ids in near_duplicate_groups.items():
+        findings.append(
+            QualityFinding(
+                kind="near-duplicate",
+                message="pages form a near-duplicate visual-hash similarity group",
+                asset_ids=tuple(asset_ids),
+                evidence=(
+                    "average_hash_distance_threshold=20",
+                    f"member_count={len(asset_ids)}",
+                    f"similar_pair_count={similar_pair_counts[root]}",
+                ),
+            )
+        )
     return findings
 
 

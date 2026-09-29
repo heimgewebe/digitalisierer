@@ -6,6 +6,7 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
+import digitalisierer.review as review_module
 import digitalisierer.scanner as scanner_module
 from digitalisierer.scanner import (
     ScannerWorkflowError,
@@ -231,6 +232,118 @@ class _FakePdf:
 
 
 _fake_pdf = _FakePdf()
+
+
+def test_near_duplicate_findings_aggregate_large_similarity_group() -> None:
+    assets = [
+        {
+            "asset_id": f"page-{index:04d}",
+            "image": {
+                "width": 120,
+                "height": 160,
+                "stddev": 50.0,
+                "dark_ratio": 0.25,
+                "average_hash": "0",
+            },
+        }
+        for index in range(1000)
+    ]
+
+    findings = scanner_module._findings_from_assets(assets)
+    near_duplicates = [
+        finding for finding in findings if finding.kind == "near-duplicate"
+    ]
+
+    assert len(findings) == 1
+    assert len(near_duplicates) == 1
+    grouped = near_duplicates[0]
+    assert grouped.asset_ids == tuple(f"page-{index:04d}" for index in range(1000))
+    assert grouped.evidence == (
+        "average_hash_distance_threshold=20",
+        "member_count=1000",
+        "similar_pair_count=499500",
+    )
+    payload = {
+        "schema_version": 1,
+        "kind": "digitalisierer.scan-findings",
+        "findings": [scanner_module._finding_payload(grouped)],
+    }
+    scanner_module._validate_findings_payload(payload)
+    assert len(grouped.asset_ids) == 1000
+
+
+def test_near_duplicate_group_supports_transitive_similarity() -> None:
+    hashes = (
+        "0",
+        f"{(1 << 20) - 1:x}",
+        f"{(1 << 40) - 1:x}",
+    )
+    assets = [
+        {
+            "asset_id": f"page-{index + 1}",
+            "image": {
+                "width": 120,
+                "height": 160,
+                "stddev": 50.0,
+                "dark_ratio": 0.25,
+                "average_hash": average_hash,
+            },
+        }
+        for index, average_hash in enumerate(hashes)
+    ]
+
+    findings = scanner_module._findings_from_assets(assets)
+    near_duplicates = [
+        finding for finding in findings if finding.kind == "near-duplicate"
+    ]
+
+    assert len(near_duplicates) == 1
+    assert near_duplicates[0].asset_ids == ("page-1", "page-2", "page-3")
+    assert near_duplicates[0].evidence == (
+        "average_hash_distance_threshold=20",
+        "member_count=3",
+        "similar_pair_count=2",
+    )
+
+
+def test_grouped_near_duplicates_render_and_finalize(tmp_path: Path) -> None:
+    capture = tmp_path / "grouped-near-duplicates"
+    capture.mkdir()
+    for index in range(3):
+        _image(capture / f"page-{index + 1}.jpg", 90)
+
+    paths = create_or_resume_scan_session(
+        "book",
+        "grouped-near-duplicates",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    near_duplicates = [
+        finding for finding in observed.findings if finding.kind == "near-duplicate"
+    ]
+
+    assert len(near_duplicates) == 1
+    assert near_duplicates[0].asset_ids == observed.imported_asset_ids
+
+    review_html = review_module.render_review_html(paths, csrf_token="test-token")
+    rendered_message = (
+        "near-duplicate: pages form a near-duplicate visual-hash similarity group"
+    )
+    assert review_html.count(rendered_message) == 3
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+    manifest = json.loads(
+        (exported.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    manifest_near_duplicates = [
+        finding
+        for finding in manifest["findings"]["findings"]
+        if finding["kind"] == "near-duplicate"
+    ]
+    assert len(manifest_near_duplicates) == 1
+    assert manifest_near_duplicates[0]["asset_ids"] == list(
+        observed.imported_asset_ids
+    )
 
 
 @pytest.mark.parametrize(
