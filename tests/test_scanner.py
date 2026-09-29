@@ -562,9 +562,16 @@ def test_finalize_initial_snapshot_serializes_observe_publication(
 
     monkeypatch.setattr(scanner_module, "_stable_json_snapshot", delayed_snapshot)
 
+    class _DelayedPdf(_FakePdf):
+        def __call__(self, images: list[Path], output: Path) -> None:
+            assert observe_done.wait(timeout=2.0)
+            super().__call__(images, output)
+
+    delayed_pdf = _DelayedPdf()
+
     def finalize() -> None:
         try:
-            finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+            finalize_scan_session(paths, _FakeOcr(), pdf_builder=delayed_pdf)
         except BaseException as exc:  # pragma: no cover - surfaced below
             finalizer_failures.append(exc)
 
@@ -1207,6 +1214,48 @@ def test_processing_rejects_preserved_source_path_escape(
     assert list(paths.exports.iterdir()) == []
 
 
+@pytest.mark.parametrize("alias_kind", ["wrong-name", "symlink-alias"])
+def test_processing_rejects_preserved_source_alias(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    capture = tmp_path / "capture-path-alias"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 70)
+    _image(capture / "image00002.jpg", 170)
+    paths = create_or_resume_scan_session(
+        "book",
+        f"path-alias-{alias_kind}",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    first, second = session["assets"]
+
+    if alias_kind == "wrong-name":
+        first["preserved_path"] = second["preserved_path"]
+    else:
+        first_path = paths.root / first["preserved_path"]
+        second_path = paths.root / second["preserved_path"]
+        first_path.unlink()
+        first_path.symlink_to(second_path.name)
+
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source path is not canonical",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source path is not canonical",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
@@ -1239,6 +1288,47 @@ def test_finalize_rejects_session_identity_or_layout_mismatch(
         ScannerWorkflowError,
         match="identity/layout does not match the session path",
     ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
+
+def test_natural_key_uses_original_filename_as_deterministic_tie_breaker() -> None:
+    assert scanner_module._natural_key(Path("Page01.JPG")) < scanner_module._natural_key(
+        Path("page1.jpg")
+    )
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [-0.1, 1.1, float("nan"), float("inf"), 10**1000],
+)
+def test_finalize_rejects_invalid_finding_confidence(
+    tmp_path: Path,
+    confidence: float | int,
+) -> None:
+    capture = tmp_path / "capture-bad-confidence"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "bad-confidence",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+    findings["findings"] = [
+        {
+            "kind": "manual",
+            "message": "invalid confidence",
+            "asset_ids": [observed.imported_asset_ids[0]],
+            "confidence": confidence,
+            "evidence": ["test"],
+        }
+    ]
+    paths.findings_file.write_text(json.dumps(findings) + "\n", encoding="utf-8")
+
+    with pytest.raises(ScannerWorkflowError, match="invalid shape"):
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert list(paths.exports.iterdir()) == []

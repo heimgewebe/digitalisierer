@@ -112,9 +112,10 @@ class CzurCaptureBackend:
             config_ready = False
         else:
             config_ready = self._config_write_ready()
-        xdotool_ready = shutil.which(self.xdotool) is not None or Path(
-            self.xdotool
-        ).is_file()
+        xdotool_path = Path(self.xdotool)
+        xdotool_ready = shutil.which(self.xdotool) is not None or (
+            xdotool_path.is_file() and os.access(xdotool_path, os.X_OK)
+        )
         windows = self._visible_windows() if xdotool_ready else []
         connected = bool(windows)
         capture_root_ready = self._capture_root_ready()

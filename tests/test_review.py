@@ -344,6 +344,74 @@ def test_review_rejects_thumbnail_symlink_to_another_asset(
         render_review_html(paths, csrf_token="token")
 
 
+@pytest.mark.parametrize("alias_kind", ["wrong-name", "symlink-alias"])
+def test_review_rejects_preserved_source_alias(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    capture = tmp_path / "source-alias"
+    capture.mkdir()
+    for index, value in enumerate((60, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session(
+        "book",
+        f"source-alias-{alias_kind}",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    first, second = session["assets"]
+
+    if alias_kind == "wrong-name":
+        first["preserved_path"] = second["preserved_path"]
+    else:
+        first_path = paths.root / first["preserved_path"]
+        second_path = paths.root / second["preserved_path"]
+        first_path.unlink()
+        first_path.symlink_to(second_path.name)
+
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source path is not canonical",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+
+def test_review_rejects_invalid_source_name_instead_of_hiding_asset(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "invalid-source-name"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "invalid-source-name",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset_id = session["assets"][0]["asset_id"]
+    session["assets"][0]["source_name"] = None
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    assert len(load_processing_session(paths).items) == 1
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="source_name is invalid for review",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+    assert asset_id
+
+
 def test_review_replacement_defaults_to_replaced_page_position(tmp_path: Path) -> None:
     capture = tmp_path / "replacement-default"
     capture.mkdir()

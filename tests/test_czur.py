@@ -360,3 +360,24 @@ def test_status_handles_config_read_failure(
     assert backend.status().ready is False
     with pytest.raises(CzurAdapterError, match="cannot be read as UTF-8"):
         backend.apply_curved_books_preset()
+
+def test_status_rejects_non_executable_xdotool_path(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o600)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+
+    status = backend.status()
+
+    assert status.ready is False
+    assert status.connected is False

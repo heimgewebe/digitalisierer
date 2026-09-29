@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -146,6 +147,8 @@ def _validate_findings_payload(findings: dict[str, Any]) -> None:
                 and (
                     isinstance(confidence, bool)
                     or not isinstance(confidence, (int, float))
+                    or not 0.0 <= confidence <= 1.0
+                    or not math.isfinite(confidence)
                 )
             )
         ):
@@ -245,12 +248,12 @@ def _stable_hash(path: Path) -> tuple[str, os.stat_result]:
     return digest, after
 
 
-def _natural_key(path: Path) -> list[int | str]:
-    return [
+def _natural_key(path: Path) -> tuple[list[int | str], str]:
+    normalized = [
         int(part) if part.isdigit() else part.lower()
         for part in re.split(r"(\d+)", path.name)
     ]
-
+    return normalized, path.name
 
 def image_files(folder: Path) -> list[Path]:
     root = folder.expanduser().resolve(strict=True)
@@ -720,16 +723,23 @@ def _stable_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def _preserved_source_path(paths: ScanSessionPaths, relative: str) -> Path:
+def _preserved_source_path(
+    paths: ScanSessionPaths,
+    asset_id: str,
+    relative: str,
+) -> Path:
     relative_path = Path(relative)
-    if relative_path.is_absolute() or not relative_path.parts:
+    if (
+        relative_path.is_absolute()
+        or len(relative_path.parts) != 2
+        or relative_path.parts[0] != "sources"
+        or ".." in relative_path.parts
+    ):
         raise ScannerWorkflowError(
             f"preserved scanner source path is outside session sources: {relative}"
         )
-    if relative_path.parts[0] != "sources" or ".." in relative_path.parts:
-        raise ScannerWorkflowError(
-            f"preserved scanner source path is outside session sources: {relative}"
-        )
+    suffix = relative_path.suffix.lower()
+    expected_relative = Path("sources") / f"{asset_id}{suffix}"
     try:
         root = paths.root.resolve(strict=True)
         sources_root = paths.sources.resolve(strict=True)
@@ -746,6 +756,14 @@ def _preserved_source_path(paths: ScanSessionPaths, relative: str) -> Path:
         raise ScannerWorkflowError(
             f"preserved scanner source path is outside session sources: {relative}"
         ) from exc
+    if (
+        suffix not in IMAGE_SUFFIXES
+        or relative_path != expected_relative
+        or candidate != sources_root / f"{asset_id}{suffix}"
+    ):
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is not canonical for {asset_id}"
+        )
     if not candidate.is_file():
         raise ScannerWorkflowError(
             f"preserved scanner source must be a regular file: {relative}"
@@ -796,7 +814,7 @@ def _processing_session_from_payload(
             SessionAsset(
                 MediaAsset(
                     asset_id=asset_id,
-                    path=_preserved_source_path(paths, preserved),
+                    path=_preserved_source_path(paths, asset_id, preserved),
                     kind=MediaKind.DOCUMENT_IMAGE,
                     sha256=sha256,
                 ),
@@ -956,7 +974,7 @@ def _verify_preserved_sources(
             or not isinstance(expected, str)
         ):
             raise ScannerWorkflowError("scan asset identity is incomplete")
-        path = _preserved_source_path(paths, relative)
+        path = _preserved_source_path(paths, asset_id, relative)
         if _sha256_file(path) != expected:
             raise ScannerWorkflowError(
                 f"preserved scanner source hash mismatch: {asset_id}"

@@ -96,13 +96,16 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
         thumbnail = asset.get("thumbnail_path")
         if (
             not isinstance(asset_id, str)
-            or not isinstance(source_name, str)
             or not isinstance(thumbnail, str)
         ):
-            continue
+            raise ScannerWorkflowError("scan asset record has invalid review metadata")
+        if not isinstance(source_name, str) or not source_name:
+            raise ScannerWorkflowError(
+                f"scan asset source_name is invalid for review: {asset_id}"
+            )
         decision = decisions.get(asset_id)
         if not isinstance(decision, dict):
-            continue
+            raise ScannerWorkflowError(f"review state missing for {asset_id}")
         included = decision.get("included") is True
         sequence = decision.get("sequence")
         replacement_for = decision.get("replacement_for")
