@@ -79,7 +79,9 @@ def test_observe_preserves_sources_and_generates_review_and_findings(
         preserved = paths.root / asset["preserved_path"]
         assert preserved.read_bytes() == original.read_bytes()
         assert hashlib.sha256(preserved.read_bytes()).hexdigest() == asset["sha256"]
-        assert (paths.root / asset["thumbnail_path"]).is_file()
+        thumbnail = paths.root / asset["thumbnail_path"]
+        assert thumbnail.is_file()
+        assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == asset["thumbnail_sha256"]
 
 
 def test_observe_resume_skips_already_preserved_assets(tmp_path: Path) -> None:

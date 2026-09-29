@@ -4,10 +4,12 @@ from dataclasses import dataclass
 import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import ipaddress
 import os
 from pathlib import Path
 import secrets
+import socket
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -20,6 +22,18 @@ from .scanner import (
 
 
 MAX_FORM_BYTES = 16 * 1024
+
+
+class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +216,7 @@ def _review_thumbnail_path(
     paths: ScanSessionPaths,
     asset_id: str,
     relative: str,
+    expected_sha256: str,
 ) -> Path:
     expected = f"thumbnails/{asset_id}.jpg"
     if relative != expected:
@@ -236,6 +251,14 @@ def _review_thumbnail_path(
         raise ScannerWorkflowError(
             f"scan thumbnail must be the canonical regular file for {asset_id}"
         )
+    if (
+        len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+        or not secrets.compare_digest(_sha256_file(candidate), expected_sha256)
+    ):
+        raise ScannerWorkflowError(
+            f"scan thumbnail hash mismatch for {asset_id}"
+        )
     return candidate
 
 
@@ -253,15 +276,21 @@ def _review_asset_paths_from_session(
             raise ScannerWorkflowError("scan asset record must be an object")
         asset_id = asset.get("asset_id")
         thumbnail = asset.get("thumbnail_path")
+        thumbnail_sha256 = asset.get("thumbnail_sha256")
         preserved = asset.get("preserved_path")
         if not isinstance(asset_id, str) or not asset_id:
             raise ScannerWorkflowError("scan asset record has an invalid asset_id")
-        if not isinstance(thumbnail, str) or not isinstance(preserved, str):
+        if (
+            not isinstance(thumbnail, str)
+            or not isinstance(thumbnail_sha256, str)
+            or not isinstance(preserved, str)
+        ):
             raise ScannerWorkflowError("scan asset record has invalid review paths")
         thumbnail_by_id[asset_id] = _review_thumbnail_path(
             paths,
             asset_id,
             thumbnail,
+            thumbnail_sha256,
         )
         source_by_id[asset_id] = paths.root / preserved
     return thumbnail_by_id, source_by_id
@@ -469,7 +498,8 @@ def build_review_server(
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server_class = _IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
+    server = server_class((host, port), Handler)
     return ReviewServer(server=server, csrf_token=csrf_token)
 
 

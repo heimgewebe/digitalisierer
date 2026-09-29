@@ -619,7 +619,9 @@ def _observe_scan_folder_unlocked(
             expected_stat=source_stat,
         )
         image = _inspect_image(target)
-        _write_thumbnail(target, paths.root / thumbnail_rel)
+        thumbnail_path = paths.root / thumbnail_rel
+        _write_thumbnail(target, thumbnail_path)
+        thumbnail_sha256 = _sha256_file(thumbnail_path)
         record: dict[str, Any] = {
             "asset_id": asset_id,
             "source_name": source.name,
@@ -628,6 +630,7 @@ def _observe_scan_folder_unlocked(
             "bytes": source_stat.st_size,
             "preserved_path": preserved_rel,
             "thumbnail_path": thumbnail_rel,
+            "thumbnail_sha256": thumbnail_sha256,
             "image": image,
         }
         assets.append(record)

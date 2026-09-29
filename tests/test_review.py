@@ -63,6 +63,20 @@ def _post_review_form(
         handler_socket.close()
 
 
+def test_review_server_supports_ipv6_loopback(tmp_path: Path) -> None:
+    paths = create_or_resume_scan_session(
+        "book",
+        "ipv6-loopback",
+        tmp_path / "library",
+    )
+    review_server = build_review_server(paths, host="::1", port=0)
+    try:
+        assert review_server.server.address_family == socket.AF_INET6
+        assert review_server.url.startswith("http://[::1]:")
+    finally:
+        review_server.server.server_close()
+
+
 def test_review_html_is_large_preview_and_escapes_source_names(tmp_path: Path) -> None:
     capture = tmp_path / "capture"
     capture.mkdir()
@@ -311,6 +325,34 @@ def test_review_rejects_thumbnail_path_escape(
     with pytest.raises(
         ScannerWorkflowError,
         match="thumbnail path|thumbnail must",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+
+def test_review_rejects_thumbnail_bytes_from_another_asset(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "thumbnail-byte-alias"
+    capture.mkdir()
+    for index, value in enumerate((60, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-byte-alias",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    first, second = observed.imported_asset_ids
+    first_thumbnail = paths.thumbnails / f"{first}.jpg"
+    second_thumbnail = paths.thumbnails / f"{second}.jpg"
+    first_thumbnail.write_bytes(second_thumbnail.read_bytes())
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="thumbnail hash mismatch",
     ):
         render_review_html(paths, csrf_token="token")
 
