@@ -101,9 +101,10 @@ class CzurCaptureBackend:
             self.xdotool
         ).is_file()
         windows = self._visible_windows() if xdotool_ready else []
+        connected = bool(windows)
         return CaptureStatus(
-            connected=bool(windows),
-            ready=executable_ready and config_ready and xdotool_ready,
+            connected=connected,
+            ready=config_ready and xdotool_ready and (connected or executable_ready),
             detail=(
                 "official CZUR app + Curved Books preset + capture-folder observation"
             ),

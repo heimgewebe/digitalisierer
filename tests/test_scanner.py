@@ -6,6 +6,7 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
+import digitalisierer.scanner as scanner_module
 from digitalisierer.scanner import (
     ScannerWorkflowError,
     create_or_resume_scan_session,
@@ -873,6 +874,121 @@ def test_finalize_rejects_incompatible_findings_metadata_contract(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert list(paths.exports.iterdir()) == []
+
+
+def test_review_paths_reject_foreign_session_identity_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-review-identity"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "review-identity",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    session["project_id"] = "foreign"
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+    before_review = paths.review_file.read_bytes()
+    writes: list[Path] = []
+    original_write = scanner_module._atomic_write_text
+
+    def record_write(path: Path, content: str) -> None:
+        writes.append(path)
+        original_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", record_write)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="identity/layout does not match the session path",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="identity/layout does not match the session path",
+    ):
+        update_review_item(paths, asset_id, included=False)
+
+    assert writes == []
+    assert paths.review_file.read_bytes() == before_review
+
+
+def test_observe_rejects_foreign_session_identity_before_publication(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "capture-first-identity"
+    second = tmp_path / "capture-second-identity"
+    first.mkdir()
+    second.mkdir()
+    _image(first / "image00001.jpg", 100)
+    _image(second / "image00002.jpg", 140)
+    paths = create_or_resume_scan_session(
+        "book",
+        "observe-identity",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, first)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    session["session_id"] = "foreign"
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="identity/layout does not match the session path",
+    ):
+        observe_scan_folder(paths, second)
+
+    for path, expected in before.items():
+        assert path.read_bytes() == expected
+
+
+def test_finalize_export_identity_includes_findings_snapshot(tmp_path: Path) -> None:
+    capture = tmp_path / "capture-findings-identity"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "findings-identity",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+
+    first = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+    first_manifest = json.loads(
+        (first.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+    findings["findings"].append(
+        {
+            "kind": "manual-note",
+            "message": "reviewed finding",
+            "asset_ids": [asset_id],
+            "confidence": None,
+            "evidence": ["manual"],
+        }
+    )
+    paths.findings_file.write_text(json.dumps(findings) + "\n", encoding="utf-8")
+
+    second = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+    second_manifest = json.loads(
+        (second.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert first.export_dir != second.export_dir
+    assert first_manifest["findings_sha256"] != second_manifest["findings_sha256"]
+    assert second_manifest["findings"] == findings
 
 
 @pytest.mark.parametrize(

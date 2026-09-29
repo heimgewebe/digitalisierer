@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import socket
 from urllib.parse import urlencode
@@ -7,6 +8,7 @@ import pytest
 
 from digitalisierer.review import build_review_server, render_review_html
 from digitalisierer.scanner import (
+    ScannerWorkflowError,
     create_or_resume_scan_session,
     load_processing_session,
     observe_scan_folder,
@@ -75,8 +77,135 @@ def test_review_html_is_large_preview_and_escapes_source_names(tmp_path: Path) -
     assert "page&amp;one.jpg" in rendered
     assert 'name="csrf" value="token"' in rendered
     assert "max-height: 72vh" in rendered
-    assert 'srcset="/source/' in rendered
+    assert 'srcset="/source/' not in rendered
+    assert 'href="/source/' in rendered
     assert "Original in voller Auflösung öffnen" in rendered
+
+
+def test_review_render_rejects_foreign_session_identity(tmp_path: Path) -> None:
+    capture = tmp_path / "foreign-session"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "foreign-session",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(
+        paths.session_file.read_text(encoding="utf-8")
+    )
+    session["project_id"] = "foreign"
+    paths.session_file.write_text(
+        json.dumps(session) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="identity/layout does not match the session path",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"schema_version": 999}, "metadata contract is incompatible"),
+        ({"kind": "foreign.scan-findings"}, "metadata contract is incompatible"),
+        ({"findings": "not-a-list"}, "findings must be a list"),
+    ],
+)
+def test_review_render_rejects_invalid_findings_contract(
+    tmp_path: Path,
+    mutation: dict[str, object],
+    message: str,
+) -> None:
+    capture = tmp_path / "bad-findings"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "bad-findings",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    findings = json.loads(
+        paths.findings_file.read_text(encoding="utf-8")
+    )
+    findings.update(mutation)
+    paths.findings_file.write_text(
+        json.dumps(findings) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ScannerWorkflowError, match=message):
+        render_review_html(paths, csrf_token="token")
+
+
+def test_review_rejects_findings_for_unknown_asset_before_post_mutation(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "unknown-finding"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "unknown-finding",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    findings = json.loads(
+        paths.findings_file.read_text(encoding="utf-8")
+    )
+    findings["findings"] = [
+        {
+            "kind": "manual-note",
+            "message": "foreign asset",
+            "asset_ids": ["missing-asset"],
+            "confidence": None,
+            "evidence": ["manual"],
+        }
+    ]
+    paths.findings_file.write_text(
+        json.dumps(findings) + "\n",
+        encoding="utf-8",
+    )
+    before = paths.review_file.read_bytes()
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        with pytest.raises(
+            ScannerWorkflowError,
+            match="references unknown asset",
+        ):
+            render_review_html(paths, csrf_token=review_server.csrf_token)
+
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": asset_id,
+                "included": "1",
+                "sequence": "1",
+                "original_sequence": "1",
+                "replacement_for": "",
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 500 " in response.splitlines()[0]
+        assert paths.review_file.read_bytes() == before
+    finally:
+        review_server.server.server_close()
 
 
 def test_review_server_is_loopback_only(tmp_path: Path) -> None:
@@ -104,13 +233,17 @@ def test_review_server_serves_preserved_source_for_hidpi(
     observed = observe_scan_folder(paths, capture)
     asset_id = observed.imported_asset_ids[0]
     expected = image_path.read_bytes()
+    preserved_source = next(paths.sources.glob(f"{asset_id}.*"))
+    original_read_bytes = Path.read_bytes
 
     review_server = build_review_server(paths, host="127.0.0.1", port=0)
-    monkeypatch.setattr(
-        Path,
-        "read_bytes",
-        lambda _self: pytest.fail("review image responses must stream from file handles"),
-    )
+
+    def reject_source_read_bytes(self: Path) -> bytes:
+        if self == preserved_source:
+            pytest.fail("review image responses must stream from file handles")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_source_read_bytes)
     client, handler_socket = socket.socketpair()
     try:
         client.sendall(

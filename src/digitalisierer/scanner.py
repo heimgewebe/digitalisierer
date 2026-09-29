@@ -7,14 +7,13 @@ import fcntl
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 from pathlib import Path
 import re
 import secrets
 import shutil
 import statistics
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Iterator, Protocol
 
 from .domain import MediaAsset, MediaKind, ProcessingSession, QualityFinding, SessionAsset
 from .library import session_root
@@ -549,6 +548,7 @@ def _observe_scan_folder_unlocked(
         for path in selected
     ]
     session = _load_json(paths.session_file)
+    _validate_session_identity(paths, session)
     raw_assets = session.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")
@@ -722,6 +722,7 @@ def _processing_session_from_payload(
     session: dict[str, Any],
     review: dict[str, Any],
 ) -> ProcessingSession:
+    _validate_session_identity(paths, session)
     _validate_review_payload(review)
     raw_assets = session.get("assets")
     raw_review = review.get("items")
@@ -786,10 +787,46 @@ def _processing_session_from_payload(
         raise ScannerWorkflowError(f"invalid scanner review state: {exc}") from exc
 
 
-def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
+def _validate_findings_asset_ids(
+    processing: ProcessingSession,
+    findings: dict[str, Any],
+) -> None:
+    known_asset_ids = {item.asset.asset_id for item in processing.items}
+    raw_findings = findings.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ScannerWorkflowError("scan findings must be a list")
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            raise ScannerWorkflowError("scan finding entry must be an object")
+        asset_ids = finding.get("asset_ids")
+        if not isinstance(asset_ids, list):
+            raise ScannerWorkflowError("scan finding entry has invalid shape")
+        for asset_id in asset_ids:
+            if asset_id not in known_asset_ids:
+                raise ScannerWorkflowError(
+                    f"scan finding references unknown asset: {asset_id}"
+                )
+
+
+def load_review_state(
+    paths: ScanSessionPaths,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    ProcessingSession,
+]:
     session, _ = _stable_json_snapshot(paths.session_file)
     review, _ = _stable_json_snapshot(paths.review_file)
-    return _processing_session_from_payload(paths, session, review)
+    findings, _ = _stable_json_snapshot(paths.findings_file)
+    _validate_findings_payload(findings)
+    processing = _processing_session_from_payload(paths, session, review)
+    _validate_findings_asset_ids(processing, findings)
+    return session, review, findings, processing
+
+
+def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
+    return load_review_state(paths)[3]
 
 
 _UNSET = object()
@@ -803,8 +840,7 @@ def _update_review_item_unlocked(
     sequence: int | None | object = _UNSET,
     replacement_for: str | None | object = _UNSET,
 ) -> ProcessingSession:
-    review = _load_json(paths.review_file)
-    _validate_review_payload(review)
+    _, review, _, _ = load_review_state(paths)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
@@ -945,10 +981,10 @@ def _ocr_provenance(ocr_backend: OCRBackend, language: str) -> dict[str, str]:
     return {"adapter": name, "language": language, "version": version}
 
 
-def _review_digest(review: dict[str, Any]) -> str:
+def _canonical_json_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
-            review,
+            payload,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -1004,12 +1040,14 @@ def finalize_scan_session(
     findings_payload, findings_file_sha = _stable_json_snapshot(paths.findings_file)
     _validate_findings_payload(findings_payload)
     processing = _processing_session_from_payload(paths, session, review)
+    _validate_findings_asset_ids(processing, findings_payload)
     active = processing.ordered_assets()
     if not active:
         raise ScannerWorkflowError("scanner session has no included pages")
 
     verified_sources = _verify_preserved_sources(paths, session)
-    review_sha = _review_digest(review)
+    review_sha = _canonical_json_digest(review)
+    findings_sha = _canonical_json_digest(findings_payload)
     pdf_builder_provenance = _pdf_builder_provenance(pdf_builder)
     ocr_provenance = _ocr_provenance(ocr_backend, language)
     export_identity = hashlib.sha256(
@@ -1017,6 +1055,7 @@ def finalize_scan_session(
             {
                 "layout": SCAN_EXPORT_LAYOUT,
                 "review_sha256": review_sha,
+                "findings_sha256": findings_sha,
                 "pdf_builder": pdf_builder_provenance,
                 "ocr": ocr_provenance,
                 "active": [
@@ -1087,6 +1126,7 @@ def finalize_scan_session(
             "export_id": export_id,
             "review_sha256": review_sha,
             "review": review,
+            "findings_sha256": findings_sha,
             "pdf_builder": pdf_builder_provenance,
             "ocr": ocr_provenance,
             "sources": verified_sources,

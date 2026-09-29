@@ -5,14 +5,18 @@ import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
-import json
 import os
 from pathlib import Path
 import secrets
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
-from .scanner import ScanSessionPaths, ScannerWorkflowError, update_review_item
+from .scanner import (
+    ScanSessionPaths,
+    ScannerWorkflowError,
+    load_review_state,
+    update_review_item,
+)
 
 
 MAX_FORM_BYTES = 16 * 1024
@@ -36,16 +40,6 @@ class ReviewServer:
         return f"http://{rendered_host}:{port}/"
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ScannerWorkflowError(f"cannot read review data: {path}") from exc
-    if not isinstance(value, dict):
-        raise ScannerWorkflowError(f"review data must be an object: {path}")
-    return value
-
-
 def _loopback_host(host: str) -> bool:
     if host.lower() == "localhost":
         return True
@@ -55,12 +49,11 @@ def _loopback_host(host: str) -> bool:
         return False
 
 
-def _finding_index(paths: ScanSessionPaths) -> dict[str, list[str]]:
-    payload = _read_json(paths.findings_file)
+def _finding_index(payload: dict[str, Any]) -> dict[str, list[str]]:
     raw = payload.get("findings")
     index: dict[str, list[str]] = {}
     if not isinstance(raw, list):
-        return index
+        raise ScannerWorkflowError("scan findings must be a list")
     for finding in raw:
         if not isinstance(finding, dict):
             continue
@@ -81,14 +74,13 @@ def _finding_index(paths: ScanSessionPaths) -> dict[str, list[str]]:
 
 
 def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
-    session = _read_json(paths.session_file)
-    review = _read_json(paths.review_file)
+    session, review, findings_payload, _ = load_review_state(paths)
     assets = session.get("assets")
     decisions = review.get("items")
     if not isinstance(assets, list) or not isinstance(decisions, dict):
         raise ScannerWorkflowError("scan session/review state has invalid shape")
 
-    findings = _finding_index(paths)
+    findings = _finding_index(findings_payload)
     known_ids = [
         str(asset["asset_id"])
         for asset in assets
@@ -144,7 +136,7 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
             f"""
 <article class="page-card">
   <a class="page-image-link" href="/source/{quote(asset_id, safe='')}" title="Original in voller Auflösung öffnen">
-    <img loading="lazy" src="/thumbnail/{quote(asset_id, safe='')}" srcset="/source/{quote(asset_id, safe='')} 2x" alt="{html.escape(source_name, quote=True)}">
+    <img loading="lazy" src="/thumbnail/{quote(asset_id, safe='')}" alt="{html.escape(source_name, quote=True)}">
   </a>
   <div class="page-meta">
     <h2>{html.escape(source_name)}</h2>
@@ -205,7 +197,7 @@ code {{ word-break: break-all; }}
 def _review_asset_paths(
     paths: ScanSessionPaths,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
-    session_payload = _read_json(paths.session_file)
+    session_payload, _, _, _ = load_review_state(paths)
     raw_assets = session_payload.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")

@@ -85,6 +85,38 @@ def test_newest_scan_folder_can_select_capture_root(tmp_path: Path) -> None:
 
     assert backend.newest_scan_folder() == tmp_path.resolve()
 
+def test_status_accepts_existing_window_without_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"setting": {}}), encoding="utf-8")
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=tmp_path / "missing-launcher",
+        xdotool=str(xdotool),
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(backend, "_visible_windows", lambda: ["123"])
+    monkeypatch.setattr(backend, "_focus", lambda window_id: calls.append(("focus", window_id)))
+    monkeypatch.setattr(
+        backend,
+        "_activate_curved_books_mode",
+        lambda window_id: calls.append((CURVED_BOOKS_HOTKEY, window_id)),
+    )
+
+    status = backend.status()
+    assert status.connected is True
+    assert status.ready is True
+
+    backend.start(tmp_path / "session")
+    assert calls == [("focus", "123"), (CURVED_BOOKS_HOTKEY, "123")]
+
+
 def test_start_activates_curved_books_in_existing_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
