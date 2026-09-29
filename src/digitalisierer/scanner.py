@@ -185,8 +185,11 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 @contextmanager
 def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
+    if not paths.root.is_dir() or not paths.session_file.is_file():
+        raise ScannerWorkflowError(
+            f"scanner session is not initialized: {paths.root}"
+        )
     lock_path = paths.root / REVIEW_LOCK_FILE
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(
         lock_path,
         os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,

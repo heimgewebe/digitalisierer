@@ -205,14 +205,20 @@ def _review_thumbnail_path(
         raise ScannerWorkflowError(
             f"scan thumbnail path is not canonical for {asset_id}"
         )
+    expected_path = paths.thumbnails / f"{asset_id}.jpg"
+    if paths.thumbnails.is_symlink() or expected_path.is_symlink():
+        raise ScannerWorkflowError(
+            f"scan thumbnail path must not be a symlink for {asset_id}"
+        )
     try:
+        root = paths.root.resolve(strict=True)
         thumbnails_root = paths.thumbnails.resolve(strict=True)
-        candidate = (paths.root / relative).resolve(strict=True)
+        candidate = expected_path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ScannerWorkflowError(
             f"scan thumbnail path is invalid for {asset_id}"
         ) from exc
-    if not thumbnails_root.is_dir():
+    if not thumbnails_root.is_dir() or thumbnails_root.parent != root:
         raise ScannerWorkflowError("scan thumbnails directory is invalid")
     try:
         candidate.relative_to(thumbnails_root)
@@ -220,9 +226,12 @@ def _review_thumbnail_path(
         raise ScannerWorkflowError(
             f"scan thumbnail path escapes thumbnails for {asset_id}"
         ) from exc
-    if not candidate.is_file():
+    if (
+        candidate != thumbnails_root / f"{asset_id}.jpg"
+        or not candidate.is_file()
+    ):
         raise ScannerWorkflowError(
-            f"scan thumbnail must be a regular file for {asset_id}"
+            f"scan thumbnail must be the canonical regular file for {asset_id}"
         )
     return candidate
 

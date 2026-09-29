@@ -13,6 +13,7 @@ from digitalisierer.scanner import (
     finalize_scan_session,
     load_processing_session,
     observe_scan_folder,
+    scan_session_paths,
     update_review_item,
 )
 
@@ -340,6 +341,36 @@ def test_observe_is_recoverable_if_session_write_fails_after_review(
 
     assert len(resumed.imported_asset_ids) == 1
     assert len(processing.ordered_assets()) == 1
+
+
+def test_review_on_uninitialized_session_has_no_filesystem_side_effect(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    paths = scan_session_paths("book", "not-yet-initialized", library)
+
+    assert not paths.root.exists()
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner session is not initialized",
+    ):
+        load_processing_session(paths)
+    assert not paths.root.exists()
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner session is not initialized",
+    ):
+        update_review_item(paths, "missing", included=False)
+    assert not paths.root.exists()
+
+    created = create_or_resume_scan_session(
+        "book",
+        "not-yet-initialized",
+        library,
+    )
+    assert created.session_file.is_file()
 
 
 def test_review_state_snapshot_serializes_observe_publication(
