@@ -342,6 +342,78 @@ def test_observe_is_recoverable_if_session_write_fails_after_review(
     assert len(processing.ordered_assets()) == 1
 
 
+def test_review_state_snapshot_serializes_observe_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_capture = tmp_path / "snapshot-first"
+    second_capture = tmp_path / "snapshot-second"
+    first_capture.mkdir()
+    second_capture.mkdir()
+    _image(first_capture / "image00001.jpg", 80)
+    _image(second_capture / "image00002.jpg", 160)
+    paths = create_or_resume_scan_session(
+        "book",
+        "snapshot-race",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, first_capture)
+
+    original_snapshot = scanner_module._stable_json_snapshot
+    session_snapshot_reached = threading.Event()
+    release_snapshot = threading.Event()
+    observe_done = threading.Event()
+    failures: list[BaseException] = []
+    loaded_asset_counts: list[int] = []
+
+    def delayed_snapshot(path: Path) -> tuple[dict[str, object], str]:
+        result = original_snapshot(path)
+        if path == paths.session_file and not session_snapshot_reached.is_set():
+            session_snapshot_reached.set()
+            assert release_snapshot.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(scanner_module, "_stable_json_snapshot", delayed_snapshot)
+
+    def load_state() -> None:
+        try:
+            session, _review, _findings, _processing = scanner_module.load_review_state(
+                paths
+            )
+            assets = session.get("assets")
+            assert isinstance(assets, list)
+            loaded_asset_counts.append(len(assets))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    def observe_second() -> None:
+        try:
+            observe_scan_folder(paths, second_capture)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            observe_done.set()
+
+    reader = threading.Thread(target=load_state)
+    writer = threading.Thread(target=observe_second)
+    reader.start()
+    assert session_snapshot_reached.wait(timeout=2.0)
+    writer.start()
+
+    # The observer needs the same lock, so it cannot publish review/findings/session
+    # between the three snapshot reads.
+    assert observe_done.wait(timeout=0.1) is False
+    release_snapshot.set()
+    reader.join(timeout=2.0)
+    writer.join(timeout=2.0)
+
+    assert not reader.is_alive()
+    assert not writer.is_alive()
+    assert failures == []
+    assert loaded_asset_counts == [1]
+    assert len(load_processing_session(paths).items) == 2
+
+
 def test_review_updates_are_serialized_without_lost_decisions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -989,6 +1061,51 @@ def test_finalize_export_identity_includes_findings_snapshot(tmp_path: Path) -> 
     assert first.export_dir != second.export_dir
     assert first_manifest["findings_sha256"] != second_manifest["findings_sha256"]
     assert second_manifest["findings"] == findings
+
+
+@pytest.mark.parametrize("escape_kind", ["parent", "absolute", "symlink"])
+def test_processing_rejects_preserved_source_path_escape(
+    tmp_path: Path,
+    escape_kind: str,
+) -> None:
+    capture = tmp_path / "capture-path-escape"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        f"path-escape-{escape_kind}",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    outside = paths.root.parent / f"outside-{escape_kind}.jpg"
+    outside.write_bytes((paths.root / asset["preserved_path"]).read_bytes())
+
+    if escape_kind == "parent":
+        asset["preserved_path"] = f"../{outside.name}"
+    elif escape_kind == "absolute":
+        asset["preserved_path"] = str(outside.resolve())
+    else:
+        link = paths.sources / "escape.jpg"
+        link.symlink_to(outside)
+        asset["preserved_path"] = "sources/escape.jpg"
+
+    asset["sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source path is outside session sources",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source path is outside session sources",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
 
 
 @pytest.mark.parametrize(

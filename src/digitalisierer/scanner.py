@@ -717,6 +717,39 @@ def _stable_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     return value, hashlib.sha256(raw).hexdigest()
 
 
+def _preserved_source_path(paths: ScanSessionPaths, relative: str) -> Path:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or not relative_path.parts:
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is outside session sources: {relative}"
+        )
+    if relative_path.parts[0] != "sources" or ".." in relative_path.parts:
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is outside session sources: {relative}"
+        )
+    try:
+        root = paths.root.resolve(strict=True)
+        sources_root = paths.sources.resolve(strict=True)
+        candidate = (paths.root / relative_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is invalid: {relative}"
+        ) from exc
+    if not sources_root.is_dir() or sources_root.parent != root:
+        raise ScannerWorkflowError("scanner sources directory escaped session root")
+    try:
+        candidate.relative_to(sources_root)
+    except ValueError as exc:
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is outside session sources: {relative}"
+        ) from exc
+    if not candidate.is_file():
+        raise ScannerWorkflowError(
+            f"preserved scanner source must be a regular file: {relative}"
+        )
+    return candidate
+
+
 def _processing_session_from_payload(
     paths: ScanSessionPaths,
     session: dict[str, Any],
@@ -760,7 +793,7 @@ def _processing_session_from_payload(
             SessionAsset(
                 MediaAsset(
                     asset_id=asset_id,
-                    path=paths.root / preserved,
+                    path=_preserved_source_path(paths, preserved),
                     kind=MediaKind.DOCUMENT_IMAGE,
                     sha256=sha256,
                 ),
@@ -808,7 +841,7 @@ def _validate_findings_asset_ids(
                 )
 
 
-def load_review_state(
+def _load_review_state_unlocked(
     paths: ScanSessionPaths,
 ) -> tuple[
     dict[str, Any],
@@ -823,6 +856,18 @@ def load_review_state(
     processing = _processing_session_from_payload(paths, session, review)
     _validate_findings_asset_ids(processing, findings)
     return session, review, findings, processing
+
+
+def load_review_state(
+    paths: ScanSessionPaths,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    ProcessingSession,
+]:
+    with _review_update_lock(paths):
+        return _load_review_state_unlocked(paths)
 
 
 def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
@@ -840,7 +885,7 @@ def _update_review_item_unlocked(
     sequence: int | None | object = _UNSET,
     replacement_for: str | None | object = _UNSET,
 ) -> ProcessingSession:
-    _, review, _, _ = load_review_state(paths)
+    _, review, _, _ = _load_review_state_unlocked(paths)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
@@ -863,7 +908,7 @@ def _update_review_item_unlocked(
     old_text = paths.review_file.read_text(encoding="utf-8")
     _atomic_write_text(paths.review_file, _json_text(updated))
     try:
-        processing = load_processing_session(paths)
+        processing = _load_review_state_unlocked(paths)[3]
     except Exception:
         _atomic_write_text(paths.review_file, old_text)
         raise
@@ -908,8 +953,8 @@ def _verify_preserved_sources(
             or not isinstance(expected, str)
         ):
             raise ScannerWorkflowError("scan asset identity is incomplete")
-        path = paths.root / relative
-        if not path.is_file() or _sha256_file(path) != expected:
+        path = _preserved_source_path(paths, relative)
+        if _sha256_file(path) != expected:
             raise ScannerWorkflowError(
                 f"preserved scanner source hash mismatch: {asset_id}"
             )
