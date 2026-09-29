@@ -786,6 +786,36 @@ def _observe_scan_folder_unlocked(
                 f"scan session records capture source more than once: {capture_source}"
             )
         known_by_capture_source[capture_source] = item
+
+    known_capture_paths = [
+        Path(capture_source)
+        for capture_source in known_by_capture_source
+        if Path(capture_source).parent == source_root
+    ]
+    unseen_selected = [
+        source for source in selected if str(source) not in known_by_capture_source
+    ]
+    if known_capture_paths and unseen_selected:
+        ordered_capture_sources = sorted(
+            set(sources).union(known_capture_paths),
+            key=_natural_key,
+        )
+        positions = {
+            str(source): index
+            for index, source in enumerate(ordered_capture_sources, start=1)
+        }
+        latest_known_position = max(
+            positions[str(source)] for source in known_capture_paths
+        )
+        if any(
+            positions[str(source)] < latest_known_position
+            for source in unseen_selected
+        ):
+            raise ScannerWorkflowError(
+                "out-of-order capture backfill is not supported; "
+                "observe ranges from this capture folder in natural source order"
+            )
+
     imported: list[str] = []
     skipped: list[str] = []
 

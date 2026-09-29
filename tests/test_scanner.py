@@ -138,6 +138,81 @@ def test_observe_resume_skips_already_preserved_assets(tmp_path: Path) -> None:
     assert second.skipped_asset_ids == first.imported_asset_ids
 
 
+def test_observe_rejects_out_of_order_backfill_from_same_capture_folder(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-backfill"
+    capture.mkdir()
+    for index in range(1, 13):
+        _image(capture / f"image{index:05d}.jpg", 20 + index * 10)
+    paths = create_or_resume_scan_session(
+        "book",
+        "out-of-order-backfill",
+        tmp_path / "library",
+    )
+
+    first = observe_scan_folder(paths, capture, start=11, limit=2)
+    assert len(first.imported_asset_ids) == 2
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert [
+        review["items"][asset_id]["sequence"]
+        for asset_id in first.imported_asset_ids
+    ] == [11, 12]
+
+    metadata_before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    sources_before = {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    }
+    thumbnails_before = {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    }
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="out-of-order capture backfill is not supported",
+    ):
+        observe_scan_folder(paths, capture, start=1, limit=10)
+
+    assert {
+        path: path.read_bytes() for path in metadata_before
+    } == metadata_before
+    assert {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    } == sources_before
+    assert {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    } == thumbnails_before
+
+
+def test_observe_allows_forward_overlapping_range_from_same_capture_folder(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-forward-overlap"
+    capture.mkdir()
+    for index in range(1, 13):
+        _image(capture / f"image{index:05d}.jpg", 20 + index * 10)
+    paths = create_or_resume_scan_session(
+        "book",
+        "forward-overlap",
+        tmp_path / "library",
+    )
+
+    first = observe_scan_folder(paths, capture, start=1, limit=10)
+    second = observe_scan_folder(paths, capture, start=5, limit=8)
+    processing = load_processing_session(paths)
+
+    assert len(first.imported_asset_ids) == 10
+    assert len(second.imported_asset_ids) == 2
+    assert second.skipped_asset_ids == first.imported_asset_ids[4:10]
+    assert [item.sequence for item in processing.ordered_items()] == list(
+        range(1, 13)
+    )
+
+
 def test_observe_appends_sequences_for_a_second_capture_folder(
     tmp_path: Path,
 ) -> None:
