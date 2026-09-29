@@ -1334,3 +1334,70 @@ def test_finalize_rejects_invalid_finding_confidence(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert list(paths.exports.iterdir()) == []
+
+
+def test_observe_preserves_distinct_sources_when_generated_asset_ids_collide(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "asset-id-collision"
+    capture.mkdir()
+    first_source = capture / "page one.jpg"
+    second_source = capture / "page-one.jpg"
+    _image(first_source, 90)
+    second_source.write_bytes(first_source.read_bytes())
+    paths = create_or_resume_scan_session(
+        "book",
+        "asset-id-collision",
+        tmp_path / "library",
+    )
+
+    first = observe_scan_folder(paths, capture)
+    second = observe_scan_folder(paths, capture)
+
+    assert len(first.imported_asset_ids) == 2
+    assert len(set(first.imported_asset_ids)) == 2
+    assert second.imported_asset_ids == ()
+    assert second.skipped_asset_ids == first.imported_asset_ids
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert {asset["source_name"] for asset in session["assets"]} == {
+        "page one.jpg",
+        "page-one.jpg",
+    }
+    assert len(session["assets"]) == 2
+    assert any(
+        finding.kind == "near-duplicate"
+        and set(finding.asset_ids) == set(first.imported_asset_ids)
+        for finding in second.findings
+    )
+
+
+def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "resume-repair"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    thumbnail = paths.root / asset["thumbnail_path"]
+    preserved.write_bytes(b"corrupted-preserved-copy")
+    thumbnail.unlink()
+
+    resumed = observe_scan_folder(paths, capture)
+
+    assert resumed.imported_asset_ids == ()
+    assert resumed.skipped_asset_ids == (asset_id,)
+    repaired = json.loads(paths.session_file.read_text(encoding="utf-8"))["assets"][0]
+    assert preserved.read_bytes() == source.read_bytes()
+    assert hashlib.sha256(preserved.read_bytes()).hexdigest() == repaired["sha256"]
+    assert thumbnail.is_file()
+    assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]

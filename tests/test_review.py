@@ -692,3 +692,44 @@ def test_review_server_rejects_untrusted_host_before_post_mutation(
         client.close()
         handler_socket.close()
         review_server.server.server_close()
+
+
+def test_review_server_rejects_corrupted_preserved_source_bytes(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "source-byte-corruption"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "source-byte-corruption",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    preserved.write_bytes(b"wrong-full-resolution-page")
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            f"GET /source/{asset_id} HTTP/1.0\r\nHost: {_review_host_header(review_server)}\r\n\r\n".encode()
+        )
+        server = review_server.server
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        assert b" 500 " in response.splitlines()[0]
+        assert b"wrong-full-resolution-page" not in response
+    finally:
+        client.close()
+        handler_socket.close()
+        review_server.server.server_close()

@@ -452,6 +452,127 @@ def _asset_id(source_name: str, sha256: str) -> str:
     return f"{stem[:40]}--{sha256[:12]}"
 
 
+def _next_collision_asset_id(base_asset_id: str, known_by_id: dict[str, dict[str, Any]]) -> str:
+    collision_index = 2
+    while True:
+        candidate = f"{base_asset_id}--{collision_index}"
+        if candidate not in known_by_id:
+            return candidate
+        collision_index += 1
+
+
+def _replace_preserved(
+    source: Path,
+    target: Path,
+    *,
+    expected_sha256: str,
+    expected_stat: os.stat_result,
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        copied_sha = _sha256_file(temporary)
+        after = source.stat()
+        if (
+            copied_sha != expected_sha256
+            or _stat_identity(after) != _stat_identity(expected_stat)
+        ):
+            raise ScannerWorkflowError(
+                f"scan source changed while repairing preserved copy: {source}"
+            )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _repair_recorded_asset(
+    paths: ScanSessionPaths,
+    source: Path,
+    record: dict[str, Any],
+    *,
+    expected_sha256: str,
+    expected_stat: os.stat_result,
+) -> None:
+    asset_id = record.get("asset_id")
+    if not isinstance(asset_id, str) or not asset_id:
+        raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+    if record.get("source_name") != source.name or record.get("capture_source") != str(source):
+        raise ScannerWorkflowError(f"recorded scan source identity is invalid for {asset_id}")
+
+    suffix = source.suffix.lower()
+    expected_preserved_rel = f"sources/{asset_id}{suffix}"
+    expected_thumbnail_rel = f"thumbnails/{asset_id}.jpg"
+    if record.get("preserved_path") != expected_preserved_rel:
+        raise ScannerWorkflowError(
+            f"preserved scanner source path is not canonical for {asset_id}"
+        )
+    if record.get("thumbnail_path") != expected_thumbnail_rel:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is not canonical for {asset_id}"
+        )
+
+    try:
+        root = paths.root.resolve(strict=True)
+        sources_root = paths.sources.resolve(strict=True)
+        thumbnails_root = paths.thumbnails.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError("scanner storage directories are invalid") from exc
+    if (
+        paths.sources.is_symlink()
+        or paths.thumbnails.is_symlink()
+        or not sources_root.is_dir()
+        or not thumbnails_root.is_dir()
+        or sources_root.parent != root
+        or thumbnails_root.parent != root
+    ):
+        raise ScannerWorkflowError("scanner storage directories escaped session root")
+
+    preserved = sources_root / f"{asset_id}{suffix}"
+    if preserved.is_symlink() or (preserved.exists() and not preserved.is_file()):
+        raise ScannerWorkflowError(
+            f"preserved scanner source must be a regular file: {expected_preserved_rel}"
+        )
+    if not preserved.exists() or _sha256_file(preserved) != expected_sha256:
+        _replace_preserved(
+            source,
+            preserved,
+            expected_sha256=expected_sha256,
+            expected_stat=expected_stat,
+        )
+    if _sha256_file(preserved) != expected_sha256:
+        raise ScannerWorkflowError(f"preserved source hash mismatch for {asset_id}")
+
+    thumbnail = thumbnails_root / f"{asset_id}.jpg"
+    if thumbnail.is_symlink() or (thumbnail.exists() and not thumbnail.is_file()):
+        raise ScannerWorkflowError(
+            f"scan thumbnail must be the canonical regular file for {asset_id}"
+        )
+    thumbnail_sha256 = record.get("thumbnail_sha256")
+    thumbnail_valid = (
+        isinstance(thumbnail_sha256, str)
+        and len(thumbnail_sha256) == 64
+        and all(char in "0123456789abcdef" for char in thumbnail_sha256)
+        and thumbnail.exists()
+        and secrets.compare_digest(_sha256_file(thumbnail), thumbnail_sha256)
+    )
+    if not thumbnail_valid:
+        _write_thumbnail(preserved, thumbnail)
+        record["thumbnail_sha256"] = _sha256_file(thumbnail)
+
+
 def _finding_payload(finding: QualityFinding) -> dict[str, object]:
     return {
         "kind": finding.kind,
@@ -568,6 +689,16 @@ def _observe_scan_folder_unlocked(
         for item in assets
         if isinstance(item.get("asset_id"), str)
     }
+    known_by_capture_source: dict[str, dict[str, Any]] = {}
+    for item in assets:
+        capture_source = item.get("capture_source")
+        if not isinstance(capture_source, str):
+            continue
+        if capture_source in known_by_capture_source:
+            raise ScannerWorkflowError(
+                f"scan session records capture source more than once: {capture_source}"
+            )
+        known_by_capture_source[capture_source] = item
     imported: list[str] = []
     skipped: list[str] = []
 
@@ -591,16 +722,23 @@ def _observe_scan_folder_unlocked(
 
     for source in selected:
         sha256, source_stat = _stable_hash(source)
-        asset_id = _asset_id(source.name, sha256)
-        suffix = source.suffix.lower()
-        preserved_rel = f"sources/{asset_id}{suffix}"
-        thumbnail_rel = f"thumbnails/{asset_id}.jpg"
-        existing = known_by_id.get(asset_id)
-        if existing is not None:
-            if existing.get("sha256") != sha256:
+        source_reference = str(source)
+        existing_occurrence = known_by_capture_source.get(source_reference)
+        if existing_occurrence is not None:
+            asset_id = existing_occurrence.get("asset_id")
+            if not isinstance(asset_id, str) or not asset_id:
+                raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+            if existing_occurrence.get("sha256") != sha256:
                 raise ScannerWorkflowError(
-                    f"asset identity collision for {asset_id}"
+                    f"capture source changed since observation for {asset_id}"
                 )
+            _repair_recorded_asset(
+                paths,
+                source,
+                existing_occurrence,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
             if not isinstance(review_items.get(asset_id), dict):
                 review_items[asset_id] = {
                     "sequence": next_sequence,
@@ -611,6 +749,19 @@ def _observe_scan_folder_unlocked(
             skipped.append(asset_id)
             continue
 
+        base_asset_id = _asset_id(source.name, sha256)
+        asset_id = base_asset_id
+        existing = known_by_id.get(base_asset_id)
+        if existing is not None:
+            if existing.get("sha256") != sha256:
+                raise ScannerWorkflowError(
+                    f"asset identity collision for {base_asset_id}"
+                )
+            asset_id = _next_collision_asset_id(base_asset_id, known_by_id)
+
+        suffix = source.suffix.lower()
+        preserved_rel = f"sources/{asset_id}{suffix}"
+        thumbnail_rel = f"thumbnails/{asset_id}.jpg"
         target = paths.root / preserved_rel
         _copy_preserved(
             source,
@@ -635,6 +786,7 @@ def _observe_scan_folder_unlocked(
         }
         assets.append(record)
         known_by_id[asset_id] = record
+        known_by_capture_source[source_reference] = record
         review_items[asset_id] = {
             "sequence": next_sequence,
             "included": True,
