@@ -126,11 +126,14 @@ def test_start_activates_curved_books_in_existing_window(
     launcher = tmp_path / "czur-scanner"
     launcher.write_text("#!/bin/sh\n", encoding="utf-8")
     launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\\n", encoding="utf-8")
+    xdotool.chmod(0o700)
     backend = CzurCaptureBackend(
         capture_root=tmp_path / "captures",
         config_path=config,
         launcher=launcher,
-        xdotool="/usr/bin/xdotool",
+        xdotool=str(xdotool),
     )
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(backend, "_visible_windows", lambda: ["123"])
