@@ -1861,3 +1861,120 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     assert hashlib.sha256(preserved.read_bytes()).hexdigest() == repaired["sha256"]
     assert thumbnail.is_file()
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "preserved_name"),
+    [
+        ("review_file", "findings_file"),
+        ("findings_file", "review_file"),
+    ],
+)
+def test_resume_rejects_missing_metadata_for_populated_session_without_writes(
+    tmp_path: Path,
+    missing_name: str,
+    preserved_name: str,
+) -> None:
+    capture = tmp_path / f"missing-{missing_name}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", missing_name, library)
+    observe_scan_folder(paths, capture)
+
+    missing_path = getattr(paths, missing_name)
+    preserved_path = getattr(paths, preserved_name)
+    session_before = paths.session_file.read_bytes()
+    preserved_metadata_before = preserved_path.read_bytes()
+    sources_before = {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    }
+    thumbnails_before = {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    }
+    missing_path.unlink()
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="metadata is missing for populated session",
+    ):
+        create_or_resume_scan_session("book", missing_name, library)
+
+    assert not missing_path.exists()
+    assert paths.session_file.read_bytes() == session_before
+    assert preserved_path.read_bytes() == preserved_metadata_before
+    assert {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    } == sources_before
+    assert {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    } == thumbnails_before
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "expected_kind", "payload_key"),
+    [
+        ("review_file", "digitalisierer.scan-review", "items"),
+        ("findings_file", "digitalisierer.scan-findings", "findings"),
+    ],
+)
+def test_resume_recreates_missing_metadata_for_empty_session(
+    tmp_path: Path,
+    missing_name: str,
+    expected_kind: str,
+    payload_key: str,
+) -> None:
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", missing_name, library)
+    target = getattr(paths, missing_name)
+    target.unlink()
+
+    resumed = create_or_resume_scan_session("book", missing_name, library)
+    payload = json.loads(getattr(resumed, missing_name).read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 1
+    assert payload["kind"] == expected_kind
+    assert payload[payload_key] == ([] if payload_key == "findings" else {})
+
+
+def test_resume_rejects_non_list_session_assets_before_metadata_repair(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", "invalid-assets", library)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    session["assets"] = {}
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+    paths.review_file.unlink()
+
+    with pytest.raises(ScannerWorkflowError, match="session assets must be a list"):
+        create_or_resume_scan_session("book", "invalid-assets", library)
+
+    assert not paths.review_file.exists()
+
+
+def test_finalize_uses_atomic_writer_for_report_and_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "atomic-export-metadata"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "atomic-export-metadata",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_write = scanner_module._atomic_write_text
+    written: list[Path] = []
+
+    def recording_write(path: Path, content: str) -> None:
+        written.append(path)
+        original_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", recording_write)
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert [path.name for path in written] == ["report.txt", "manifest.json"]

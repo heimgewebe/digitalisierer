@@ -864,3 +864,101 @@ def test_review_server_rejects_corrupted_preserved_source_bytes(
         client.close()
         handler_socket.close()
         review_server.server.server_close()
+
+
+def test_review_replacement_choices_are_materialized_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = create_or_resume_scan_session(
+        "book",
+        "large-replacement-list",
+        tmp_path / "library",
+    )
+    assets = [
+        {
+            "asset_id": f"asset-{index:04d}",
+            "source_name": f"page-{index:04d}.jpg",
+            "thumbnail_path": f"thumbnails/asset-{index:04d}.jpg",
+            "image": {"width": 100, "height": 140},
+        }
+        for index in range(1000)
+    ]
+    review = {
+        "schema_version": 1,
+        "kind": "digitalisierer.scan-review",
+        "items": {
+            asset["asset_id"]: {
+                "included": True,
+                "sequence": index + 1,
+                "replacement_for": None,
+            }
+            for index, asset in enumerate(assets)
+        },
+    }
+    session = {
+        "project_id": "book",
+        "session_id": "large-replacement-list",
+        "assets": assets,
+    }
+    findings = {
+        "schema_version": 1,
+        "kind": "digitalisierer.scan-findings",
+        "findings": [],
+    }
+    monkeypatch.setattr(
+        review_module,
+        "load_review_state",
+        lambda _paths: (session, review, findings, object()),
+    )
+    monkeypatch.setattr(
+        review_module,
+        "_review_asset_paths_from_session",
+        lambda _paths, _session: ({}, {}),
+    )
+
+    rendered = render_review_html(paths, csrf_token="token")
+
+    assert rendered.count('<option value="') == 1000
+    assert rendered.count('list="replacement-assets"') == 1000
+    assert rendered.count('id="replacement-assets"') == 1
+    assert '<select name="replacement_for">' not in rendered
+
+
+def test_review_rejects_unknown_replacement_from_free_text_input(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "replacement-free-text"
+    capture.mkdir()
+    for index, value in enumerate((40, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg",
+            format="JPEG",
+        )
+    paths = create_or_resume_scan_session(
+        "book",
+        "replacement-free-text",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    before = paths.review_file.read_bytes()
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _post_review_form(
+            review_server,
+            {
+                "csrf": review_server.csrf_token,
+                "asset_id": asset_id,
+                "included": "1",
+                "sequence": "1",
+                "original_sequence": "1",
+                "replacement_for": "missing-asset",
+                "original_replacement_for": "",
+            },
+        )
+        assert b" 400 " in response.splitlines()[0]
+        assert paths.review_file.read_bytes() == before
+    finally:
+        review_server.server.server_close()

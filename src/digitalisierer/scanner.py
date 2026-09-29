@@ -353,6 +353,21 @@ def create_or_resume_scan_session(
         }
         _atomic_write_text(paths.session_file, _json_text(session))
 
+    raw_assets = session.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+    if raw_assets:
+        missing_metadata = [
+            path.name
+            for path in (paths.review_file, paths.findings_file)
+            if not path.exists()
+        ]
+        if missing_metadata:
+            raise ScannerWorkflowError(
+                "scan metadata is missing for populated session: "
+                + ", ".join(missing_metadata)
+            )
+
     for directory, expected_name in (
         (paths.sources, "sources"),
         (paths.thumbnails, "thumbnails"),
@@ -1469,7 +1484,8 @@ def finalize_scan_session(
 
         raw_findings = findings_payload.get("findings")
         findings_count = len(raw_findings) if isinstance(raw_findings, list) else 0
-        report.write_text(
+        _atomic_write_text(
+            report,
             "\n".join(
                 [
                     "Digitalisierer Scanner Finalize Report",
@@ -1488,7 +1504,6 @@ def finalize_scan_session(
                     "",
                 ]
             ),
-            encoding="utf-8",
         )
 
         output_hashes = {
@@ -1516,8 +1531,7 @@ def finalize_scan_session(
             "findings": findings_payload,
             "output_hashes": output_hashes,
         }
-        manifest_path.write_text(_json_text(manifest), encoding="utf-8")
-        os.chmod(manifest_path, 0o600)
+        _atomic_write_text(manifest_path, _json_text(manifest))
 
         # Re-verify preserved inputs after all processing and before publication.
         after_sources = _verify_preserved_sources(paths, session)

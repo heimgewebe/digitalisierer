@@ -17,6 +17,10 @@ def _unexpected_transcription_capability() -> cli.CapabilityStatus:
     pytest.fail("transcription must not be probed unless it is required")
 
 
+def _unexpected_capture_capability() -> cli.CapabilityStatus:
+    pytest.fail("CZUR capture must not be probed unless it is required")
+
+
 def _transcription_status(ready: bool) -> cli.CapabilityStatus:
     return {
         "ready": ready,
@@ -61,7 +65,7 @@ def test_doctor_reports_uniform_capability_json(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "_which", _all_tools_present)
-    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
@@ -71,8 +75,13 @@ def test_doctor_reports_uniform_capability_json(
     assert payload["required_capabilities"] == ["media", "ocr"]
     assert payload["capabilities"]["media"]["ready"] is True
     assert payload["capabilities"]["ocr"]["ready"] is True
-    assert payload["capabilities"]["capture-czur"]["ready"] is True
-    assert payload["capabilities"]["capture-czur"] == _capture_status(True)
+    assert payload["capabilities"]["capture-czur"] == {
+        "ready": None,
+        "checks": {},
+        "detail": (
+            "not checked; use --require capture-czur for a live CZUR readiness probe"
+        ),
+    }
     assert payload["capabilities"]["transcription"] == {
         "ready": None,
         "checks": {},
@@ -107,7 +116,7 @@ def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
         return {"found": True, "path": f"/tools/{name}"}
 
     monkeypatch.setattr(cli, "_which", missing_tesseract)
-    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(True))
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 1
@@ -124,6 +133,7 @@ def test_doctor_require_transcription_reflects_backend_readiness(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(
         cli,
         "_transcription_capability",
@@ -150,6 +160,7 @@ def test_doctor_emits_ascii_json_for_non_utf8_tool_path(
         "_which",
         lambda _name: {"found": True, "path": weird_path},
     )
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
@@ -231,6 +242,7 @@ def test_invalid_scanner_jobs_env_does_not_break_unrelated_commands(
 ) -> None:
     monkeypatch.setenv("CZUR_OCR_JOBS", "not-an-integer")
     monkeypatch.setattr(cli, "_which", _all_tools_present)
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0

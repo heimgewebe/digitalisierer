@@ -101,6 +101,10 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
         for asset in assets
         if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str)
     ]
+    replacement_options = "".join(
+        f'<option value="{html.escape(candidate, quote=True)}"></option>'
+        for candidate in known_ids
+    )
     cards: list[str] = []
     for asset in assets:
         if not isinstance(asset, dict):
@@ -136,15 +140,6 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
         )
         if not finding_html:
             finding_html = "<li>keine Hinweise</li>"
-        options = ['<option value="">— kein Ersatz —</option>']
-        for candidate in known_ids:
-            if candidate == asset_id:
-                continue
-            selected = " selected" if candidate == replacement_for else ""
-            options.append(
-                f'<option value="{html.escape(candidate, quote=True)}"{selected}>'
-                f"{html.escape(candidate)}</option>"
-            )
         checked = " checked" if included else ""
         sequence_value = "" if sequence is None else html.escape(str(sequence))
         replacement_value = (
@@ -168,7 +163,12 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
       <label><input type="checkbox" name="included" value="1"{checked}> enthalten</label>
       <label>Position <input name="sequence" inputmode="numeric" value="{sequence_value}"></label>
       <label>Ersatz für
-        <select name="replacement_for">{''.join(options)}</select>
+        <input
+          name="replacement_for"
+          list="replacement-assets"
+          value="{replacement_value}"
+          autocomplete="off"
+        >
       </label>
       <button type="submit">Speichern</button>
     </form>
@@ -207,6 +207,9 @@ code {{ word-break: break-all; }}
 <main class="grid">
 {''.join(cards)}
 </main>
+<datalist id="replacement-assets">
+{replacement_options}
+</datalist>
 </body>
 </html>
 """

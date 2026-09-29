@@ -99,7 +99,18 @@ def _capabilities(required: tuple[str, ...]) -> dict[str, CapabilityStatus]:
 
     for capability, tools in CAPABILITY_TOOLS.items():
         if capability == "capture-czur":
-            capabilities[capability] = _czur_capture_capability()
+            capabilities[capability] = (
+                _czur_capture_capability()
+                if capability in required
+                else {
+                    "ready": None,
+                    "checks": {},
+                    "detail": (
+                        "not checked; use --require capture-czur "
+                        "for a live CZUR readiness probe"
+                    ),
+                }
+            )
             continue
 
         checks: dict[str, ToolCheck] = {name: _which(name) for name in tools}
