@@ -860,6 +860,54 @@ def test_observe_findings_failure_does_not_publish_session(
         review_after_retry["items"]
     )
 
+def test_observe_rejects_capture_membership_change_at_commit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-membership-change"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 90)
+    paths = create_or_resume_scan_session(
+        "book",
+        "membership-change",
+        tmp_path / "library",
+    )
+    before_session = paths.session_file.read_bytes()
+    original_write = scanner_module._atomic_write_text
+    injected = False
+
+    def write_with_new_capture(path: Path, content: str) -> None:
+        nonlocal injected
+        original_write(path, content)
+        if path == paths.findings_file and not injected:
+            _image(capture / "image00002.jpg", 150)
+            injected = True
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        write_with_new_capture,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="capture folder changed while Digitalisierer observed it",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert injected is True
+    assert paths.session_file.read_bytes() == before_session
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    retried = observe_scan_folder(paths, capture)
+    assert len(retried.imported_asset_ids) == 2
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert [asset["source_name"] for asset in session["assets"]] == [
+        "image00001.jpg",
+        "image00002.jpg",
+    ]
+
+
 def test_finalize_export_identity_includes_pdf_builder_provenance(tmp_path: Path) -> None:
     capture = tmp_path / "capture-pdf-builder-identity"
     capture.mkdir()

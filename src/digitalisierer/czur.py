@@ -306,18 +306,36 @@ class CzurCaptureBackend:
             raise CzurAdapterError(
                 f"CZUR capture root is missing: {self.capture_root}"
             )
+        try:
+            capture_root = self.capture_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise CzurAdapterError(
+                f"CZUR capture root is invalid: {self.capture_root}"
+            ) from exc
+        if not capture_root.is_dir():
+            raise CzurAdapterError(
+                f"CZUR capture root is missing: {self.capture_root}"
+            )
+
         candidates: list[tuple[int, Path]] = []
-        directories = [self.capture_root]
-        directories.extend(
-            directory
-            for directory in self.capture_root.iterdir()
-            if directory.is_dir() and not directory.name.startswith("_")
-        )
+        directories = [capture_root]
+        for directory in self.capture_root.iterdir():
+            if directory.name.startswith("_") or directory.is_symlink():
+                continue
+            try:
+                resolved = directory.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if not resolved.is_dir() or resolved.parent != capture_root:
+                continue
+            directories.append(resolved)
+
         for directory in directories:
             images = [
                 path
                 for path in directory.iterdir()
-                if path.is_file()
+                if not path.is_symlink()
+                and path.is_file()
                 and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
             ]
             if not images:
@@ -328,7 +346,7 @@ class CzurCaptureBackend:
             raise CzurAdapterError(
                 f"no CZUR scan folder with images at or below {self.capture_root}"
             )
-        return max(candidates, key=lambda item: item[0])[1].resolve()
+        return max(candidates, key=lambda item: item[0])[1]
 
     def image_files(self, folder: Path) -> list[Path]:
         return sorted(

@@ -854,15 +854,6 @@ def _observe_scan_folder_unlocked(
         next_sequence += 1
         imported.append(asset_id)
 
-    after_signature = [
-        (path.name, path.stat().st_size, path.stat().st_mtime_ns)
-        for path in selected
-    ]
-    if after_signature != before_signature:
-        raise ScannerWorkflowError(
-            "capture folder changed while Digitalisierer observed it"
-        )
-
     findings = _findings_from_assets(assets)
     session["assets"] = assets
     observations = session.setdefault("capture_observations", [])
@@ -894,6 +885,23 @@ def _observe_scan_folder_unlocked(
             }
         ),
     )
+
+    # Re-list the selected range at the session.json commit boundary. The
+    # signature must cover membership as well as file identity so a page that
+    # appears while observation is running cannot be silently omitted.
+    current_sources = image_files(source_root)
+    current_selected = current_sources[start - 1 :]
+    if limit is not None:
+        current_selected = current_selected[:limit]
+    after_signature = [
+        (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+        for path in current_selected
+    ]
+    if after_signature != before_signature:
+        raise ScannerWorkflowError(
+            "capture folder changed while Digitalisierer observed it"
+        )
+
     _atomic_write_text(paths.session_file, _json_text(session))
     return ScanObservation(
         session_root=paths.root,

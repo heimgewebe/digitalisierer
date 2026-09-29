@@ -72,6 +72,27 @@ def test_newest_scan_folder_ignores_internal_directories(tmp_path: Path) -> None
     assert backend.newest_scan_folder() != internal.resolve()
 
 
+def test_newest_scan_folder_ignores_symlinked_directory_outside_capture_root(
+    tmp_path: Path,
+) -> None:
+    capture_root = tmp_path / "captures"
+    capture_root.mkdir()
+    legitimate = capture_root / "legitimate"
+    legitimate.mkdir()
+    legitimate_image = legitimate / "image1.jpg"
+    legitimate_image.write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_image = outside / "image2.jpg"
+    outside_image.write_bytes(b"outside")
+    os.utime(legitimate_image, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(outside_image, ns=(2_000_000_000, 2_000_000_000))
+    (capture_root / "escape").symlink_to(outside, target_is_directory=True)
+    backend = CzurCaptureBackend(capture_root=capture_root)
+
+    assert backend.newest_scan_folder() == legitimate.resolve()
+
+
 def test_newest_scan_folder_can_select_capture_root(tmp_path: Path) -> None:
     nested = tmp_path / "older"
     nested.mkdir()
