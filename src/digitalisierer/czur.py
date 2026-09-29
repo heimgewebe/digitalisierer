@@ -102,20 +102,35 @@ class CzurCaptureBackend:
                 f"CZUR capture root cannot be created or used: {self.capture_root}"
             )
 
-    def status(self) -> CaptureStatus:
-        executable_ready = self.launcher.is_file() and os.access(
-            self.launcher, os.X_OK
+    def _launcher_ready(self) -> bool:
+        return self.launcher.is_file() and os.access(self.launcher, os.X_OK)
+
+    def _xdotool_ready(self) -> bool:
+        xdotool_path = Path(self.xdotool)
+        return shutil.which(self.xdotool) is not None or (
+            xdotool_path.is_file() and os.access(xdotool_path, os.X_OK)
         )
+
+    def _start_preflight(self) -> list[str]:
+        if not self._xdotool_ready():
+            raise CzurAdapterError(f"xdotool is not executable: {self.xdotool}")
+        windows = self._visible_windows()
+        if not windows and not self._launcher_ready():
+            raise CzurAdapterError(f"CZUR launcher is not executable: {self.launcher}")
+        self._load_config_payload()
+        self._require_config_write_ready()
+        self._require_capture_root_ready()
+        return windows
+
+    def status(self) -> CaptureStatus:
+        executable_ready = self._launcher_ready()
         try:
             self._load_config_payload()
         except CzurAdapterError:
             config_ready = False
         else:
             config_ready = self._config_write_ready()
-        xdotool_path = Path(self.xdotool)
-        xdotool_ready = shutil.which(self.xdotool) is not None or (
-            xdotool_path.is_file() and os.access(xdotool_path, os.X_OK)
-        )
+        xdotool_ready = self._xdotool_ready()
         windows = self._visible_windows() if xdotool_ready else []
         connected = bool(windows)
         capture_root_ready = self._capture_root_ready()
@@ -217,19 +232,19 @@ class CzurCaptureBackend:
             )
 
     def start(self, output_dir: Path) -> None:
+        windows = self._start_preflight()
+
         self._session_output = output_dir.expanduser()
         self._session_output.mkdir(parents=True, exist_ok=True)
-        self._require_capture_root_ready()
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.apply_curved_books_preset()
 
-        windows = self._visible_windows()
         if windows:
             self._focus(windows[-1])
             self._activate_curved_books_mode(windows[-1])
             return
 
-        if not self.launcher.is_file() or not os.access(self.launcher, os.X_OK):
+        if not self._launcher_ready():
             raise CzurAdapterError(f"CZUR launcher is not executable: {self.launcher}")
         subprocess.Popen(
             [str(self.launcher)],

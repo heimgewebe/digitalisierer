@@ -145,6 +145,84 @@ def test_start_activates_curved_books_in_existing_window(
 
     assert calls == [("focus", "123"), (CURVED_BOOKS_HOTKEY, "123")]
 
+def test_start_rejects_missing_xdotool_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(tmp_path / "missing-xdotool"),
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    def unexpected_visible_windows() -> list[str]:
+        pytest.fail("window discovery must not run without a usable xdotool")
+
+    monkeypatch.setattr(backend, "_visible_windows", unexpected_visible_windows)
+
+    with pytest.raises(CzurAdapterError, match="xdotool is not executable"):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+@pytest.mark.parametrize("launcher_state", ["missing", "non-executable"])
+def test_start_rejects_unusable_launcher_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launcher_state: str,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    if launcher_state == "non-executable":
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o600)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    with pytest.raises(CzurAdapterError, match="launcher is not executable"):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 @pytest.mark.parametrize(
     ("raw_config", "message"),
     [
