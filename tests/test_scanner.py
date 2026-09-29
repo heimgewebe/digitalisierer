@@ -1256,6 +1256,32 @@ def test_finalize_export_identity_includes_findings_snapshot(tmp_path: Path) -> 
     assert second_manifest["findings"] == findings
 
 
+def test_finalize_rejects_symlinked_exports_before_staging(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-export-symlink"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "export-symlink",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    outside = tmp_path / "outside-exports"
+    outside.mkdir()
+    paths.exports.rmdir()
+    paths.exports.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner exports directory must be a canonical direct child",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(outside.iterdir()) == []
+
+
 @pytest.mark.parametrize("escape_kind", ["parent", "absolute", "symlink"])
 def test_processing_rejects_preserved_source_path_escape(
     tmp_path: Path,

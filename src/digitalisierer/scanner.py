@@ -1349,6 +1349,7 @@ def finalize_scan_session(
         ).encode("utf-8")
     ).hexdigest()
     export_id = f"export--{export_identity[:12]}"
+    _validate_session_storage_directory(paths, paths.exports, "exports")
     final_dir = paths.exports / export_id
     if final_dir.exists():
         raise ScannerWorkflowError(f"scan export already exists: {final_dir}")

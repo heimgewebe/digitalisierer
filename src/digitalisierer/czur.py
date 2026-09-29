@@ -131,7 +131,14 @@ class CzurCaptureBackend:
         else:
             config_ready = self._config_write_ready()
         xdotool_ready = self._xdotool_ready()
-        windows = self._visible_windows() if xdotool_ready else []
+        if xdotool_ready:
+            try:
+                windows = self._visible_windows()
+            except CzurAdapterError:
+                xdotool_ready = False
+                windows = []
+        else:
+            windows = []
         connected = bool(windows)
         capture_root_ready = self._capture_root_ready()
         return CaptureStatus(
@@ -185,13 +192,18 @@ class CzurCaptureBackend:
         return before
 
     def _visible_windows(self) -> list[str]:
-        completed = subprocess.run(
-            [self.xdotool, "search", "--onlyvisible", "--class", "CzurScanner"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [self.xdotool, "search", "--onlyvisible", "--class", "CzurScanner"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            raise CzurAdapterError(
+                f"cannot execute xdotool: {self.xdotool}"
+            ) from exc
         if completed.returncode != 0:
             return []
         return [line.strip() for line in completed.stdout.splitlines() if line.strip()]

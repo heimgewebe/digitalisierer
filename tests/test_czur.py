@@ -442,6 +442,51 @@ def test_status_handles_config_read_failure(
     with pytest.raises(CzurAdapterError, match="cannot be read as UTF-8"):
         backend.apply_curved_books_preset()
 
+def test_status_handles_xdotool_execution_failure_before_start_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    def fail_xdotool(*args: object, **kwargs: object) -> object:
+        raise OSError("synthetic xdotool execution failure")
+
+    monkeypatch.setattr("digitalisierer.czur.subprocess.run", fail_xdotool)
+
+    status = backend.status()
+    assert status.ready is False
+    assert status.connected is False
+
+    with pytest.raises(CzurAdapterError, match="cannot execute xdotool"):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 def test_status_rejects_non_executable_xdotool_path(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
     config.write_text('{"setting": {}}', encoding="utf-8")
