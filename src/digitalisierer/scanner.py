@@ -271,7 +271,9 @@ def image_files(folder: Path) -> list[Path]:
         [
             path
             for path in root.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+            if not path.is_symlink()
+            and path.is_file()
+            and path.suffix.lower() in IMAGE_SUFFIXES
         ],
         key=_natural_key,
     )
@@ -763,6 +765,13 @@ def _observe_scan_folder_unlocked(
 
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
+    try:
+        previous_review_text = paths.review_file.read_text(encoding="utf-8")
+        previous_findings_text = paths.findings_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ScannerWorkflowError(
+            "scan dependent metadata cannot be snapshotted before observation"
+        ) from exc
     review_items = review.get("items")
     if not isinstance(review_items, dict):
         raise ScannerWorkflowError("scan review items must be an object")
@@ -870,37 +879,50 @@ def _observe_scan_folder_unlocked(
         }
     )
     review["items"] = review_items
-    # Publish dependent metadata before session.json, which is the commit point.
-    # If either earlier write succeeds and a later write fails, the session remains
-    # on the previous asset set; orphan review state then blocks processing/finalize
-    # until a retry reconstructs the complete observation.
-    _atomic_write_text(paths.review_file, _json_text(review))
-    _atomic_write_text(
-        paths.findings_file,
-        _json_text(
-            {
-                "schema_version": 1,
-                "kind": "digitalisierer.scan-findings",
-                "findings": [_finding_payload(item) for item in findings],
-            }
-        ),
-    )
 
-    # Re-list the selected range at the session.json commit boundary. The
-    # signature must cover membership as well as file identity so a page that
-    # appears while observation is running cannot be silently omitted.
-    current_sources = image_files(source_root)
-    current_selected = current_sources[start - 1 :]
-    if limit is not None:
-        current_selected = current_selected[:limit]
-    after_signature = [
-        (path.name, path.stat().st_size, path.stat().st_mtime_ns)
-        for path in current_selected
-    ]
-    if after_signature != before_signature:
+    def current_capture_signature() -> list[tuple[str, int, int]]:
+        current_sources = image_files(source_root)
+        current_selected = current_sources[start - 1 :]
+        if limit is not None:
+            current_selected = current_selected[:limit]
+        return [
+            (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+            for path in current_selected
+        ]
+
+    # Avoid publishing dependent metadata when capture membership or identity
+    # has already changed while processing.
+    if current_capture_signature() != before_signature:
         raise ScannerWorkflowError(
             "capture folder changed while Digitalisierer observed it"
         )
+
+    findings_text = _json_text(
+        {
+            "schema_version": 1,
+            "kind": "digitalisierer.scan-findings",
+            "findings": [_finding_payload(item) for item in findings],
+        }
+    )
+    try:
+        # review/findings depend on the prospective session.json asset set.
+        # session.json remains the commit point; rollback dependent metadata
+        # if either publication or the final capture-boundary check fails.
+        _atomic_write_text(paths.review_file, _json_text(review))
+        _atomic_write_text(paths.findings_file, findings_text)
+        if current_capture_signature() != before_signature:
+            raise ScannerWorkflowError(
+                "capture folder changed while Digitalisierer observed it"
+            )
+    except Exception:
+        try:
+            _atomic_write_text(paths.review_file, previous_review_text)
+            _atomic_write_text(paths.findings_file, previous_findings_text)
+        except Exception as rollback_exc:
+            raise ScannerWorkflowError(
+                "failed to restore scanner dependent metadata after observation failure"
+            ) from rollback_exc
+        raise
 
     _atomic_write_text(paths.session_file, _json_text(session))
     return ScanObservation(
@@ -999,6 +1021,7 @@ def _processing_session_from_payload(
     review: dict[str, Any],
 ) -> ProcessingSession:
     _validate_session_identity(paths, session)
+    _validate_session_storage_directory(paths, paths.sources, "sources")
     _validate_review_payload(review)
     raw_assets = session.get("assets")
     raw_review = review.get("items")

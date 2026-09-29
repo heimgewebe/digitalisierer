@@ -783,6 +783,31 @@ def test_finalize_rejects_orphan_review_entries(tmp_path: Path) -> None:
     assert list(paths.exports.iterdir()) == []
 
 
+def test_observe_ignores_symlinked_image_entries(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-image-symlink"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 90)
+    outside = tmp_path / "outside.jpg"
+    _image(outside, 180)
+    (capture / "image00002.jpg").symlink_to(outside)
+    paths = create_or_resume_scan_session(
+        "book",
+        "image-symlink",
+        tmp_path / "library",
+    )
+
+    observed = observe_scan_folder(paths, capture)
+
+    assert len(observed.imported_asset_ids) == 1
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert [asset["source_name"] for asset in session["assets"]] == [
+        "image00001.jpg",
+    ]
+    assert outside.read_bytes() != b""
+
+
 def test_default_pdf_builder_streams_to_img2pdf_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -823,6 +848,11 @@ def test_observe_findings_failure_does_not_publish_session(
         "findings-failure",
         tmp_path / "library",
     )
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
     original_write = scanner_module._atomic_write_text
     failed = False
 
@@ -837,13 +867,11 @@ def test_observe_findings_failure_does_not_publish_session(
     with pytest.raises(OSError, match="synthetic findings write failure"):
         observe_scan_folder(paths, capture)
 
-    session_after_failure = json.loads(
-        paths.session_file.read_text(encoding="utf-8")
-    )
-    assert session_after_failure["assets"] == []
+    for metadata_path, expected in before.items():
+        assert metadata_path.read_bytes() == expected
     with pytest.raises(
         ScannerWorkflowError,
-        match="review state contains assets missing from scan session",
+        match="scanner session has no included pages",
     ):
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
     assert list(paths.exports.iterdir()) == []
@@ -872,7 +900,11 @@ def test_observe_rejects_capture_membership_change_at_commit_boundary(
         "membership-change",
         tmp_path / "library",
     )
-    before_session = paths.session_file.read_bytes()
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
     original_write = scanner_module._atomic_write_text
     injected = False
 
@@ -896,7 +928,8 @@ def test_observe_rejects_capture_membership_change_at_commit_boundary(
         observe_scan_folder(paths, capture)
 
     assert injected is True
-    assert paths.session_file.read_bytes() == before_session
+    for metadata_path, expected in before.items():
+        assert metadata_path.read_bytes() == expected
 
     monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
     retried = observe_scan_folder(paths, capture)
@@ -1328,6 +1361,36 @@ def test_finalize_rejects_symlinked_exports_before_staging(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert list(outside.iterdir()) == []
+
+
+def test_processing_rejects_symlinked_sources_directory_alias(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-sources-alias"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "sources-alias",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    aliased_sources = paths.root / "aliased-sources"
+    paths.sources.rename(aliased_sources)
+    paths.sources.symlink_to(aliased_sources.name, target_is_directory=True)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner sources directory must be a canonical direct child",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner sources directory must be a canonical direct child",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
 
 
 @pytest.mark.parametrize("escape_kind", ["parent", "absolute", "symlink"])
