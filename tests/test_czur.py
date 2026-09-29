@@ -215,6 +215,96 @@ def test_status_rejects_unwritable_config_directory(
         backend.apply_curved_books_preset()
 
 
+def test_status_rejects_capture_root_that_is_a_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    capture_root = tmp_path / "captures"
+    capture_root.write_text("not a directory", encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="capture root cannot be created or used"):
+        backend.start(tmp_path / "session")
+
+
+def test_status_rejects_dangling_capture_root_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    capture_root = tmp_path / "captures"
+    capture_root.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="capture root cannot be created or used"):
+        backend.start(tmp_path / "session")
+
+
+def test_status_rejects_unwritable_capture_root_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    capture_parent = tmp_path / "capture-parent"
+    capture_parent.mkdir()
+    capture_root = capture_parent / "nested" / "captures"
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_access = os.access
+
+    def access(path: os.PathLike[str] | str, mode: int) -> bool:
+        if Path(path) == capture_parent and mode == (os.W_OK | os.X_OK):
+            return False
+        return original_access(path, mode)
+
+    monkeypatch.setattr(os, "access", access)
+
+    assert backend.status().ready is False
+    with pytest.raises(CzurAdapterError, match="capture root cannot be created or used"):
+        backend.start(tmp_path / "session")
+
+
 def test_status_handles_non_utf8_config_without_traceback(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
     config.write_bytes(b"\xff")

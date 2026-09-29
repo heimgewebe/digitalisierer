@@ -1079,13 +1079,16 @@ def finalize_scan_session(
     language: str = "deu",
     pdf_builder: ImageToPdf = _default_pdf_builder,
 ) -> ScanExport:
-    session, session_file_sha = _stable_json_snapshot(paths.session_file)
-    _validate_session_identity(paths, session)
-    review, review_file_sha = _stable_json_snapshot(paths.review_file)
-    findings_payload, findings_file_sha = _stable_json_snapshot(paths.findings_file)
-    _validate_findings_payload(findings_payload)
-    processing = _processing_session_from_payload(paths, session, review)
-    _validate_findings_asset_ids(processing, findings_payload)
+    with _review_update_lock(paths):
+        session, session_file_sha = _stable_json_snapshot(paths.session_file)
+        _validate_session_identity(paths, session)
+        review, review_file_sha = _stable_json_snapshot(paths.review_file)
+        findings_payload, findings_file_sha = _stable_json_snapshot(
+            paths.findings_file
+        )
+        _validate_findings_payload(findings_payload)
+        processing = _processing_session_from_payload(paths, session, review)
+        _validate_findings_asset_ids(processing, findings_payload)
     active = processing.ordered_assets()
     if not active:
         raise ScannerWorkflowError("scanner session has no included pages")

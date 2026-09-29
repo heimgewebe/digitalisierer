@@ -269,6 +269,52 @@ def test_review_server_serves_preserved_source_for_hidpi(
         review_server.server.server_close()
 
 
+@pytest.mark.parametrize("escape_kind", ["parent", "absolute", "symlink", "wrong-name"])
+def test_review_rejects_thumbnail_path_escape(
+    tmp_path: Path,
+    escape_kind: str,
+) -> None:
+    capture = tmp_path / "thumbnail-escape"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        f"thumbnail-escape-{escape_kind}",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    current = paths.root / asset["thumbnail_path"]
+    outside = paths.root.parent / f"outside-thumbnail-{escape_kind}.jpg"
+    outside.write_bytes(current.read_bytes())
+
+    if escape_kind == "parent":
+        asset["thumbnail_path"] = f"../{outside.name}"
+    elif escape_kind == "absolute":
+        asset["thumbnail_path"] = str(outside.resolve())
+    elif escape_kind == "symlink":
+        link = paths.thumbnails / f"{asset_id}.jpg"
+        link.unlink()
+        link.symlink_to(outside)
+    else:
+        wrong = paths.thumbnails / "wrong.jpg"
+        wrong.write_bytes(current.read_bytes())
+        asset["thumbnail_path"] = "thumbnails/wrong.jpg"
+
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="thumbnail path|thumbnail must",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+
 def test_review_replacement_defaults_to_replaced_page_position(tmp_path: Path) -> None:
     capture = tmp_path / "replacement-default"
     capture.mkdir()

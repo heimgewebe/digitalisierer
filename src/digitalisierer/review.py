@@ -81,6 +81,7 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
         raise ScannerWorkflowError("scan session/review state has invalid shape")
 
     findings = _finding_index(findings_payload)
+    _review_asset_paths_from_session(paths, session)
     known_ids = [
         str(asset["asset_id"])
         for asset in assets
@@ -194,10 +195,42 @@ code {{ word-break: break-all; }}
 """
 
 
-def _review_asset_paths(
+def _review_thumbnail_path(
     paths: ScanSessionPaths,
+    asset_id: str,
+    relative: str,
+) -> Path:
+    expected = f"thumbnails/{asset_id}.jpg"
+    if relative != expected:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is not canonical for {asset_id}"
+        )
+    try:
+        thumbnails_root = paths.thumbnails.resolve(strict=True)
+        candidate = (paths.root / relative).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is invalid for {asset_id}"
+        ) from exc
+    if not thumbnails_root.is_dir():
+        raise ScannerWorkflowError("scan thumbnails directory is invalid")
+    try:
+        candidate.relative_to(thumbnails_root)
+    except ValueError as exc:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path escapes thumbnails for {asset_id}"
+        ) from exc
+    if not candidate.is_file():
+        raise ScannerWorkflowError(
+            f"scan thumbnail must be a regular file for {asset_id}"
+        )
+    return candidate
+
+
+def _review_asset_paths_from_session(
+    paths: ScanSessionPaths,
+    session_payload: dict[str, Any],
 ) -> tuple[dict[str, Path], dict[str, Path]]:
-    session_payload, _, _, _ = load_review_state(paths)
     raw_assets = session_payload.get("assets")
     if not isinstance(raw_assets, list):
         raise ScannerWorkflowError("scan session assets must be a list")
@@ -213,9 +246,20 @@ def _review_asset_paths(
             raise ScannerWorkflowError("scan asset record has an invalid asset_id")
         if not isinstance(thumbnail, str) or not isinstance(preserved, str):
             raise ScannerWorkflowError("scan asset record has invalid review paths")
-        thumbnail_by_id[asset_id] = paths.root / thumbnail
+        thumbnail_by_id[asset_id] = _review_thumbnail_path(
+            paths,
+            asset_id,
+            thumbnail,
+        )
         source_by_id[asset_id] = paths.root / preserved
     return thumbnail_by_id, source_by_id
+
+
+def _review_asset_paths(
+    paths: ScanSessionPaths,
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    session_payload, _, _, _ = load_review_state(paths)
+    return _review_asset_paths_from_session(paths, session_payload)
 
 
 def _trusted_host_header(

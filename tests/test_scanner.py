@@ -498,6 +498,74 @@ def test_observe_rejects_malformed_existing_asset_record(tmp_path: Path) -> None
     assert persisted["assets"] == ["not-an-object"]
 
 
+def test_finalize_initial_snapshot_serializes_observe_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_capture = tmp_path / "finalize-snapshot-first"
+    second_capture = tmp_path / "finalize-snapshot-second"
+    first_capture.mkdir()
+    second_capture.mkdir()
+    _image(first_capture / "image00001.jpg", 80)
+    _image(second_capture / "image00002.jpg", 160)
+    paths = create_or_resume_scan_session(
+        "book",
+        "finalize-snapshot",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, first_capture)
+
+    original_snapshot = scanner_module._stable_json_snapshot
+    first_session_snapshot = threading.Event()
+    release_snapshot = threading.Event()
+    observe_done = threading.Event()
+    finalizer_failures: list[BaseException] = []
+    observer_failures: list[BaseException] = []
+
+    def delayed_snapshot(path: Path) -> tuple[dict[str, object], str]:
+        result = original_snapshot(path)
+        if path == paths.session_file and not first_session_snapshot.is_set():
+            first_session_snapshot.set()
+            assert release_snapshot.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(scanner_module, "_stable_json_snapshot", delayed_snapshot)
+
+    def finalize() -> None:
+        try:
+            finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            finalizer_failures.append(exc)
+
+    def observe_second() -> None:
+        try:
+            observe_scan_folder(paths, second_capture)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            observer_failures.append(exc)
+        finally:
+            observe_done.set()
+
+    finalizer = threading.Thread(target=finalize)
+    observer = threading.Thread(target=observe_second)
+    finalizer.start()
+    assert first_session_snapshot.wait(timeout=2.0)
+    observer.start()
+
+    assert observe_done.wait(timeout=0.1) is False
+    release_snapshot.set()
+    finalizer.join(timeout=2.0)
+    observer.join(timeout=2.0)
+
+    assert not finalizer.is_alive()
+    assert not observer.is_alive()
+    assert observer_failures == []
+    assert len(finalizer_failures) == 1
+    assert isinstance(finalizer_failures[0], ScannerWorkflowError)
+    assert "metadata changed while finalizing" in str(finalizer_failures[0])
+    assert len(load_processing_session(paths).items) == 2
+    assert list(paths.exports.iterdir()) == []
+
+
 def test_finalize_serializes_review_update_through_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

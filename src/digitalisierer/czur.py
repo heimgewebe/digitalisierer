@@ -87,6 +87,21 @@ class CzurCaptureBackend:
                 f"CZUR config directory is not writable: {self.config_path.parent}"
             )
 
+    def _capture_root_ready(self) -> bool:
+        candidate = self.capture_root
+        current = candidate
+        while not os.path.lexists(current) and current != current.parent:
+            current = current.parent
+        if not current.exists() or not current.is_dir():
+            return False
+        return os.access(current, os.W_OK | os.X_OK)
+
+    def _require_capture_root_ready(self) -> None:
+        if not self._capture_root_ready():
+            raise CzurAdapterError(
+                f"CZUR capture root cannot be created or used: {self.capture_root}"
+            )
+
     def status(self) -> CaptureStatus:
         executable_ready = self.launcher.is_file() and os.access(
             self.launcher, os.X_OK
@@ -102,9 +117,15 @@ class CzurCaptureBackend:
         ).is_file()
         windows = self._visible_windows() if xdotool_ready else []
         connected = bool(windows)
+        capture_root_ready = self._capture_root_ready()
         return CaptureStatus(
             connected=connected,
-            ready=config_ready and xdotool_ready and (connected or executable_ready),
+            ready=(
+                config_ready
+                and capture_root_ready
+                and xdotool_ready
+                and (connected or executable_ready)
+            ),
             detail=(
                 "official CZUR app + Curved Books preset + capture-folder observation"
             ),
@@ -197,6 +218,7 @@ class CzurCaptureBackend:
     def start(self, output_dir: Path) -> None:
         self._session_output = output_dir.expanduser()
         self._session_output.mkdir(parents=True, exist_ok=True)
+        self._require_capture_root_ready()
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.apply_curved_books_preset()
 
