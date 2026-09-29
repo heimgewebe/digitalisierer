@@ -1335,7 +1335,7 @@ def test_finalize_rejects_missing_ocr_provenance(
     ):
         finalize_scan_session(
             paths,
-            _MissingVersionOcr(),
+            _MissingVersionOcr(),  # type: ignore[arg-type]
             pdf_builder=_fake_pdf,
         )
 
@@ -1372,7 +1372,7 @@ def test_finalize_rejects_ocr_backend_without_version_method(tmp_path: Path) -> 
     ):
         finalize_scan_session(
             paths,
-            _UnversionedOcr(),
+            _UnversionedOcr(),  # type: ignore[arg-type]
             pdf_builder=_fake_pdf,
         )
 
@@ -1861,6 +1861,91 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     assert hashlib.sha256(preserved.read_bytes()).hexdigest() == repaired["sha256"]
     assert thumbnail.is_file()
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+
+
+@pytest.mark.parametrize("thumbnail_existed", [True, False])
+def test_observe_failure_restores_repaired_thumbnail_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    thumbnail_existed: bool,
+) -> None:
+    capture = tmp_path / "resume-repair-rollback"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-rollback",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    recorded_thumbnail_sha = session_before["assets"][0]["thumbnail_sha256"]
+    thumbnail = paths.root / session_before["assets"][0]["thumbnail_path"]
+    if thumbnail_existed:
+        thumbnail.write_bytes(b"preexisting-corrupt-thumbnail")
+        thumbnail_preimage: bytes | None = thumbnail.read_bytes()
+    else:
+        thumbnail.unlink()
+        thumbnail_preimage = None
+    metadata_before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+
+    original_thumbnail_writer = scanner_module._write_thumbnail
+    original_atomic_write = scanner_module._atomic_write_text
+    failed = False
+
+    def renderer_with_changed_bytes(source_path: Path, target: Path) -> None:
+        original_thumbnail_writer(source_path, target)
+        target.write_bytes(target.read_bytes() + b"-renderer-drift")
+
+    def fail_session_once(path: Path, content: str) -> None:
+        nonlocal failed
+        if path == paths.session_file and not failed:
+            failed = True
+            raise OSError("synthetic session write failure after thumbnail repair")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_write_thumbnail",
+        renderer_with_changed_bytes,
+    )
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_session_once)
+
+    with pytest.raises(
+        OSError,
+        match="synthetic session write failure after thumbnail repair",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert failed is True
+    if thumbnail_preimage is None:
+        assert not thumbnail.exists()
+    else:
+        assert thumbnail.read_bytes() == thumbnail_preimage
+    assert {
+        path: path.read_bytes() for path in metadata_before
+    } == metadata_before
+    assert not any(
+        path.name.endswith(".rollback") for path in paths.thumbnails.iterdir()
+    )
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_atomic_write)
+    resumed = observe_scan_folder(paths, capture)
+
+    assert resumed.imported_asset_ids == ()
+    assert resumed.skipped_asset_ids == (asset_id,)
+    repaired = json.loads(paths.session_file.read_text(encoding="utf-8"))["assets"][0]
+    assert repaired["thumbnail_sha256"] != recorded_thumbnail_sha
+    assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+    assert not any(
+        path.name.endswith(".rollback") for path in paths.thumbnails.iterdir()
+    )
 
 
 @pytest.mark.parametrize(

@@ -581,7 +581,7 @@ def _repair_recorded_asset(
     *,
     expected_sha256: str,
     expected_stat: os.stat_result,
-) -> None:
+) -> tuple[dict[str, Any], Path, Path] | None:
     asset_id = record.get("asset_id")
     if not isinstance(asset_id, str) or not asset_id:
         raise ScannerWorkflowError("scan asset record has an invalid asset_id")
@@ -644,9 +644,9 @@ def _repair_recorded_asset(
         and thumbnail.exists()
         and secrets.compare_digest(_sha256_file(thumbnail), thumbnail_sha256)
     )
-    if not thumbnail_valid:
-        _write_thumbnail(preserved, thumbnail)
-        record["thumbnail_sha256"] = _sha256_file(thumbnail)
+    if thumbnail_valid:
+        return None
+    return record, preserved, thumbnail
 
 
 def _finding_payload(finding: QualityFinding) -> dict[str, object]:
@@ -833,6 +833,7 @@ def _observe_scan_folder_unlocked(
 
     imported: list[str] = []
     skipped: list[str] = []
+    pending_thumbnail_repairs: list[tuple[dict[str, Any], Path, Path]] = []
 
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
@@ -872,13 +873,15 @@ def _observe_scan_folder_unlocked(
                 raise ScannerWorkflowError(
                     f"capture source changed since observation for {asset_id}"
                 )
-            _repair_recorded_asset(
+            pending_repair = _repair_recorded_asset(
                 paths,
                 source,
                 existing_occurrence,
                 expected_sha256=sha256,
                 expected_stat=source_stat,
             )
+            if pending_repair is not None:
+                pending_thumbnail_repairs.append(pending_repair)
             if not isinstance(review_items.get(asset_id), dict):
                 review_items[asset_id] = {
                     "sequence": next_sequence,
@@ -976,10 +979,43 @@ def _observe_scan_folder_unlocked(
             "findings": [_finding_payload(item) for item in findings],
         }
     )
+    thumbnail_rollbacks: list[tuple[Path, Path | None]] = []
     try:
+        for record, preserved, thumbnail in pending_thumbnail_repairs:
+            backup: Path | None = None
+            if thumbnail.exists():
+                backup_candidate = thumbnail.with_name(
+                    f".{thumbnail.name}.{secrets.token_hex(8)}.rollback"
+                )
+                os.link(
+                    thumbnail,
+                    backup_candidate,
+                    follow_symlinks=False,
+                )
+                if backup_candidate.is_symlink() or not backup_candidate.is_file():
+                    backup_candidate.unlink(missing_ok=True)
+                    raise ScannerWorkflowError(
+                        f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+                    )
+                backup = backup_candidate
+            thumbnail_rollbacks.append((thumbnail, backup))
+            if backup is not None:
+                directory_fd = os.open(
+                    thumbnail.parent,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+
+            _write_thumbnail(preserved, thumbnail)
+            record["thumbnail_sha256"] = _sha256_file(thumbnail)
+
         # review/findings depend on the prospective session.json asset set.
-        # Keep the final session commit in the same rollback boundary so any
-        # reported observation failure leaves the previous coherent snapshot.
+        # Keep repaired thumbnails and the final session commit in the same
+        # rollback boundary so any reported observation failure restores the
+        # previous filesystem and metadata snapshot.
         _atomic_write_text(paths.review_file, _json_text(review))
         _atomic_write_text(paths.findings_file, findings_text)
         if current_capture_signature() != before_signature:
@@ -989,6 +1025,23 @@ def _observe_scan_folder_unlocked(
         _atomic_write_text(paths.session_file, _json_text(session))
     except Exception:
         rollback_error: Exception | None = None
+        for thumbnail, backup in reversed(thumbnail_rollbacks):
+            try:
+                if backup is None:
+                    thumbnail.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, thumbnail)
+                directory_fd = os.open(
+                    thumbnail.parent,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except Exception as exc:
+                if rollback_error is None:
+                    rollback_error = exc
         for metadata_path, previous_text in (
             (paths.session_file, previous_session_text),
             (paths.review_file, previous_review_text),
@@ -1001,9 +1054,27 @@ def _observe_scan_folder_unlocked(
                     rollback_error = exc
         if rollback_error is not None:
             raise ScannerWorkflowError(
-                "failed to restore scanner metadata after observation failure"
+                "failed to restore scanner observation after failure"
             ) from rollback_error
         raise
+    else:
+        for thumbnail, backup in thumbnail_rollbacks:
+            if backup is None:
+                continue
+            try:
+                backup.unlink()
+                directory_fd = os.open(
+                    thumbnail.parent,
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # The canonical thumbnail and metadata are already committed.
+                # Backup cleanup must not turn that commit into a false failure.
+                pass
     return ScanObservation(
         session_root=paths.root,
         imported_asset_ids=tuple(imported),

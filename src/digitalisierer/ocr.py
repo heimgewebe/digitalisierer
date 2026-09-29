@@ -85,13 +85,20 @@ class OcrmypdfBackend:
                 f"ocrmypdf failed with exit code {completed.returncode}{suffix}"
             )
 
-    def version(self) -> str | None:
+    def version(self) -> str:
         completed = self._runner([self.executable, "--version"])
         if completed.returncode != 0:
-            return None
+            detail = (completed.stdout or "").strip()
+            suffix = f": {detail}" if detail else ""
+            raise OcrAdapterError(
+                f"ocrmypdf version probe failed with exit code "
+                f"{completed.returncode}{suffix}"
+            )
         lines = [
             line.strip()
             for line in (completed.stdout or "").splitlines()
             if line.strip()
         ]
-        return lines[-1] if lines else None
+        if not lines:
+            raise OcrAdapterError("ocrmypdf version probe returned no version")
+        return lines[-1]

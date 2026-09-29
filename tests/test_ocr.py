@@ -68,3 +68,23 @@ def test_ocr_backend_version_uses_version_line_after_warnings() -> None:
     backend = OcrmypdfBackend(executable="/usr/bin/ocrmypdf", runner=runner)
 
     assert backend.version() == "13.4.0+dfsg"
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "message"),
+    [
+        (1, "probe failed", "version probe failed"),
+        (0, "", "version probe returned no version"),
+    ],
+)
+def test_ocr_backend_version_rejects_missing_provenance(
+    returncode: int,
+    stdout: str,
+    message: str,
+) -> None:
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout)
+
+    backend = OcrmypdfBackend(executable="/usr/bin/ocrmypdf", runner=runner)
+
+    with pytest.raises(OcrAdapterError, match=message):
+        backend.version()

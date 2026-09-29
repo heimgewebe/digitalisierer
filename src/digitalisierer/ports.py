@@ -33,6 +33,9 @@ class CaptureBackend(Protocol):
 class OCRBackend(Protocol):
     name: str
 
+    def version(self) -> str:
+        ...
+
     def searchable_pdf(
         self,
         master_pdf: Path,
