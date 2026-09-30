@@ -115,6 +115,40 @@ def test_review_lock_rejects_symlinked_session_root_without_writing_target(
     assert not (outside / ".review.lock").exists()
 
 
+def test_observe_rejects_symlinked_existing_preserved_target(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-symlink-target"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    _image(source, 100)
+    paths = create_or_resume_scan_session(
+        "book", "symlink-target", tmp_path / "library"
+    )
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    asset_id = scanner_module._asset_id(source.name, digest)
+    outside = tmp_path / "outside-source.jpg"
+    outside.write_bytes(source.read_bytes())
+    target = paths.sources / f"{asset_id}.jpg"
+    target.symlink_to(outside)
+
+    before = (
+        paths.session_file.read_bytes(),
+        paths.review_file.read_bytes(),
+        paths.findings_file.read_bytes(),
+    )
+    with pytest.raises(ScannerWorkflowError, match="non-symlink regular file"):
+        observe_scan_folder(paths, capture)
+
+    assert target.is_symlink()
+    assert outside.read_bytes() == source.read_bytes()
+    assert (
+        paths.session_file.read_bytes(),
+        paths.review_file.read_bytes(),
+        paths.findings_file.read_bytes(),
+    ) == before
+
+
 def test_observe_preserves_sources_and_generates_review_and_findings(
     tmp_path: Path,
 ) -> None:
@@ -517,6 +551,57 @@ def test_finalize_is_review_bound_hash_bound_and_no_replace(tmp_path: Path) -> N
 
     with pytest.raises(ScannerWorkflowError, match="already exists"):
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+
+def test_finalize_flushes_staging_and_publication_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "durable-export"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 90)
+    paths = create_or_resume_scan_session(
+        "book", "durable-export", tmp_path / "library"
+    )
+    observe_scan_folder(paths, capture)
+
+    events: list[tuple[str, str]] = []
+    original_file_fsync = scanner_module._fsync_regular_file
+    original_dir_fsync = scanner_module._fsync_directory
+    original_rename = scanner_module._rename_noreplace
+
+    def file_fsync(path: Path) -> None:
+        events.append(("file", path.name))
+        original_file_fsync(path)
+
+    def dir_fsync(path: Path) -> None:
+        kind = "staging-dir" if ".staging-" in path.name else "exports-dir"
+        events.append((kind, path.name))
+        original_dir_fsync(path)
+
+    def rename(source: Path, target: Path) -> None:
+        events.append(("rename", target.name))
+        original_rename(source, target)
+
+    monkeypatch.setattr(scanner_module, "_fsync_regular_file", file_fsync)
+    monkeypatch.setattr(scanner_module, "_fsync_directory", dir_fsync)
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", rename)
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert [name for kind, name in events if kind == "file"] == [
+        "master.pdf",
+        "searchable.pdf",
+        "text.txt",
+        "report.txt",
+        "manifest.json",
+    ]
+    last_file = max(i for i, event in enumerate(events) if event[0] == "file")
+    staging_dir = next(i for i, event in enumerate(events) if event[0] == "staging-dir")
+    rename_at = next(i for i, event in enumerate(events) if event[0] == "rename")
+    exports_dir = next(i for i, event in enumerate(events) if event[0] == "exports-dir")
+    assert last_file < staging_dir < rename_at < exports_dir
+    assert exported.export_dir.is_dir()
 
 
 def test_finalize_rejects_modified_preserved_source(tmp_path: Path) -> None:

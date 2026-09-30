@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import statistics
 from typing import Any, Iterator, Protocol
 
@@ -492,6 +493,49 @@ def _write_thumbnail(source: Path, target: Path) -> None:
             pass
 
 
+def _existing_regular_file_hash(path: Path) -> str | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"preserved source target must be a non-symlink regular file: {path.name}"
+        ) from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"preserved source target must be a non-symlink regular file: {path.name}"
+            )
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(fd)
+        if _stat_identity(before) != _stat_identity(after):
+            raise ScannerWorkflowError(
+                f"preserved source target changed while hashing: {path.name}"
+            )
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+        ):
+            raise ScannerWorkflowError(
+                f"preserved source target changed while hashing: {path.name}"
+            )
+        return digest.hexdigest()
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"preserved source target changed while hashing: {path.name}"
+        ) from exc
+    finally:
+        os.close(fd)
+
+
 def _copy_preserved(
     source: Path,
     target: Path,
@@ -500,8 +544,9 @@ def _copy_preserved(
     expected_stat: os.stat_result,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if _sha256_file(target) != expected_sha256:
+    existing_hash = _existing_regular_file_hash(target)
+    if existing_hash is not None:
+        if existing_hash != expected_sha256:
             raise ScannerWorkflowError(
                 f"preserved source collision for {target.name}"
             )
@@ -525,7 +570,8 @@ def _copy_preserved(
         try:
             os.link(temporary, target)
         except FileExistsError:
-            if _sha256_file(target) != expected_sha256:
+            existing_hash = _existing_regular_file_hash(target)
+            if existing_hash is None or existing_hash != expected_sha256:
                 raise ScannerWorkflowError(
                     f"preserved source collision for {target.name}"
                 )
@@ -1490,6 +1536,38 @@ def _canonical_json_digest(payload: dict[str, Any]) -> str:
 _RENAME_NOREPLACE = 1
 
 
+def _fsync_regular_file(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"scanner export artifact cannot be opened safely: {path.name}"
+        ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ScannerWorkflowError(
+                f"scanner export artifact is not a regular file: {path.name}"
+            )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"scanner export directory cannot be opened safely: {path}"
+        ) from exc
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _rename_noreplace(source: Path, target: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
@@ -1638,6 +1716,10 @@ def finalize_scan_session(
         }
         _atomic_write_text(manifest_path, _json_text(manifest))
 
+        for artifact in (master, searchable, text_file, report, manifest_path):
+            _fsync_regular_file(artifact)
+        _fsync_directory(staging)
+
         # Re-verify preserved inputs after all processing and before publication.
         after_sources = _verify_preserved_sources(paths, session)
         if after_sources != verified_sources:
@@ -1667,6 +1749,7 @@ def finalize_scan_session(
                 )
 
             _rename_noreplace(staging, final_dir)
+            _fsync_directory(paths.exports)
         staging = Path()
         return ScanExport(
             session_root=paths.root,
