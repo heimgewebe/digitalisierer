@@ -299,6 +299,64 @@ def test_start_rolls_back_preset_when_executable_launcher_cannot_exec(
     assert backend._session_output is None
 
 
+def test_start_refuses_rollback_after_foreign_config_mode_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    def fail_after_mode_change(*args: object, **kwargs: object) -> None:
+        config.chmod(0o644)
+        raise OSError("forced launcher failure")
+
+    monkeypatch.setattr("digitalisierer.czur.subprocess.Popen", fail_after_mode_change)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="CZUR config changed after preset; rollback refused",
+    ):
+        backend.start(output_dir)
+
+    assert config.read_bytes() != before
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["setting"]["scan_preview_capture_type"] == "mul_page"
+    assert config.stat().st_mode & 0o7777 == 0o644
+    assert backup.is_file()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 @pytest.mark.parametrize(
     ("raw_config", "message"),
     [

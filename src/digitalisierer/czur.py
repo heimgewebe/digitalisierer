@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -191,6 +192,46 @@ class CzurCaptureBackend:
                 pass
         return before
 
+    @staticmethod
+    def _config_stat_identity(
+        value: os.stat_result,
+    ) -> tuple[int, int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+            stat.S_IMODE(value.st_mode),
+        )
+
+    def _config_snapshot(
+        self,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        fd = os.open(
+            self.config_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError("CZUR config is not a regular file")
+            with os.fdopen(os.dup(fd), "rb") as handle:
+                content = handle.read()
+            after = os.fstat(fd)
+            current = self.config_path.lstat()
+            before_identity = self._config_stat_identity(before)
+            after_identity = self._config_stat_identity(after)
+            if (
+                before_identity != after_identity
+                or after_identity != self._config_stat_identity(current)
+                or not stat.S_ISREG(current.st_mode)
+            ):
+                raise OSError("CZUR config changed while being snapshotted")
+            return content, after_identity
+        finally:
+            os.close(fd)
+
     def _atomic_restore_config(self, content: bytes, mode: int) -> None:
         fd, temporary = tempfile.mkstemp(
             prefix=".config.json.digitalisierer.rollback.",
@@ -228,12 +269,13 @@ class CzurCaptureBackend:
         config_before: bytes,
         config_before_mode: int,
         config_after: bytes,
+        config_after_identity: tuple[int, int, int, int, int, int],
     ) -> list[str]:
         errors: list[str] = []
         config_restored = False
         try:
-            current = self.config_path.read_bytes()
-            if current != config_after:
+            current, current_identity = self._config_snapshot()
+            if current != config_after or current_identity != config_after_identity:
                 errors.append("CZUR config changed after preset; rollback refused")
             else:
                 self._atomic_restore_config(config_before, config_before_mode)
@@ -328,8 +370,8 @@ class CzurCaptureBackend:
         )
         backup_existed = backup.exists()
         try:
-            config_before = self.config_path.read_bytes()
-            config_before_mode = self.config_path.stat().st_mode & 0o7777
+            config_before, config_before_identity = self._config_snapshot()
+            config_before_mode = config_before_identity[-1]
         except OSError as exc:
             raise CzurAdapterError(
                 f"CZUR config cannot be snapshotted before launch: {self.config_path}"
@@ -340,7 +382,7 @@ class CzurCaptureBackend:
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.apply_curved_books_preset()
         try:
-            config_after = self.config_path.read_bytes()
+            config_after, config_after_identity = self._config_snapshot()
         except OSError as exc:
             self._session_output = None
             raise CzurAdapterError(
@@ -372,6 +414,7 @@ class CzurCaptureBackend:
                 config_before=config_before,
                 config_before_mode=config_before_mode,
                 config_after=config_after,
+                config_after_identity=config_after_identity,
             )
             suffix = (
                 "; rollback incomplete: " + "; ".join(rollback_errors)
