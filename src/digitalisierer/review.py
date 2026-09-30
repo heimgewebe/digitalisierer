@@ -63,9 +63,12 @@ def _loopback_host(host: str) -> bool:
         return False
 
 
-def _finding_index(payload: dict[str, Any]) -> dict[str, list[str]]:
+def _finding_index(
+    payload: dict[str, Any],
+) -> tuple[dict[str, list[str]], list[str]]:
     raw = payload.get("findings")
     index: dict[str, list[str]] = {}
+    session_findings: list[str] = []
     if not isinstance(raw, list):
         raise ScannerWorkflowError("scan findings must be a list")
     for finding in raw:
@@ -81,10 +84,13 @@ def _finding_index(payload: dict[str, Any]) -> dict[str, list[str]]:
         ):
             continue
         rendered = f"{kind}: {message}"
+        if not asset_ids:
+            session_findings.append(rendered)
+            continue
         for asset_id in asset_ids:
             if isinstance(asset_id, str):
                 index.setdefault(asset_id, []).append(rendered)
-    return index
+    return index, session_findings
 
 
 def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
@@ -94,7 +100,13 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
     if not isinstance(assets, list) or not isinstance(decisions, dict):
         raise ScannerWorkflowError("scan session/review state has invalid shape")
 
-    findings = _finding_index(findings_payload)
+    findings, session_findings = _finding_index(findings_payload)
+    session_findings_html = ""
+    if session_findings:
+        finding_items = "".join(
+            f"<li>{html.escape(message)}</li>" for message in session_findings
+        )
+        session_findings_html = f"""\n<section class="session-findings" aria-label="Hinweise zur Sitzung">\n  <h2>Hinweise zur Sitzung</h2>\n  <ul>{finding_items}</ul>\n</section>\n"""
     _review_asset_paths_from_session(paths, session)
     known_ids = [
         str(asset["asset_id"])
@@ -204,7 +216,7 @@ code {{ word-break: break-all; }}
   <h1>Scan-Review</h1>
   <p>{html.escape(str(session.get('project_id')))} / {html.escape(str(session.get('session_id')))} · {len(cards)} Seiten</p>
 </header>
-<main class="grid">
+{session_findings_html}<main class="grid">
 {''.join(cards)}
 </main>
 <datalist id="replacement-assets">

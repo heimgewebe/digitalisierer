@@ -98,6 +98,41 @@ def test_review_html_is_large_preview_and_escapes_source_names(tmp_path: Path) -
     assert "Original in voller Auflösung öffnen" in rendered
 
 
+def test_review_html_surfaces_session_wide_findings(tmp_path: Path) -> None:
+    capture = tmp_path / "session-finding"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color="white").save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "session-finding",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+    findings["findings"] = [
+        {
+            "kind": "session-warning",
+            "message": "<rotate> the whole session",
+            "asset_ids": [],
+            "confidence": None,
+            "evidence": ["manual"],
+        }
+    ]
+    paths.findings_file.write_text(
+        json.dumps(findings) + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = render_review_html(paths, csrf_token="token")
+
+    assert "Hinweise zur Sitzung" in rendered
+    assert "session-warning: &lt;rotate&gt; the whole session" in rendered
+    assert rendered.count("session-warning:") == 1
+
+
 def test_review_render_rejects_foreign_session_identity(tmp_path: Path) -> None:
     capture = tmp_path / "foreign-session"
     capture.mkdir()
