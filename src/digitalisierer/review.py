@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import stat
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -333,7 +334,7 @@ def _review_asset_path(
     asset_id: str,
     *,
     kind: str,
-) -> tuple[Path, str | None] | None:
+) -> tuple[Path, str] | None:
     session_payload, _, _, processing = load_review_state(paths)
     raw_assets = session_payload.get("assets")
     if not isinstance(raw_assets, list):
@@ -361,7 +362,7 @@ def _review_asset_path(
                 thumbnail,
                 thumbnail_sha256,
             ),
-            None,
+            thumbnail_sha256,
         )
 
     if kind != "source":
@@ -509,38 +510,118 @@ def build_review_server(
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             target, expected_sha256 = resolved
-            if not target.is_file():
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
             content_type = (
                 "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
             )
-            with target.open("rb") as source:
-                if kind == "source":
-                    if expected_sha256 is None:
+            try:
+                descriptor = os.open(
+                    target,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+            except FileNotFoundError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            except OSError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            with os.fdopen(descriptor, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+
+                if kind == "thumbnail":
+                    payload = source.read()
+                    after = os.fstat(source.fileno())
+                    try:
+                        current = target.lstat()
+                    except OSError:
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    before = os.fstat(source.fileno())
-                    digest = hashlib.sha256()
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                    after = os.fstat(source.fileno())
                     if (
-                        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                        not stat.S_ISREG(current.st_mode)
+                        or (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                        )
+                        != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
+                        or current.st_dev != after.st_dev
+                        or current.st_ino != after.st_ino
+                        or (
+                            current.st_size,
+                            current.st_mtime_ns,
+                        )
+                        != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
                         or not secrets.compare_digest(
-                            digest.hexdigest(),
+                            hashlib.sha256(payload).hexdigest(),
                             expected_sha256,
                         )
                     ):
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    source.seek(0)
-                content_length = os.fstat(source.fileno()).st_size
+                    self._headers(
+                        HTTPStatus.OK,
+                        content_type=content_type,
+                        content_length=len(payload),
+                    )
+                    self.wfile.write(payload)
+                    return
+
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                after = os.fstat(source.fileno())
+                try:
+                    current = target.lstat()
+                except OSError:
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    )
+                    != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                    )
+                    or current.st_dev != after.st_dev
+                    or current.st_ino != after.st_ino
+                    or (
+                        current.st_size,
+                        current.st_mtime_ns,
+                    )
+                    != (
+                        after.st_size,
+                        after.st_mtime_ns,
+                    )
+                    or not secrets.compare_digest(
+                        digest.hexdigest(),
+                        expected_sha256,
+                    )
+                ):
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                source.seek(0)
                 self._headers(
                     HTTPStatus.OK,
                     content_type=content_type,
-                    content_length=content_length,
+                    content_length=after.st_size,
                 )
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     self.wfile.write(chunk)

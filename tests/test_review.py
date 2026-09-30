@@ -73,6 +73,33 @@ def _post_review_form(
         handler_socket.close()
 
 
+def _get_review_path(review_server: object, path: str) -> bytes:
+    host_header = _review_host_header(review_server)
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                f"GET {path} HTTP/1.0\r\n"
+                f"Host: {host_header}\r\n"
+                "\r\n"
+            ).encode("ascii")
+        )
+        server = review_server.server  # type: ignore[attr-defined]
+        handler = server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), server)
+        handler_socket.close()
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        return response
+    finally:
+        client.close()
+        handler_socket.close()
+
+
 def test_review_server_supports_ipv6_loopback(tmp_path: Path) -> None:
     paths = create_or_resume_scan_session(
         "book",
@@ -467,6 +494,70 @@ def test_review_rejects_thumbnail_bytes_from_another_asset(
         render_review_html(paths, csrf_token="token")
 
 
+@pytest.mark.parametrize("replacement_kind", ["regular", "symlink"])
+def test_review_thumbnail_revalidates_opened_descriptor_after_path_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    capture = tmp_path / f"thumbnail-open-race-{replacement_kind}"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color=(80, 80, 80)).save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        f"thumbnail-open-race-{replacement_kind}",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    replacement = tmp_path / "unverified-thumbnail.jpg"
+    replacement.write_bytes(b"unverified-thumbnail-bytes")
+
+    original_resolver = review_module._review_asset_path
+    raced = False
+
+    def replace_after_resolution(
+        scan_paths: ScanSessionPaths,
+        requested_asset_id: str,
+        *,
+        kind: str,
+    ) -> tuple[Path, str] | None:
+        nonlocal raced
+        resolved = original_resolver(
+            scan_paths,
+            requested_asset_id,
+            kind=kind,
+        )
+        if (
+            resolved is not None
+            and kind == "thumbnail"
+            and requested_asset_id == asset_id
+            and not raced
+        ):
+            raced = True
+            target, expected_sha256 = resolved
+            target.unlink()
+            if replacement_kind == "regular":
+                target.write_bytes(replacement.read_bytes())
+            else:
+                target.symlink_to(replacement)
+            return target, expected_sha256
+        return resolved
+
+    monkeypatch.setattr(review_module, "_review_asset_path", replace_after_resolution)
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _get_review_path(review_server, f"/thumbnail/{asset_id}")
+        assert raced is True
+        assert b" 500 " in response.splitlines()[0]
+        assert b"unverified-thumbnail-bytes" not in response
+    finally:
+        review_server.server.server_close()
+
+
 def test_review_rejects_thumbnail_symlink_to_another_asset(
     tmp_path: Path,
 ) -> None:
@@ -554,10 +645,14 @@ def test_review_rejects_invalid_source_name_instead_of_hiding_asset(
     session["assets"][0]["source_name"] = None
     paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
 
-    assert len(load_processing_session(paths).items) == 1
     with pytest.raises(
         ScannerWorkflowError,
-        match="source_name is invalid for review",
+        match="asset source_name is invalid",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="asset source_name is invalid",
     ):
         render_review_html(paths, csrf_token="token")
 

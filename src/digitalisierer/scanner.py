@@ -168,6 +168,124 @@ def _validate_findings_payload(findings: dict[str, Any]) -> None:
             raise ScannerWorkflowError("scan finding entry has invalid shape")
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _validate_scan_asset_record(
+    record: dict[str, Any],
+) -> tuple[str, str, str]:
+    asset_id = record.get("asset_id")
+    source_name = record.get("source_name")
+    capture_source = record.get("capture_source")
+    sha256 = record.get("sha256")
+    byte_count = record.get("bytes")
+    preserved = record.get("preserved_path")
+    thumbnail = record.get("thumbnail_path")
+    thumbnail_sha256 = record.get("thumbnail_sha256")
+    image = record.get("image")
+
+    if not isinstance(asset_id, str) or not asset_id:
+        raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+    if (
+        not isinstance(source_name, str)
+        or not source_name
+        or Path(source_name).name != source_name
+        or Path(source_name).suffix.lower() not in IMAGE_SUFFIXES
+    ):
+        raise ScannerWorkflowError(
+            f"scan asset source_name is invalid for {asset_id}"
+        )
+    if not isinstance(capture_source, str) or not capture_source:
+        raise ScannerWorkflowError(
+            f"scan asset capture_source is invalid for {asset_id}"
+        )
+    if not _is_sha256(sha256):
+        raise ScannerWorkflowError(
+            f"scan asset source digest is invalid for {asset_id}"
+        )
+    if (
+        isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count <= 0
+    ):
+        raise ScannerWorkflowError(
+            f"scan asset byte count is invalid for {asset_id}"
+        )
+    if not isinstance(preserved, str) or not preserved:
+        raise ScannerWorkflowError(
+            f"scan asset preserved path is invalid for {asset_id}"
+        )
+    if thumbnail != f"thumbnails/{asset_id}.jpg":
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is not canonical for {asset_id}"
+        )
+    if not _is_sha256(thumbnail_sha256):
+        raise ScannerWorkflowError(
+            f"scan thumbnail digest is invalid for {asset_id}"
+        )
+    if not isinstance(image, dict):
+        raise ScannerWorkflowError(
+            f"scan asset image metadata is invalid for {asset_id}"
+        )
+
+    width = image.get("width")
+    height = image.get("height")
+    dpi = image.get("dpi")
+    mean = image.get("mean")
+    stddev = image.get("stddev")
+    dark_ratio = image.get("dark_ratio")
+    average_hash = image.get("average_hash")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+        or not isinstance(dpi, list)
+        or len(dpi) != 2
+        or any(not _is_finite_number(value) or float(value) < 0.0 for value in dpi)
+        or not _is_finite_number(mean)
+        or not _is_finite_number(stddev)
+        or not _is_finite_number(dark_ratio)
+        or not isinstance(average_hash, str)
+        or len(average_hash) != 256
+        or any(character not in "0123456789abcdef" for character in average_hash)
+    ):
+        raise ScannerWorkflowError(
+            f"scan asset image metadata is invalid for {asset_id}"
+        )
+    assert isinstance(mean, (int, float)) and not isinstance(mean, bool)
+    assert isinstance(stddev, (int, float)) and not isinstance(stddev, bool)
+    assert isinstance(dark_ratio, (int, float)) and not isinstance(dark_ratio, bool)
+    if (
+        not 0.0 <= float(mean) <= 255.0
+        or float(stddev) < 0.0
+        or not 0.0 <= float(dark_ratio) <= 1.0
+    ):
+        raise ScannerWorkflowError(
+            f"scan asset image metadata is invalid for {asset_id}"
+        )
+
+    assert isinstance(sha256, str)
+    assert isinstance(preserved, str)
+    return asset_id, sha256, preserved
+
+
 def _json_text(payload: object) -> str:
     return json.dumps(
         payload,
@@ -906,6 +1024,7 @@ def _observe_scan_folder_unlocked(
     for item in raw_assets:
         if not isinstance(item, dict):
             raise ScannerWorkflowError("scan asset record must be an object")
+        _validate_scan_asset_record(item)
         assets.append(dict(item))
     known_by_id = {
         str(item.get("asset_id")): item
@@ -1307,15 +1426,7 @@ def _processing_session_from_payload(
     for raw in raw_assets:
         if not isinstance(raw, dict):
             raise ScannerWorkflowError("scan asset record must be an object")
-        asset_id = raw.get("asset_id")
-        sha256 = raw.get("sha256")
-        preserved = raw.get("preserved_path")
-        if (
-            not isinstance(asset_id, str)
-            or not isinstance(sha256, str)
-            or not isinstance(preserved, str)
-        ):
-            raise ScannerWorkflowError("scan asset identity is incomplete")
+        asset_id, sha256, preserved = _validate_scan_asset_record(raw)
         decision = raw_review.get(asset_id)
         if not isinstance(decision, dict):
             raise ScannerWorkflowError(f"review state missing for {asset_id}")

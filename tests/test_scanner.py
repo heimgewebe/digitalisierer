@@ -2314,6 +2314,70 @@ def test_resume_rejects_logically_inconsistent_metadata_before_ready(
 
 
 @pytest.mark.parametrize(
+    ("field_path", "bad_value", "message"),
+    [
+        ("source_name", None, "asset source_name is invalid"),
+        ("capture_source", "", "asset capture_source is invalid"),
+        ("sha256", "0" * 63, "source digest is invalid"),
+        ("bytes", 0, "byte count is invalid"),
+        ("thumbnail_path", "thumbnails/wrong.jpg", "thumbnail path is not canonical"),
+        ("thumbnail_sha256", "0" * 63, "thumbnail digest is invalid"),
+        ("image", None, "image metadata is invalid"),
+        ("image.width", 0, "image metadata is invalid"),
+        ("image.stddev", "bad", "image metadata is invalid"),
+        ("image.average_hash", "0" * 255, "image metadata is invalid"),
+    ],
+)
+def test_resume_and_observe_reject_incomplete_persisted_asset_records(
+    tmp_path: Path,
+    field_path: str,
+    bad_value: object,
+    message: str,
+) -> None:
+    capture = tmp_path / f"invalid-asset-{field_path.replace('.', '-')}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    library = tmp_path / "library"
+    session_id = f"invalid-asset-{field_path.replace('.', '-')}"
+    paths = create_or_resume_scan_session("book", session_id, library)
+    observe_scan_folder(paths, capture)
+
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    if field_path.startswith("image."):
+        image_field = field_path.split(".", 1)[1]
+        asset["image"][image_field] = bad_value
+    else:
+        asset[field_path] = bad_value
+    paths.session_file.write_text(json.dumps(session) + "\n", encoding="utf-8")
+
+    metadata_before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    sources_before = {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    }
+    thumbnails_before = {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    }
+
+    with pytest.raises(ScannerWorkflowError, match=message):
+        create_or_resume_scan_session("book", session_id, library)
+    with pytest.raises(ScannerWorkflowError, match=message):
+        observe_scan_folder(paths, capture)
+
+    assert {path: path.read_bytes() for path in metadata_before} == metadata_before
+    assert {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    } == sources_before
+    assert {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    } == thumbnails_before
+
+
+@pytest.mark.parametrize(
     ("missing_name", "preserved_name"),
     [
         ("review_file", "findings_file"),
