@@ -2143,6 +2143,76 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
 
 
 @pytest.mark.parametrize(
+    ("metadata_name", "content", "message"),
+    [
+        ("review_file", "{broken\n", "scanner session JSON is invalid"),
+        ("findings_file", "{broken\n", "scanner session JSON is invalid"),
+        (
+            "review_file",
+            json.dumps(
+                {
+                    "schema_version": 999,
+                    "kind": "digitalisierer.scan-review",
+                    "items": {},
+                }
+            )
+            + "\n",
+            "scan review metadata contract is incompatible",
+        ),
+        (
+            "findings_file",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "foreign.scan-findings",
+                    "findings": [],
+                }
+            )
+            + "\n",
+            "scan findings metadata contract is incompatible",
+        ),
+    ],
+)
+def test_resume_validates_existing_metadata_before_reporting_ready(
+    tmp_path: Path,
+    metadata_name: str,
+    content: str,
+    message: str,
+) -> None:
+    capture = tmp_path / f"invalid-{metadata_name}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", metadata_name, library)
+    observe_scan_folder(paths, capture)
+
+    target = getattr(paths, metadata_name)
+    target.write_text(content, encoding="utf-8")
+    session_before = paths.session_file.read_bytes()
+    review_before = paths.review_file.read_bytes()
+    findings_before = paths.findings_file.read_bytes()
+    sources_before = {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    }
+    thumbnails_before = {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    }
+
+    with pytest.raises(ScannerWorkflowError, match=message):
+        create_or_resume_scan_session("book", metadata_name, library)
+
+    assert paths.session_file.read_bytes() == session_before
+    assert paths.review_file.read_bytes() == review_before
+    assert paths.findings_file.read_bytes() == findings_before
+    assert {
+        path.name: path.read_bytes() for path in paths.sources.iterdir()
+    } == sources_before
+    assert {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    } == thumbnails_before
+
+
+@pytest.mark.parametrize(
     ("missing_name", "preserved_name"),
     [
         ("review_file", "findings_file"),

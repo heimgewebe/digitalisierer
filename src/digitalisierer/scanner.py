@@ -428,6 +428,13 @@ def create_or_resume_scan_session(
                 + ", ".join(missing_metadata)
             )
 
+    for metadata_path, validator in (
+        (paths.review_file, _validate_review_payload),
+        (paths.findings_file, _validate_findings_payload),
+    ):
+        if metadata_path.exists():
+            validator(_load_json(metadata_path))
+
     for directory, expected_name in (
         (paths.sources, "sources"),
         (paths.thumbnails, "thumbnails"),
