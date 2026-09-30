@@ -1135,6 +1135,49 @@ def test_default_pdf_builder_streams_to_img2pdf_output(
 
     assert output.read_bytes() == b"streamed-pdf"
 
+def test_observe_flushes_artifact_directories_before_dependent_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "durable-observe"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "durable-observe",
+        tmp_path / "library",
+    )
+
+    events: list[tuple[str, str]] = []
+    original_dir_fsync = scanner_module._fsync_directory
+    original_atomic_write = scanner_module._atomic_write_text
+
+    def dir_fsync(path: Path) -> None:
+        events.append(("dir", path.name))
+        original_dir_fsync(path)
+
+    def metadata_write(path: Path, content: str) -> None:
+        events.append(("metadata", path.name))
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_fsync_directory", dir_fsync)
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", metadata_write)
+
+    observed = observe_scan_folder(paths, capture)
+
+    assert len(observed.imported_asset_ids) == 1
+    sources_fsync = events.index(("dir", "sources"))
+    thumbnails_fsync = events.index(("dir", "thumbnails"))
+    first_metadata = min(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "metadata"
+        and event[1] in {"review.json", "findings.json", "session.json"}
+    )
+    assert sources_fsync < first_metadata
+    assert thumbnails_fsync < first_metadata
+
+
 def test_observe_findings_failure_does_not_publish_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

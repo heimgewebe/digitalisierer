@@ -1120,6 +1120,14 @@ def _observe_scan_folder_unlocked(
             _write_thumbnail(preserved, thumbnail)
             record["thumbnail_sha256"] = _sha256_file(thumbnail)
 
+        # Dependent metadata must not become durable before the artifact
+        # directory entries it references. New imports publish both preserved
+        # sources and thumbnails; repairs can publish a replacement thumbnail.
+        if imported:
+            _fsync_directory(paths.sources)
+        if imported or pending_thumbnail_repairs:
+            _fsync_directory(paths.thumbnails)
+
         # review/findings depend on the prospective session.json asset set.
         # Keep repaired thumbnails and the final session commit in the same
         # rollback boundary so any reported observation failure restores the
