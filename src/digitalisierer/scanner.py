@@ -200,21 +200,32 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
         raise ScannerWorkflowError(
             f"scanner session is not initialized: {paths.root}"
         )
-    lock_path = paths.root / REVIEW_LOCK_FILE
-    descriptor = os.open(
-        lock_path,
-        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
+    root = _validate_session_root(paths)
     try:
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
+        root_descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError("scan session root is invalid") from exc
+    try:
+        descriptor = os.open(
+            REVIEW_LOCK_FILE,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
         finally:
-            os.close(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(root_descriptor)
 
 
 def _load_json(path: Path) -> dict[str, Any]:

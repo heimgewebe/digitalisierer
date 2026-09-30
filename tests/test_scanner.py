@@ -97,6 +97,24 @@ def test_init_rejects_symlinked_session_root_before_writing(tmp_path: Path) -> N
     assert list(outside.iterdir()) == []
 
 
+def test_review_lock_rejects_symlinked_session_root_without_writing_target(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", "symlink-review-lock", library)
+    outside = tmp_path / "outside-session-root"
+    paths.root.rename(outside)
+    paths.root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scan session root must not be a symlink",
+    ):
+        load_processing_session(paths)
+
+    assert not (outside / ".review.lock").exists()
+
+
 def test_observe_preserves_sources_and_generates_review_and_findings(
     tmp_path: Path,
 ) -> None:
