@@ -233,12 +233,56 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
         os.close(root_descriptor)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _stable_file_bytes(path: Path) -> bytes:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
     except FileNotFoundError as exc:
         raise ScannerWorkflowError(f"scanner session file is missing: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"scanner session file must be a non-symlink regular file: {path}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"scanner session file must be a non-symlink regular file: {path}"
+            )
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            raw = handle.read()
+        after = os.fstat(descriptor)
+        if _stat_identity(before) != _stat_identity(after):
+            raise ScannerWorkflowError(
+                f"scanner session file changed while reading: {path}"
+            )
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scanner session file changed while reading: {path}"
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+        ):
+            raise ScannerWorkflowError(
+                f"scanner session file changed while reading: {path}"
+            )
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    raw = _stable_file_bytes(path)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ScannerWorkflowError(f"scanner session JSON is invalid: {path}") from exc
     if not isinstance(value, dict):
         raise ScannerWorkflowError(f"scanner session JSON must be an object: {path}")
@@ -899,16 +943,26 @@ def _observe_scan_folder_unlocked(
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
     try:
-        previous_session_text = paths.session_file.read_text(encoding="utf-8")
-        previous_review_text = paths.review_file.read_text(encoding="utf-8")
-        previous_findings_text = paths.findings_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+        previous_session_text = _stable_file_bytes(paths.session_file).decode("utf-8")
+        previous_review_text = _stable_file_bytes(paths.review_file).decode("utf-8")
+        previous_findings_text = _stable_file_bytes(paths.findings_file).decode("utf-8")
+    except UnicodeError as exc:
         raise ScannerWorkflowError(
             "scan metadata cannot be snapshotted before observation"
         ) from exc
     review_items = review.get("items")
     if not isinstance(review_items, dict):
         raise ScannerWorkflowError("scan review items must be an object")
+    missing_review_ids = sorted(
+        asset_id
+        for asset_id in known_by_id
+        if not isinstance(review_items.get(asset_id), dict)
+    )
+    if missing_review_ids:
+        raise ScannerWorkflowError(
+            "scan review is missing a decision for existing asset(s): "
+            + ", ".join(missing_review_ids)
+        )
 
     existing_sequences: list[int] = []
     for decision in review_items.values():
@@ -943,13 +997,6 @@ def _observe_scan_folder_unlocked(
             )
             if pending_repair is not None:
                 pending_thumbnail_repairs.append(pending_repair)
-            if not isinstance(review_items.get(asset_id), dict):
-                review_items[asset_id] = {
-                    "sequence": next_sequence,
-                    "included": True,
-                    "replacement_for": None,
-                }
-                next_sequence += 1
             skipped.append(asset_id)
             continue
 
@@ -1161,14 +1208,7 @@ def observe_scan_folder(
 
 
 def _stable_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
-    try:
-        before = path.stat()
-        raw = path.read_bytes()
-        after = path.stat()
-    except FileNotFoundError as exc:
-        raise ScannerWorkflowError(f"scanner session file is missing: {path}") from exc
-    if _stat_identity(before) != _stat_identity(after):
-        raise ScannerWorkflowError(f"scanner session file changed while reading: {path}")
+    raw = _stable_file_bytes(path)
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

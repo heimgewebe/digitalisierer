@@ -664,7 +664,7 @@ def test_finalize_uses_one_review_snapshot_when_review_changes_during_ocr(
     assert current_review["items"][first]["included"] is False
     assert list(paths.exports.iterdir()) == []
 
-def test_observe_resume_repairs_known_asset_missing_review_state(
+def test_observe_resume_rejects_known_asset_missing_review_state(
     tmp_path: Path,
 ) -> None:
     capture = tmp_path / "capture"
@@ -673,6 +673,7 @@ def test_observe_resume_repairs_known_asset_missing_review_state(
     paths = create_or_resume_scan_session("book", "chapter", tmp_path / "library")
     first = observe_scan_folder(paths, capture)
     asset_id = first.imported_asset_ids[0]
+    update_review_item(paths, asset_id, included=False)
 
     review = json.loads(paths.review_file.read_text(encoding="utf-8"))
     review["items"].pop(asset_id)
@@ -680,13 +681,22 @@ def test_observe_resume_repairs_known_asset_missing_review_state(
         json.dumps(review, indent=2) + "\n",
         encoding="utf-8",
     )
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
 
-    resumed = observe_scan_folder(paths, capture)
-    processing = load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="missing a decision for existing asset",
+    ):
+        observe_scan_folder(paths, capture)
 
-    assert resumed.imported_asset_ids == ()
-    assert resumed.skipped_asset_ids == (asset_id,)
-    assert [asset.asset_id for asset in processing.ordered_assets()] == [asset_id]
+    assert {path: path.read_bytes() for path in before} == before
+    assert asset_id not in json.loads(
+        paths.review_file.read_text(encoding="utf-8")
+    )["items"]
 
 
 def test_observe_is_recoverable_if_session_write_fails_after_review(
@@ -1702,6 +1712,44 @@ def test_finalize_rejects_symlinked_exports_before_staging(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "metadata_name",
+    ["session_file", "review_file", "findings_file"],
+)
+def test_processing_rejects_symlinked_metadata_snapshot(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    capture = tmp_path / f"capture-metadata-symlink-{metadata_name}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        f"metadata-symlink-{metadata_name}",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    metadata = getattr(paths, metadata_name)
+    outside = tmp_path / f"outside-{metadata_name}.json"
+    outside.write_bytes(metadata.read_bytes())
+    metadata.unlink()
+    metadata.symlink_to(outside)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        load_processing_session(paths)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert metadata.is_symlink()
+    assert list(paths.exports.iterdir()) == []
 
 
 def test_processing_rejects_symlinked_sources_directory_alias(
