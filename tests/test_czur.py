@@ -247,6 +247,58 @@ def test_start_rejects_unusable_launcher_before_side_effects(
     assert backend._session_output is None
 
 
+def test_start_rolls_back_preset_when_executable_launcher_cannot_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text(
+        "#!/definitely/missing/digitalisierer-interpreter\nexit 0\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    before = config.read_bytes()
+    before_mode = config.stat().st_mode & 0o7777
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    assert backend._launcher_ready() is True
+    with pytest.raises(CzurAdapterError, match="cannot execute CZUR launcher"):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert config.stat().st_mode & 0o7777 == before_mode
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 @pytest.mark.parametrize(
     ("raw_config", "message"),
     [

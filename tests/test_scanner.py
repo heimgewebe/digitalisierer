@@ -2044,10 +2044,27 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     asset = session["assets"][0]
     preserved = paths.root / asset["preserved_path"]
     thumbnail = paths.root / asset["thumbnail_path"]
-    preserved.write_bytes(b"corrupted-preserved-copy")
+    preserved.unlink()
     thumbnail.unlink()
 
-    resumed = observe_scan_folder(paths, capture)
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source must be a regular file",
+    ):
+        create_or_resume_scan_session(
+            "book",
+            "resume-repair",
+            tmp_path / "library",
+        )
+
+    resumed_paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair",
+        tmp_path / "library",
+        repairable_capture_sources=frozenset({str(source.resolve())}),
+    )
+    assert resumed_paths == paths
+    resumed = observe_scan_folder(resumed_paths, capture)
 
     assert resumed.imported_asset_ids == ()
     assert resumed.skipped_asset_ids == (asset_id,)
@@ -2056,6 +2073,40 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     assert hashlib.sha256(preserved.read_bytes()).hexdigest() == repaired["sha256"]
     assert thumbnail.is_file()
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+
+
+def test_observe_resume_does_not_allow_missing_source_outside_selected_range(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "resume-repair-range"
+    capture.mkdir()
+    first_source = capture / "image00001.jpg"
+    second_source = capture / "image00002.jpg"
+    _image(first_source, 90)
+    _image(second_source, 150)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-range",
+        library,
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    missing = paths.root / session["assets"][1]["preserved_path"]
+    missing.unlink()
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="preserved scanner source must be a regular file",
+    ):
+        create_or_resume_scan_session(
+            "book",
+            "resume-repair-range",
+            library,
+            repairable_capture_sources=frozenset({str(first_source.resolve())}),
+        )
+
+    assert not missing.exists()
 
 
 @pytest.mark.parametrize("thumbnail_existed", [True, False])

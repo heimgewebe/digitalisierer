@@ -500,6 +500,8 @@ def create_or_resume_scan_session(
     project_id: str,
     session_id: str,
     library_root: Path | None = None,
+    *,
+    repairable_capture_sources: frozenset[str] = frozenset(),
 ) -> ScanSessionPaths:
     paths = scan_session_paths(project_id, session_id, library_root)
     paths.root.parent.mkdir(parents=True, exist_ok=True)
@@ -594,7 +596,12 @@ def create_or_resume_scan_session(
     _validate_review_payload(review)
     findings = _load_json(paths.findings_file)
     _validate_findings_payload(findings)
-    processing = _processing_session_from_payload(paths, session, review)
+    processing = _processing_session_from_payload(
+        paths,
+        session,
+        review,
+        repairable_capture_sources=repairable_capture_sources,
+    )
     _validate_findings_asset_ids(processing, findings)
     return paths
 
@@ -1365,6 +1372,8 @@ def _preserved_source_path(
     paths: ScanSessionPaths,
     asset_id: str,
     relative: str,
+    *,
+    require_exists: bool = True,
 ) -> Path:
     relative_path = Path(relative)
     if (
@@ -1381,28 +1390,50 @@ def _preserved_source_path(
     try:
         root = paths.root.resolve(strict=True)
         sources_root = paths.sources.resolve(strict=True)
-        candidate = (paths.root / relative_path).resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ScannerWorkflowError(
             f"preserved scanner source path is invalid: {relative}"
         ) from exc
-    if not sources_root.is_dir() or sources_root.parent != root:
-        raise ScannerWorkflowError("scanner sources directory escaped session root")
-    try:
-        candidate.relative_to(sources_root)
-    except ValueError as exc:
-        raise ScannerWorkflowError(
-            f"preserved scanner source path is outside session sources: {relative}"
-        ) from exc
     if (
-        suffix not in IMAGE_SUFFIXES
-        or relative_path != expected_relative
-        or candidate != sources_root / f"{asset_id}{suffix}"
+        paths.sources.is_symlink()
+        or not sources_root.is_dir()
+        or sources_root.parent != root
     ):
+        raise ScannerWorkflowError("scanner sources directory escaped session root")
+
+    candidate = sources_root / f"{asset_id}{suffix}"
+    lexical_candidate = paths.root / relative_path
+    if os.path.lexists(lexical_candidate):
+        try:
+            current = lexical_candidate.lstat()
+            resolved = lexical_candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ScannerWorkflowError(
+                f"preserved scanner source path is invalid: {relative}"
+            ) from exc
+        try:
+            resolved.relative_to(sources_root)
+        except ValueError as exc:
+            raise ScannerWorkflowError(
+                f"preserved scanner source path is outside session sources: {relative}"
+            ) from exc
+        if (
+            suffix not in IMAGE_SUFFIXES
+            or relative_path != expected_relative
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or resolved != candidate
+        ):
+            raise ScannerWorkflowError(
+                f"preserved scanner source path is not canonical for {asset_id}"
+            )
+        return candidate
+
+    if suffix not in IMAGE_SUFFIXES or relative_path != expected_relative:
         raise ScannerWorkflowError(
             f"preserved scanner source path is not canonical for {asset_id}"
         )
-    if not candidate.is_file():
+    if require_exists:
         raise ScannerWorkflowError(
             f"preserved scanner source must be a regular file: {relative}"
         )
@@ -1413,6 +1444,8 @@ def _processing_session_from_payload(
     paths: ScanSessionPaths,
     session: dict[str, Any],
     review: dict[str, Any],
+    *,
+    repairable_capture_sources: frozenset[str] = frozenset(),
 ) -> ProcessingSession:
     _validate_session_identity(paths, session)
     _validate_session_storage_directory(paths, paths.sources, "sources")
@@ -1427,6 +1460,14 @@ def _processing_session_from_payload(
         if not isinstance(raw, dict):
             raise ScannerWorkflowError("scan asset record must be an object")
         asset_id, sha256, preserved = _validate_scan_asset_record(raw)
+        capture_source = raw["capture_source"]
+        assert isinstance(capture_source, str)
+        capture_path = Path(capture_source)
+        source_is_repairable = (
+            capture_source in repairable_capture_sources
+            and not capture_path.is_symlink()
+            and capture_path.is_file()
+        )
         decision = raw_review.get(asset_id)
         if not isinstance(decision, dict):
             raise ScannerWorkflowError(f"review state missing for {asset_id}")
@@ -1445,7 +1486,12 @@ def _processing_session_from_payload(
             SessionAsset(
                 MediaAsset(
                     asset_id=asset_id,
-                    path=_preserved_source_path(paths, asset_id, preserved),
+                    path=_preserved_source_path(
+                        paths,
+                        asset_id,
+                        preserved,
+                        require_exists=not source_is_repairable,
+                    ),
                     kind=MediaKind.DOCUMENT_IMAGE,
                     sha256=sha256,
                 ),

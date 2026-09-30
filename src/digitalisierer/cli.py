@@ -18,6 +18,7 @@ from .scanner import (
     ScannerWorkflowError,
     create_or_resume_scan_session,
     finalize_scan_session,
+    image_files,
     load_processing_session,
     observe_scan_folder,
     scan_session_paths,
@@ -328,18 +329,28 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.scan_command == "observe":
+                if args.start < 1:
+                    raise ValueError("start must be at least 1")
+                if args.limit is not None and args.limit < 1:
+                    raise ValueError("limit must be at least 1")
+                capture_backend = CzurCaptureBackend()
+                source = (
+                    args.source.expanduser().resolve(strict=True)
+                    if args.source is not None
+                    else capture_backend.newest_scan_folder()
+                )
+                selected_sources = image_files(source)[args.start - 1 :]
+                if args.limit is not None:
+                    selected_sources = selected_sources[: args.limit]
                 paths = create_or_resume_scan_session(
                     args.project,
                     args.session,
                     args.library_root.expanduser()
                     if args.library_root is not None
                     else None,
-                )
-                capture_backend = CzurCaptureBackend()
-                source = (
-                    args.source.expanduser().resolve(strict=True)
-                    if args.source is not None
-                    else capture_backend.newest_scan_folder()
+                    repairable_capture_sources=frozenset(
+                        str(path) for path in selected_sources
+                    ),
                 )
                 observed = observe_scan_folder(
                     paths,
@@ -347,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
                     start=args.start,
                     limit=args.limit,
                 )
+                load_processing_session(paths)
                 print(
                     json.dumps(
                         {

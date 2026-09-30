@@ -191,6 +191,80 @@ class CzurCaptureBackend:
                 pass
         return before
 
+    def _atomic_restore_config(self, content: bytes, mode: int) -> None:
+        fd, temporary = tempfile.mkstemp(
+            prefix=".config.json.digitalisierer.rollback.",
+            dir=str(self.config_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, self.config_path)
+            directory_fd = os.open(
+                self.config_path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _rollback_failed_prelaunch(
+        self,
+        *,
+        output_dir: Path,
+        output_existed: bool,
+        capture_root_existed: bool,
+        backup: Path,
+        backup_existed: bool,
+        config_before: bytes,
+        config_before_mode: int,
+        config_after: bytes,
+    ) -> list[str]:
+        errors: list[str] = []
+        config_restored = False
+        try:
+            current = self.config_path.read_bytes()
+            if current != config_after:
+                errors.append("CZUR config changed after preset; rollback refused")
+            else:
+                self._atomic_restore_config(config_before, config_before_mode)
+                config_restored = True
+        except OSError as exc:
+            errors.append(f"CZUR config rollback failed: {exc}")
+
+        if not backup_existed and backup.exists():
+            try:
+                if config_restored and backup.is_file() and backup.read_bytes() == config_before:
+                    backup.unlink()
+                else:
+                    errors.append("CZUR backup rollback refused")
+            except OSError as exc:
+                errors.append(f"CZUR backup rollback failed: {exc}")
+
+        for path, existed, label in (
+            (output_dir, output_existed, "session output"),
+            (self.capture_root, capture_root_existed, "capture root"),
+        ):
+            if existed:
+                continue
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                errors.append(f"{label} rollback failed: {exc}")
+        self._session_output = None
+        return errors
+
     def _visible_windows(self) -> list[str]:
         try:
             completed = subprocess.run(
@@ -246,10 +320,32 @@ class CzurCaptureBackend:
     def start(self, output_dir: Path) -> None:
         windows = self._start_preflight()
 
-        self._session_output = output_dir.expanduser()
+        session_output = output_dir.expanduser()
+        output_existed = session_output.exists()
+        capture_root_existed = self.capture_root.exists()
+        backup = self.config_path.with_name(
+            "config.pre-digitalisierer-curved-books.json"
+        )
+        backup_existed = backup.exists()
+        try:
+            config_before = self.config_path.read_bytes()
+            config_before_mode = self.config_path.stat().st_mode & 0o7777
+        except OSError as exc:
+            raise CzurAdapterError(
+                f"CZUR config cannot be snapshotted before launch: {self.config_path}"
+            ) from exc
+
+        self._session_output = session_output
         self._session_output.mkdir(parents=True, exist_ok=True)
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.apply_curved_books_preset()
+        try:
+            config_after = self.config_path.read_bytes()
+        except OSError as exc:
+            self._session_output = None
+            raise CzurAdapterError(
+                f"CZUR config cannot be verified after preset: {self.config_path}"
+            ) from exc
 
         if windows:
             self._focus(windows[-1])
@@ -258,13 +354,33 @@ class CzurCaptureBackend:
 
         if not self._launcher_ready():
             raise CzurAdapterError(f"CZUR launcher is not executable: {self.launcher}")
-        subprocess.Popen(
-            [str(self.launcher)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        try:
+            subprocess.Popen(
+                [str(self.launcher)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            rollback_errors = self._rollback_failed_prelaunch(
+                output_dir=session_output,
+                output_existed=output_existed,
+                capture_root_existed=capture_root_existed,
+                backup=backup,
+                backup_existed=backup_existed,
+                config_before=config_before,
+                config_before_mode=config_before_mode,
+                config_after=config_after,
+            )
+            suffix = (
+                "; rollback incomplete: " + "; ".join(rollback_errors)
+                if rollback_errors
+                else ""
+            )
+            raise CzurAdapterError(
+                f"cannot execute CZUR launcher: {self.launcher}{suffix}"
+            ) from exc
         deadline = time.monotonic() + 12.0
         while time.monotonic() < deadline:
             windows = self._visible_windows()

@@ -1,11 +1,14 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from digitalisierer import cli
 from digitalisierer.domain import ExportArtifact
+from digitalisierer.scanner import scan_session_paths
 from digitalisierer.transcription import TranscriptionExport, default_output_dir
 
 
@@ -235,6 +238,79 @@ def test_default_output_dir_uses_standard_library_layout(tmp_path: Path) -> None
         / "sessions"
         / f"My-Recording--{source_sha256[:12]}"
     )
+
+def test_scan_observe_opts_into_repairable_missing_preserved_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "capture"
+    source.mkdir()
+    selected = source / "page.jpg"
+    selected.write_bytes(b"synthetic-image")
+    library = tmp_path / "library"
+    observed_repairable_sources: list[frozenset[str]] = []
+    validation_events: list[tuple[str, Any]] = []
+
+    def fake_create_or_resume(
+        project_id: str,
+        session_id: str,
+        library_root: Path | None = None,
+        *,
+        repairable_capture_sources: frozenset[str] = frozenset(),
+    ) -> Any:
+        observed_repairable_sources.append(repairable_capture_sources)
+        return scan_session_paths(project_id, session_id, library_root)
+
+    def fake_observe(
+        paths: Any,
+        folder: Path,
+        *,
+        start: int = 1,
+        limit: int | None = None,
+    ) -> Any:
+        assert folder == source.resolve()
+        assert start == 1
+        assert limit is None
+        return SimpleNamespace(
+            session_root=paths.root,
+            imported_asset_ids=(),
+            skipped_asset_ids=(),
+            findings=(),
+        )
+
+    def fake_load_processing_session(paths: Any) -> Any:
+        validation_events.append(("strict", paths))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "create_or_resume_scan_session", fake_create_or_resume)
+    monkeypatch.setattr(cli, "observe_scan_folder", fake_observe)
+    monkeypatch.setattr(cli, "load_processing_session", fake_load_processing_session)
+    monkeypatch.setattr(cli, "CzurCaptureBackend", lambda: object())
+
+    assert cli.main(
+        [
+            "scan",
+            "observe",
+            "--project",
+            "book",
+            "--session",
+            "chapter",
+            "--library-root",
+            str(library),
+            "--source",
+            str(source),
+        ]
+    ) == 0
+    assert observed_repairable_sources == [
+        frozenset({str(selected.resolve())})
+    ]
+    assert validation_events == [
+        ("strict", scan_session_paths("book", "chapter", library))
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source_folder"] == str(source.resolve())
+
 
 def test_invalid_scanner_jobs_env_does_not_break_unrelated_commands(
     monkeypatch: pytest.MonkeyPatch,
