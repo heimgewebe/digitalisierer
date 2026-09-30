@@ -35,6 +35,10 @@ class ScannerWorkflowError(RuntimeError):
     """Raised when a scanner session cannot be ingested or finalized safely."""
 
 
+class ScannerReviewConflict(ScannerWorkflowError):
+    """Raised when a review form no longer describes the current decision."""
+
+
 class ImageDependencyError(ScannerWorkflowError):
     """Raised when Pillow/img2pdf are unavailable for scanner work."""
 
@@ -1304,6 +1308,16 @@ def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
 _UNSET = object()
 
 
+def review_item_snapshot(asset_id: str, decision: dict[str, Any]) -> str:
+    """Bind a form to its complete asset decision, not unrelated session edits."""
+    payload = json.dumps(
+        {"asset_id": asset_id, "decision": decision},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _update_review_item_unlocked(
     paths: ScanSessionPaths,
     asset_id: str,
@@ -1311,11 +1325,18 @@ def _update_review_item_unlocked(
     included: bool | None = None,
     sequence: int | None | object = _UNSET,
     replacement_for: str | None | object = _UNSET,
+    expected_snapshot: str | None = None,
 ) -> ProcessingSession:
     _, review, _, _ = _load_review_state_unlocked(paths)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
+    if expected_snapshot is not None and not secrets.compare_digest(
+        expected_snapshot, review_item_snapshot(asset_id, items[asset_id])
+    ):
+        raise ScannerReviewConflict(
+            "review decision changed since this form was rendered; reload and retry"
+        )
     updated = json.loads(json.dumps(review))
     updated_items = updated["items"]
     decision = updated_items[asset_id]
@@ -1349,6 +1370,7 @@ def update_review_item(
     included: bool | None = None,
     sequence: int | None | object = _UNSET,
     replacement_for: str | None | object = _UNSET,
+    expected_snapshot: str | None = None,
 ) -> ProcessingSession:
     with _review_update_lock(paths):
         return _update_review_item_unlocked(
@@ -1357,6 +1379,7 @@ def update_review_item(
             included=included,
             sequence=sequence,
             replacement_for=replacement_for,
+            expected_snapshot=expected_snapshot,
         )
 
 

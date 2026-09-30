@@ -1,4 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 import json
+from threading import Barrier
+from typing import Any
 from pathlib import Path
 import socket
 from urllib.parse import urlencode
@@ -7,13 +11,15 @@ from PIL import Image
 import pytest
 
 import digitalisierer.review as review_module
-from digitalisierer.review import build_review_server, render_review_html
+import digitalisierer.scanner as scanner_module
+from digitalisierer.review import ReviewServer, build_review_server, render_review_html
 from digitalisierer.scanner import (
     ScanSessionPaths,
     ScannerWorkflowError,
     create_or_resume_scan_session,
     load_processing_session,
     observe_scan_folder,
+    review_item_snapshot,
     update_review_item,
 )
 
@@ -33,8 +39,10 @@ def _review_host_header(review_server: object) -> str:
 def _post_review_form(
     review_server: object,
     fields: dict[str, str],
+    *,
+    body_suffix: str = "",
 ) -> bytes:
-    body = urlencode(fields).encode("utf-8")
+    body = (urlencode(fields) + body_suffix).encode("utf-8")
     host_header = _review_host_header(review_server)
     client, handler_socket = socket.socketpair()
     try:
@@ -252,6 +260,7 @@ def test_review_rejects_findings_for_unknown_asset_before_post_mutation(
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": asset_id,
+                "review_snapshot": _current_review_snapshot(paths, asset_id),
                 "included": "1",
                 "sequence": "1",
                 "original_sequence": "1",
@@ -517,6 +526,7 @@ def test_review_replacement_defaults_to_replaced_page_position(tmp_path: Path) -
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": replacement,
+                "review_snapshot": _current_review_snapshot(paths, replacement),
                 "included": "1",
                 "sequence": "3",
                 "original_sequence": "3",
@@ -559,6 +569,7 @@ def test_review_replacement_preserves_explicit_position_change(tmp_path: Path) -
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": replacement,
+                "review_snapshot": _current_review_snapshot(paths, replacement),
                 "included": "1",
                 "sequence": "20",
                 "original_sequence": "3",
@@ -625,6 +636,7 @@ def test_review_server_refreshes_asset_maps_after_observe(tmp_path: Path) -> Non
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": new_asset,
+                "review_snapshot": _current_review_snapshot(paths, new_asset),
                 "included": "1",
                 "sequence": "2",
                 "original_sequence": "2",
@@ -699,6 +711,7 @@ def test_review_server_rejects_untrusted_host_before_post_mutation(
         {
             "csrf": review_server.csrf_token,
             "asset_id": asset_id,
+            "review_snapshot": _current_review_snapshot(paths, asset_id),
             "included": "",
             "sequence": "1",
             "original_sequence": "1",
@@ -848,6 +861,7 @@ def test_review_save_does_not_hash_thumbnails_for_asset_existence(
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": asset_id,
+                "review_snapshot": _current_review_snapshot(paths, asset_id),
                 "included": "1",
                 "sequence": "1",
                 "original_sequence": "1",
@@ -986,6 +1000,7 @@ def test_review_rejects_unknown_replacement_from_free_text_input(
             {
                 "csrf": review_server.csrf_token,
                 "asset_id": asset_id,
+                "review_snapshot": _current_review_snapshot(paths, asset_id),
                 "included": "1",
                 "sequence": "1",
                 "original_sequence": "1",
@@ -997,3 +1012,192 @@ def test_review_rejects_unknown_replacement_from_free_text_input(
         assert paths.review_file.read_bytes() == before
     finally:
         review_server.server.server_close()
+
+
+
+def _current_review_snapshot(paths: ScanSessionPaths, asset_id: str) -> str:
+    review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    return review_item_snapshot(asset_id, review["items"][asset_id])
+
+
+class _ReviewForms(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[dict[str, str]] = []
+        self.current: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "form":
+            self.current = {}
+        elif tag == "input" and self.current is not None:
+            name = values.get("name")
+            if name is not None:
+                if values.get("type") == "checkbox" and "checked" not in values:
+                    return
+                self.current[name] = values.get("value") or ""
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self.current is not None:
+            self.forms.append(self.current)
+            self.current = None
+
+
+def _rendered_form(
+    paths: ScanSessionPaths, server: ReviewServer, asset_id: str,
+) -> dict[str, str]:
+    parser = _ReviewForms()
+    parser.feed(render_review_html(paths, csrf_token=server.csrf_token))
+    matches = [form for form in parser.forms if form.get("asset_id") == asset_id]
+    assert len(matches) == 1
+    assert len(matches[0]["review_snapshot"]) == 64
+    return matches[0]
+
+
+def _stale_form_session(tmp_path: Path) -> tuple[ScanSessionPaths, tuple[str, ...]]:
+    capture = tmp_path / "stale-forms"
+    capture.mkdir()
+    for index, value in enumerate((40, 100, 180), start=1):
+        Image.new("RGB", (100, 140), color=(value, value, value)).save(
+            capture / f"page{index}.jpg", format="JPEG",
+        )
+    paths = create_or_resume_scan_session("book", "stale-forms", tmp_path / "library")
+    return paths, observe_scan_folder(paths, capture).imported_asset_ids
+
+
+@pytest.mark.parametrize("changed_field", ["included", "sequence", "replacement_for"])
+def test_stale_review_form_preserves_every_current_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_field: str,
+) -> None:
+    paths, (first, _, asset_id) = _stale_form_session(tmp_path)
+    update_review_item(paths, first, included=False)
+    server = build_review_server(paths)
+    try:
+        tab_a = _rendered_form(paths, server, asset_id)
+        tab_b = _rendered_form(paths, server, asset_id)
+        tab_a[changed_field] = {
+            "included": "", "sequence": "30", "replacement_for": first,
+        }[changed_field]
+        tab_b["sequence" if changed_field != "sequence" else "included"] = (
+            "40" if changed_field != "sequence" else ""
+        )
+        assert b" 303 " in _post_review_form(server, tab_a).splitlines()[0]
+        before = paths.review_file.read_bytes()
+
+        def reject_write(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("stale review submission must not write or roll back metadata")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(scanner_module, "_atomic_write_text", reject_write)
+            response = _post_review_form(server, tab_b)
+        assert b" 409 " in response.splitlines()[0]
+        assert b"Seite neu laden" in response
+        assert paths.review_file.read_bytes() == before
+        decision = json.loads(before)["items"][asset_id]
+        assert decision[changed_field] == {
+            "included": False, "sequence": 30, "replacement_for": first,
+        }[changed_field]
+
+        refreshed = _rendered_form(paths, server, asset_id)
+        refreshed["sequence"] = "50"
+        assert b" 303 " in _post_review_form(server, refreshed).splitlines()[0]
+        current = json.loads(paths.review_file.read_text())["items"][asset_id]
+        assert current["sequence"] == 50
+        assert current["included"] == decision["included"]
+        assert current["replacement_for"] == decision["replacement_for"]
+    finally:
+        server.server.server_close()
+
+
+def test_review_snapshot_rechecked_after_post_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, (_, _, asset_id) = _stale_form_session(tmp_path)
+    server = build_review_server(paths)
+    saved: list[bytes] = []
+    try:
+        form = _rendered_form(paths, server, asset_id)
+        form["sequence"] = "30"
+        original = update_review_item
+
+        def change_before_lock(*args: Any, **kwargs: Any) -> Any:
+            original(paths, asset_id, included=False)
+            saved.append(paths.review_file.read_bytes())
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(review_module, "update_review_item", change_before_lock)
+        response = _post_review_form(server, form)
+        assert b" 409 " in response.splitlines()[0]
+        assert len(saved) == 1
+        assert paths.review_file.read_bytes() == saved[0]
+    finally:
+        server.server.server_close()
+
+
+@pytest.mark.parametrize("same_asset", [False, True])
+def test_parallel_review_forms_compare_inside_update_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_asset: bool,
+) -> None:
+    paths, (first, second, _) = _stale_form_session(tmp_path)
+    server = build_review_server(paths)
+    try:
+        form_a = _rendered_form(paths, server, first)
+        form_b = _rendered_form(paths, server, first if same_asset else second)
+        form_a.pop("included")
+        form_b["sequence"] = "30"
+        barrier = Barrier(2, timeout=5)
+        original = update_review_item
+
+        def simultaneous(*args: Any, **kwargs: Any) -> Any:
+            barrier.wait()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(review_module, "update_review_item", simultaneous)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_post_review_form, server, form) for form in (form_a, form_b)]
+            statuses = [int(f.result(timeout=10).splitlines()[0].split()[1]) for f in futures]
+        decisions = json.loads(paths.review_file.read_text())["items"]
+        if same_asset:
+            assert sorted(statuses) == [303, 409]
+            assert (decisions[first]["included"], decisions[first]["sequence"]) == (
+                (False, 1) if statuses[0] == 303 else (True, 30)
+            )
+        else:
+            assert statuses == [303, 303]
+            assert decisions[first]["included"] is False
+            assert decisions[second]["sequence"] == 30
+    finally:
+        server.server.server_close()
+
+
+@pytest.mark.parametrize("token_kind", ["missing", "empty", "invalid", "duplicate", "other-asset", "csrf"])
+def test_review_form_requires_unambiguous_snapshot_and_csrf(
+    tmp_path: Path, token_kind: str,
+) -> None:
+    paths, (first, second, _) = _stale_form_session(tmp_path)
+    server = build_review_server(paths)
+    try:
+        form = _rendered_form(paths, server, first)
+        before = paths.review_file.read_bytes()
+        suffix = ""
+        expected = 400
+        if token_kind == "missing":
+            del form["review_snapshot"]
+        elif token_kind == "empty":
+            form["review_snapshot"] = ""
+        elif token_kind == "invalid":
+            form["review_snapshot"] = "x" * 64
+        elif token_kind == "duplicate":
+            suffix = "&review_snapshot=" + form["review_snapshot"]
+        elif token_kind == "other-asset":
+            form["review_snapshot"] = _rendered_form(paths, server, second)["review_snapshot"]
+            expected = 409
+        else:
+            form["csrf"] = "wrong-token"
+            expected = 403
+        form.pop("included")
+        response = _post_review_form(server, form, body_suffix=suffix)
+        assert int(response.splitlines()[0].split()[1]) == expected
+        assert paths.review_file.read_bytes() == before
+    finally:
+        server.server.server_close()

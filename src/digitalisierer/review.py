@@ -16,7 +16,9 @@ from urllib.parse import parse_qs, quote, urlparse
 from .scanner import (
     ScanSessionPaths,
     ScannerWorkflowError,
+    ScannerReviewConflict,
     load_review_state,
+    review_item_snapshot,
     update_review_item,
 )
 
@@ -170,6 +172,7 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
     <form method="post" action="/save">
       <input type="hidden" name="csrf" value="{html.escape(csrf_token, quote=True)}">
       <input type="hidden" name="asset_id" value="{html.escape(asset_id, quote=True)}">
+      <input type="hidden" name="review_snapshot" value="{review_item_snapshot(asset_id, decision)}">
       <input type="hidden" name="original_sequence" value="{sequence_value}">
       <input type="hidden" name="original_replacement_for" value="{replacement_value}">
       <label><input type="checkbox" name="included" value="1"{checked}> enthalten</label>
@@ -562,6 +565,14 @@ def build_review_server(
             ):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
+            snapshots = fields.get("review_snapshot", [])
+            if (
+                len(snapshots) != 1
+                or len(snapshots[0]) != 64
+                or any(char not in "0123456789abcdef" for char in snapshots[0])
+            ):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
             sequence_raw = fields.get("sequence", [""])[0].strip()
             original_sequence_raw = fields.get("original_sequence", [""])[0].strip()
             replacement = fields.get("replacement_for", [""])[0].strip()
@@ -582,7 +593,16 @@ def build_review_server(
                     included=fields.get("included", [""])[0] == "1",
                     sequence=sequence,
                     replacement_for=replacement or None,
+                    expected_snapshot=snapshots[0],
                 )
+            except ScannerReviewConflict:
+                self.send_error(
+                    HTTPStatus.CONFLICT,
+                    "Review-Konflikt: Seite neu laden und erneut bearbeiten.",
+                    explain="Die gespeicherte Entscheidung wurde inzwischen geaendert. "
+                    "Dieses veraltete Formular hat keine Aenderung gespeichert.",
+                )
+                return
             except (ValueError, ScannerWorkflowError):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
