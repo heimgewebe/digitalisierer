@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -2207,6 +2208,106 @@ def test_resume_validates_existing_metadata_before_reporting_ready(
     assert {
         path.name: path.read_bytes() for path in paths.sources.iterdir()
     } == sources_before
+    assert {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    } == thumbnails_before
+
+
+@pytest.mark.parametrize(
+    "metadata_name",
+    ["session_file", "review_file", "findings_file"],
+)
+def test_resume_rejects_fifo_metadata_without_blocking(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    capture = tmp_path / f"fifo-{metadata_name}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", metadata_name, library)
+    observe_scan_folder(paths, capture)
+
+    target = getattr(paths, metadata_name)
+    target.unlink()
+    os.mkfifo(target)
+    errors: list[BaseException] = []
+
+    def resume() -> None:
+        try:
+            create_or_resume_scan_session("book", metadata_name, library)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=resume, daemon=True)
+    worker.start()
+    worker.join(0.5)
+    if worker.is_alive():
+        # Unblock a regressed blocking FIFO reader so the test can fail cleanly.
+        writer = os.open(target, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+        worker.join(1.0)
+        pytest.fail(f"resume blocked while opening FIFO metadata: {metadata_name}")
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], ScannerWorkflowError)
+    assert "non-symlink regular file" in str(errors[0])
+
+
+@pytest.mark.parametrize(
+    ("inconsistency", "message"),
+    [
+        ("missing-review-decision", "review state missing"),
+        ("unknown-finding-asset", "scan finding references unknown asset"),
+    ],
+)
+def test_resume_rejects_logically_inconsistent_metadata_before_ready(
+    tmp_path: Path,
+    inconsistency: str,
+    message: str,
+) -> None:
+    capture = tmp_path / f"inconsistent-{inconsistency}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session("book", inconsistency, library)
+    observe_scan_folder(paths, capture)
+
+    if inconsistency == "missing-review-decision":
+        review = json.loads(paths.review_file.read_text(encoding="utf-8"))
+        review["items"] = {}
+        paths.review_file.write_text(json.dumps(review) + "\n", encoding="utf-8")
+    else:
+        findings = json.loads(paths.findings_file.read_text(encoding="utf-8"))
+        findings["findings"].append(
+            {
+                "kind": "manual",
+                "message": "orphan finding",
+                "asset_ids": ["missing-asset"],
+                "confidence": None,
+                "evidence": ["test"],
+            }
+        )
+        paths.findings_file.write_text(
+            json.dumps(findings) + "\n",
+            encoding="utf-8",
+        )
+
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    sources_before = {path.name: path.read_bytes() for path in paths.sources.iterdir()}
+    thumbnails_before = {
+        path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
+    }
+
+    with pytest.raises(ScannerWorkflowError, match=message):
+        create_or_resume_scan_session("book", inconsistency, library)
+
+    assert {path: path.read_bytes() for path in before} == before
+    assert {path.name: path.read_bytes() for path in paths.sources.iterdir()} == sources_before
     assert {
         path.name: path.read_bytes() for path in paths.thumbnails.iterdir()
     } == thumbnails_before

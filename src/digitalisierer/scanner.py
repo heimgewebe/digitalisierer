@@ -237,7 +237,7 @@ def _stable_file_bytes(path: Path) -> bytes:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
     except FileNotFoundError as exc:
         raise ScannerWorkflowError(f"scanner session file is missing: {path}") from exc
@@ -469,6 +469,15 @@ def create_or_resume_scan_session(
                 }
             ),
         )
+
+    # A resumed session is ready only when its individually valid metadata also
+    # forms one coherent scanner state.
+    review = _load_json(paths.review_file)
+    _validate_review_payload(review)
+    findings = _load_json(paths.findings_file)
+    _validate_findings_payload(findings)
+    processing = _processing_session_from_payload(paths, session, review)
+    _validate_findings_asset_ids(processing, findings)
     return paths
 
 
