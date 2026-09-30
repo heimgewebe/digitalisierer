@@ -65,6 +65,19 @@ def _loopback_host(host: str) -> bool:
         return False
 
 
+def _display_filesystem_name(value: str) -> str:
+    rendered: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if 0xDC80 <= codepoint <= 0xDCFF:
+            rendered.append(f"\\x{codepoint - 0xDC00:02x}")
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            rendered.append(f"\\u{codepoint:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
 def _finding_index(
     payload: dict[str, Any],
 ) -> tuple[dict[str, list[str]], list[str]]:
@@ -135,6 +148,7 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
             raise ScannerWorkflowError(
                 f"scan asset source_name is invalid for review: {asset_id}"
             )
+        display_source_name = _display_filesystem_name(source_name)
         decision = decisions.get(asset_id)
         if not isinstance(decision, dict):
             raise ScannerWorkflowError(f"review state missing for {asset_id}")
@@ -163,10 +177,10 @@ def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
             f"""
 <article class="page-card">
   <a class="page-image-link" href="/source/{quote(asset_id, safe='')}" title="Original in voller Auflösung öffnen">
-    <img loading="lazy" src="/thumbnail/{quote(asset_id, safe='')}" alt="{html.escape(source_name, quote=True)}">
+    <img loading="lazy" src="/thumbnail/{quote(asset_id, safe='')}" alt="{html.escape(display_source_name, quote=True)}">
   </a>
   <div class="page-meta">
-    <h2>{html.escape(source_name)}</h2>
+    <h2>{html.escape(display_source_name)}</h2>
     <p><code>{html.escape(asset_id)}</code> · {dimensions}</p>
     <ul>{finding_html}</ul>
     <form method="post" action="/save">

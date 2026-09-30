@@ -106,6 +106,64 @@ def test_review_html_is_large_preview_and_escapes_source_names(tmp_path: Path) -
     assert "Original in voller Auflösung öffnen" in rendered
 
 
+def test_review_html_renders_surrogateescaped_source_name_as_utf8(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "surrogate-name"
+    capture.mkdir()
+    source_name = b"page-\xff.jpg".decode("utf-8", errors="surrogateescape")
+    image_path = capture / source_name
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "surrogate-name",
+        tmp_path / "library",
+    )
+
+    observe_scan_folder(paths, capture)
+    persisted = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert persisted["assets"][0]["source_name"] == source_name
+
+    rendered = render_review_html(paths, csrf_token="token")
+    rendered_bytes = rendered.encode("utf-8")
+    assert rendered_bytes.decode("utf-8") == rendered
+    assert "page-\\xff.jpg" in rendered
+    assert source_name not in rendered
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            (
+                "GET / HTTP/1.0\r\n"
+                f"Host: {_review_host_header(review_server)}\r\n"
+                "\r\n"
+            ).encode("ascii")
+        )
+        handler = review_server.server.RequestHandlerClass
+        handler(handler_socket, ("127.0.0.1", 1), review_server.server)
+        handler_socket.close()
+
+        response = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+        headers, _, body = response.partition(b"\r\n\r\n")
+        assert b" 200 " in headers.splitlines()[0]
+        decoded = body.decode("utf-8")
+        assert "page-\\xff.jpg" in decoded
+        persisted_after = json.loads(
+            paths.session_file.read_text(encoding="utf-8")
+        )
+        assert persisted_after["assets"][0]["source_name"] == source_name
+    finally:
+        client.close()
+        handler_socket.close()
+        review_server.server.server_close()
+
+
 def test_review_html_surfaces_session_wide_findings(tmp_path: Path) -> None:
     capture = tmp_path / "session-finding"
     capture.mkdir()
