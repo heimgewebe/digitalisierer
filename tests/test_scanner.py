@@ -2542,6 +2542,64 @@ def test_observe_resume_repair_rejects_preserved_symlink_swap_before_hash(
     assert preserved.resolve() == outside.resolve()
 
 
+
+def test_observe_resume_repair_rejects_thumbnail_symlink_swap_before_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-thumbnail-symlink-race"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-thumbnail-symlink-race",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    thumbnail = paths.root / asset["thumbnail_path"]
+    outside = tmp_path / "matching-thumbnail.jpg"
+    outside.write_bytes(thumbnail.read_bytes())
+    original_open = os.open
+    rebound = False
+
+    def rebind_before_descriptor_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal rebound
+        if (
+            dir_fd is None
+            and not rebound
+            and isinstance(path, (str, bytes, os.PathLike))
+            and Path(os.fsdecode(path)) == thumbnail
+        ):
+            thumbnail.unlink()
+            thumbnail.symlink_to(outside)
+            rebound = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "digitalisierer.scanner.os.open",
+        rebind_before_descriptor_open,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert rebound is True
+    assert thumbnail.is_symlink()
+    assert thumbnail.resolve() == outside.resolve()
+
+
 def test_observe_resume_does_not_allow_missing_source_outside_selected_range(
     tmp_path: Path,
 ) -> None:

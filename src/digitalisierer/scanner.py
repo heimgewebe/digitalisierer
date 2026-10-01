@@ -1319,13 +1319,21 @@ def _repair_recorded_asset(
             f"scan thumbnail must be the canonical regular file for {asset_id}"
         )
     thumbnail_sha256 = record.get("thumbnail_sha256")
-    thumbnail_valid = (
+    thumbnail_valid = False
+    if (
         isinstance(thumbnail_sha256, str)
         and len(thumbnail_sha256) == 64
         and all(char in "0123456789abcdef" for char in thumbnail_sha256)
         and thumbnail.exists()
-        and secrets.compare_digest(_sha256_file(thumbnail), thumbnail_sha256)
-    )
+    ):
+        current_thumbnail_sha256, _ = _regular_file_snapshot(
+            thumbnail,
+            purpose="scan thumbnail",
+        )
+        thumbnail_valid = secrets.compare_digest(
+            current_thumbnail_sha256,
+            thumbnail_sha256,
+        )
     if thumbnail_valid:
         return None
     return record, preserved, thumbnail
