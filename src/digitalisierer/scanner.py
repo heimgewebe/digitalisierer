@@ -2400,7 +2400,7 @@ def _update_review_item_unlocked(
     replacement_for: str | None | object = _UNSET,
     expected_snapshot: str | None = None,
 ) -> ProcessingSession:
-    _, review, _, _, old_text = _load_review_state_unlocked(paths)
+    session, review, findings, _, old_text = _load_review_state_unlocked(paths)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
@@ -2425,6 +2425,30 @@ def _update_review_item_unlocked(
         if replacement_for is not None and not isinstance(replacement_for, str):
             raise ValueError("replacement_for must be a string or null")
         decision["replacement_for"] = replacement_for
+
+    old_bytes = old_text.encode("utf-8")
+    try:
+        current_review_bytes = _stable_file_bytes(paths.review_file)
+    except ScannerWorkflowError as exc:
+        try:
+            current_review_stat = paths.review_file.lstat()
+        except FileNotFoundError:
+            current_review_stat = None
+        if current_review_stat is not None and stat.S_ISREG(
+            current_review_stat.st_mode
+        ):
+            raise ScannerReviewConflict(
+                "review state changed while this update was prepared; reload and retry"
+            ) from exc
+        _atomic_write_text(paths.review_file, old_text)
+    else:
+        if not secrets.compare_digest(current_review_bytes, old_bytes):
+            raise ScannerReviewConflict(
+                "review state changed while this update was prepared; reload and retry"
+            )
+
+    processing = _processing_session_from_payload(paths, session, updated)
+    _validate_findings_asset_ids(processing, findings)
 
     _atomic_write_text(paths.review_file, _json_text(updated))
     try:

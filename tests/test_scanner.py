@@ -3430,3 +3430,47 @@ def test_observe_existing_preserved_fifo_is_opened_nonblocking(
 
     assert inspected is True
     assert preserved.exists() and not preserved.is_file()
+
+
+def test_review_update_validates_before_publishing_invalid_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "review-validate-before-write"
+    capture.mkdir()
+    _image(capture / "page1.jpg", 80)
+    _image(capture / "page2.jpg", 160)
+    paths = create_or_resume_scan_session(
+        "book",
+        "review-validate-before-write",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    first_id, second_id = observed.imported_asset_ids
+    review_before = paths.review_file.read_bytes()
+    review = json.loads(review_before)
+    first_sequence = review["items"][first_id]["sequence"]
+    original_write = scanner_module._atomic_write_text
+    wrote_invalid_review = False
+
+    def crash_after_review_write(path: Path, content: str) -> None:
+        nonlocal wrote_invalid_review
+        original_write(path, content)
+        if path == paths.review_file:
+            wrote_invalid_review = True
+            raise SystemExit("synthetic crash after invalid review write")
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        crash_after_review_write,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="invalid scanner review state",
+    ):
+        update_review_item(paths, second_id, sequence=first_sequence)
+
+    assert wrote_invalid_review is False
+    assert paths.review_file.read_bytes() == review_before
