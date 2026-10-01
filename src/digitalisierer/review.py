@@ -32,11 +32,47 @@ class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"review asset must be a non-symlink regular file: {path.name}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"review asset must be a non-symlink regular file: {path.name}"
+            )
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"review asset changed while hashing: {path.name}"
+            ) from exc
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or (current.st_size, current.st_mtime_ns)
+            != (after.st_size, after.st_mtime_ns)
+        ):
+            raise ScannerWorkflowError(
+                f"review asset changed while hashing: {path.name}"
+            )
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)

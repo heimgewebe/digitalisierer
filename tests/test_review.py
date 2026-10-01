@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 import json
+import os
 from threading import Barrier
 from typing import Any
 from pathlib import Path
@@ -492,6 +493,55 @@ def test_review_rejects_thumbnail_bytes_from_another_asset(
         match="thumbnail hash mismatch",
     ):
         render_review_html(paths, csrf_token="token")
+
+
+def test_review_thumbnail_hash_rejects_symlink_swap_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-hash-open-race"
+    capture.mkdir()
+    Image.new("RGB", (100, 140), color=(80, 80, 80)).save(
+        capture / "page.jpg",
+        format="JPEG",
+    )
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-hash-open-race",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    thumbnail = paths.thumbnails / f"{asset_id}.jpg"
+    outside = tmp_path / "outside-thumbnail.jpg"
+    outside.write_bytes(thumbnail.read_bytes())
+    original_open = os.open
+    raced = False
+
+    def raced_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal raced
+        if os.fspath(path) == os.fspath(thumbnail) and not raced:
+            raced = True
+            thumbnail.unlink()
+            thumbnail.symlink_to(outside)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", raced_open)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="review asset must be a non-symlink regular file",
+    ):
+        render_review_html(paths, csrf_token="token")
+
+    assert raced is True
+    assert thumbnail.is_symlink()
 
 
 @pytest.mark.parametrize("replacement_kind", ["regular", "symlink"])
