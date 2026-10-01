@@ -3376,3 +3376,57 @@ def test_observe_metadata_commit_recovers_after_process_crash(
     retried = observe_scan_folder(resumed_paths, capture)
     assert retried.imported_asset_ids == ()
     assert len(retried.skipped_asset_ids) == 1
+
+
+def test_observe_existing_preserved_fifo_is_opened_nonblocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "existing-preserved-fifo"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 120)
+    original_bytes = source.read_bytes()
+    source_sha = hashlib.sha256(original_bytes).hexdigest()
+    paths = create_or_resume_scan_session(
+        "book",
+        "existing-preserved-fifo",
+        tmp_path / "library",
+    )
+    asset_id = scanner_module._asset_id(source.name, source_sha)
+    preserved = paths.sources / f"{asset_id}{source.suffix.lower()}"
+    os.mkfifo(preserved)
+    original_open = os.open
+    inspected = False
+
+    def require_nonblocking_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal inspected
+        if (
+            dir_fd is None
+            and isinstance(path, (str, bytes, os.PathLike))
+            and Path(os.fsdecode(path)) == preserved
+        ):
+            inspected = True
+            if not flags & os.O_NONBLOCK:
+                raise AssertionError("existing preserved target opened without O_NONBLOCK")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "digitalisierer.scanner.os.open",
+        require_nonblocking_open,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert inspected is True
+    assert preserved.exists() and not preserved.is_file()
