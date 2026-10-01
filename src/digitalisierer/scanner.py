@@ -2117,10 +2117,13 @@ def _verified_export_source_snapshots(
     active: list[MediaAsset],
     staging: Path,
 ) -> Iterator[list[Path]]:
-    snapshots: list[Any] = []
     bound_paths: list[Path] = []
-    try:
-        for asset in active:
+    with tempfile.TemporaryDirectory(
+        prefix=".verified-export-sources.",
+        dir=staging,
+    ) as snapshot_dir_name:
+        snapshot_dir = Path(snapshot_dir_name)
+        for index, asset in enumerate(active):
             expected_sha256 = asset.sha256
             if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
                 raise ScannerWorkflowError(
@@ -2135,36 +2138,58 @@ def _verified_export_source_snapshots(
                 raise ScannerWorkflowError(
                     f"preserved scanner source cannot be snapshotted: {asset.asset_id}"
                 ) from exc
-            snapshot = tempfile.TemporaryFile(mode="w+b", dir=staging)
-            snapshots.append(snapshot)
+
+            suffix = asset.path.suffix or ".bin"
+            snapshot_path = snapshot_dir / f"{index:06d}{suffix}"
+            snapshot_fd = -1
             try:
+                snapshot_fd = os.open(
+                    snapshot_path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o400,
+                )
                 before = os.fstat(source_fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise ScannerWorkflowError(
                         f"preserved scanner source is not regular: {asset.asset_id}"
                     )
+
                 digest = hashlib.sha256()
-                with os.fdopen(os.dup(source_fd), "rb") as source_handle:
+                with (
+                    os.fdopen(os.dup(source_fd), "rb") as source_handle,
+                    os.fdopen(os.dup(snapshot_fd), "wb") as snapshot_handle,
+                ):
                     for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
                         digest.update(chunk)
-                        snapshot.write(chunk)
-                snapshot.flush()
-                os.fsync(snapshot.fileno())
+                        snapshot_handle.write(chunk)
+                    snapshot_handle.flush()
+                    os.fsync(snapshot_handle.fileno())
+
                 after = os.fstat(source_fd)
                 try:
                     current = asset.path.lstat()
+                    snapshot_current = snapshot_path.lstat()
                 except OSError as exc:
                     raise ScannerWorkflowError(
                         f"preserved scanner source changed while snapshotting: {asset.asset_id}"
                     ) from exc
-                snapshot_stat = os.fstat(snapshot.fileno())
+                snapshot_stat = os.fstat(snapshot_fd)
                 if (
                     _stat_identity(before) != _stat_identity(after)
                     or not stat.S_ISREG(current.st_mode)
                     or current.st_dev != after.st_dev
                     or current.st_ino != after.st_ino
                     or _stat_identity(current) != _stat_identity(after)
+                    or not stat.S_ISREG(snapshot_stat.st_mode)
+                    or not stat.S_ISREG(snapshot_current.st_mode)
+                    or snapshot_stat.st_dev != snapshot_current.st_dev
+                    or snapshot_stat.st_ino != snapshot_current.st_ino
                     or snapshot_stat.st_size != after.st_size
+                    or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
                     or not secrets.compare_digest(
                         digest.hexdigest(),
                         expected_sha256,
@@ -2173,14 +2198,13 @@ def _verified_export_source_snapshots(
                     raise ScannerWorkflowError(
                         f"preserved scanner source changed while snapshotting: {asset.asset_id}"
                     )
-                snapshot.seek(0)
-                bound_paths.append(Path(f"/proc/self/fd/{snapshot.fileno()}"))
+                bound_paths.append(snapshot_path)
             finally:
+                if snapshot_fd >= 0:
+                    os.close(snapshot_fd)
                 os.close(source_fd)
+
         yield bound_paths
-    finally:
-        for snapshot in reversed(snapshots):
-            snapshot.close()
 
 
 class _Img2PdfBuilder:

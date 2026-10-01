@@ -1,5 +1,7 @@
 import json
 import os
+import signal
+import threading
 from pathlib import Path
 
 import pytest
@@ -315,6 +317,268 @@ def test_start_rolls_back_preset_when_existing_window_activation_fails(
     assert not output_dir.exists()
     assert not capture_root.exists()
     assert backend._session_output is None
+
+
+
+@pytest.mark.parametrize("failure_point", ["discover", "focus", "activate"])
+def test_start_rolls_back_preset_after_launched_process_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+
+    class _FakeProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.exited = False
+
+        def poll(self) -> int | None:
+            return 0 if self.exited else None
+
+    process = _FakeProcess()
+    group_alive = True
+    group_signals: list[signal.Signals] = []
+    visible_calls = 0
+
+    def fake_killpg(process_group_id: int, sent_signal: int) -> None:
+        nonlocal group_alive
+        assert process_group_id == process.pid
+        if sent_signal == 0:
+            if not group_alive:
+                raise ProcessLookupError
+            return
+        group_signals.append(signal.Signals(sent_signal))
+        if sent_signal == signal.SIGTERM:
+            group_alive = False
+            process.exited = True
+            return
+        pytest.fail(f"unexpected process-group signal: {sent_signal}")
+
+    def visible_windows() -> list[str]:
+        nonlocal visible_calls
+        visible_calls += 1
+        if visible_calls == 1:
+            return []
+        if failure_point == "discover":
+            raise CzurAdapterError("forced post-launch discovery failure")
+        return ["42"]
+
+    def fake_popen(*args: object, **kwargs: object) -> _FakeProcess:
+        return process
+
+    monkeypatch.setattr(backend, "_visible_windows", visible_windows)
+    monkeypatch.setattr("digitalisierer.czur.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("digitalisierer.czur.os.killpg", fake_killpg)
+
+    if failure_point == "focus":
+        def fail_focus(window_id: str) -> None:
+            raise CzurAdapterError(f"forced post-launch focus failure for {window_id}")
+
+        monkeypatch.setattr(backend, "_focus", fail_focus)
+    else:
+        monkeypatch.setattr(backend, "_focus", lambda window_id: None)
+
+    if failure_point == "activate":
+        def fail_activate(window_id: str) -> None:
+            raise CzurAdapterError(
+                f"forced post-launch activate failure for {window_id}"
+            )
+
+        monkeypatch.setattr(backend, "_activate_curved_books_mode", fail_activate)
+    else:
+        monkeypatch.setattr(
+            backend,
+            "_activate_curved_books_mode",
+            lambda window_id: None,
+        )
+
+    before = config.read_bytes()
+    before_mode = config.stat().st_mode & 0o7777
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    with pytest.raises(CzurAdapterError, match="forced post-launch"):
+        backend.start(output_dir)
+
+    assert group_signals == [signal.SIGTERM]
+    assert group_alive is False
+    assert config.read_bytes() == before
+    assert config.stat().st_mode & 0o7777 == before_mode
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_start_preserves_preset_if_launched_process_cannot_be_stopped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+
+    class _UnstoppableProcess:
+        pid = 4343
+
+        def poll(self) -> None:
+            return None
+
+    process = _UnstoppableProcess()
+    visible_calls = 0
+
+    def fail_killpg(process_group_id: int, sent_signal: int) -> None:
+        assert process_group_id == process.pid
+        if sent_signal == 0:
+            return
+        if sent_signal == signal.SIGTERM:
+            raise PermissionError("forced stop failure")
+        pytest.fail(f"unexpected process-group signal: {sent_signal}")
+
+    def visible_windows() -> list[str]:
+        nonlocal visible_calls
+        visible_calls += 1
+        if visible_calls == 1:
+            return []
+        raise CzurAdapterError("forced post-launch discovery failure")
+
+    def fake_popen(*args: object, **kwargs: object) -> _UnstoppableProcess:
+        return process
+
+    monkeypatch.setattr(backend, "_visible_windows", visible_windows)
+    monkeypatch.setattr("digitalisierer.czur.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("digitalisierer.czur.os.killpg", fail_killpg)
+
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="rollback incomplete: launched CZUR process-group termination failed",
+    ):
+        backend.start(output_dir)
+
+    assert config.read_bytes() != before
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    assert payload["setting"]["scan_preview_capture_type"] == "mul_page"
+    assert backup.is_file()
+    assert output_dir.is_dir()
+    assert capture_root.is_dir()
+    assert backend._session_output == output_dir
+
+
+
+def test_stop_launched_process_stops_group_after_leader_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ExitedLeader:
+        pid = 4444
+
+        def poll(self) -> int:
+            return 0
+
+    group_alive = True
+    group_signals: list[signal.Signals] = []
+
+    def fake_killpg(process_group_id: int, sent_signal: int) -> None:
+        nonlocal group_alive
+        assert process_group_id == 4444
+        if sent_signal == 0:
+            if not group_alive:
+                raise ProcessLookupError
+            return
+        group_signals.append(signal.Signals(sent_signal))
+        if sent_signal == signal.SIGTERM:
+            group_alive = False
+            return
+        pytest.fail(f"unexpected process-group signal: {sent_signal}")
+
+    monkeypatch.setattr("digitalisierer.czur.os.killpg", fake_killpg)
+
+    errors = CzurCaptureBackend._stop_launched_process(_ExitedLeader())  # type: ignore[arg-type]
+
+    assert errors == []
+    assert group_signals == [signal.SIGTERM]
+    assert group_alive is False
+
+
+def test_config_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    os.mkfifo(config)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=tmp_path / "launcher",
+        xdotool="/usr/bin/xdotool",
+    )
+    errors: list[BaseException] = []
+
+    def load_config() -> None:
+        try:
+            backend._load_config_payload()
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=load_config, daemon=True)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], CzurAdapterError)
+    assert "config is not a regular file" in str(errors[0])
 
 
 def test_start_rolls_back_preset_when_executable_launcher_cannot_exec(
@@ -1151,18 +1415,16 @@ def test_status_handles_config_read_failure(
         launcher=launcher,
         xdotool=str(xdotool),
     )
-    original_read_text = Path.read_text
+    original_snapshot = backend._snapshot_regular_file
 
     def fail_config_read(
-        self: Path,
-        encoding: str | None = None,
-        errors: str | None = None,
-    ) -> str:
-        if self == config:
+        path: Path,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        if path == config:
             raise OSError("synthetic config read failure")
-        return original_read_text(self, encoding=encoding, errors=errors)
+        return original_snapshot(path)
 
-    monkeypatch.setattr(Path, "read_text", fail_config_read)
+    monkeypatch.setattr(backend, "_snapshot_regular_file", fail_config_read)
 
     assert backend.status().ready is False
 

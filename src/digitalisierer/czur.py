@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import stat
 import subprocess
@@ -61,22 +62,32 @@ class CzurCaptureBackend:
 
     def _load_config_payload(self) -> dict[str, Any]:
         try:
-            config_stat = self.config_path.lstat()
+            raw_bytes, _ = self._snapshot_regular_file(self.config_path)
         except FileNotFoundError as exc:
             raise CzurAdapterError(
                 f"CZUR config is missing: {self.config_path}"
             ) from exc
         except OSError as exc:
+            try:
+                current = self.config_path.lstat()
+            except FileNotFoundError as missing_exc:
+                raise CzurAdapterError(
+                    f"CZUR config is missing: {self.config_path}"
+                ) from missing_exc
+            except OSError as inspect_exc:
+                raise CzurAdapterError(
+                    f"CZUR config cannot be inspected: {self.config_path}"
+                ) from inspect_exc
+            if not stat.S_ISREG(current.st_mode):
+                raise CzurAdapterError(
+                    f"CZUR config is not a regular file: {self.config_path}"
+                ) from exc
             raise CzurAdapterError(
-                f"CZUR config cannot be inspected: {self.config_path}"
+                f"CZUR config cannot be read safely: {self.config_path}"
             ) from exc
-        if not stat.S_ISREG(config_stat.st_mode):
-            raise CzurAdapterError(
-                f"CZUR config is not a regular file: {self.config_path}"
-            )
         try:
-            raw = self.config_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeError as exc:
             raise CzurAdapterError(
                 f"CZUR config cannot be read as UTF-8: {self.config_path}"
             ) from exc
@@ -222,7 +233,7 @@ class CzurCaptureBackend:
     ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
         fd = os.open(
             path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
         try:
             before = os.fstat(fd)
@@ -724,6 +735,58 @@ class CzurCaptureBackend:
         self._session_output = None
         return errors
 
+    @staticmethod
+    def _process_group_alive(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @classmethod
+    def _wait_for_process_group_exit(
+        cls,
+        process_group_id: int,
+        *,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not cls._process_group_alive(process_group_id):
+                return True
+            time.sleep(0.05)
+        return not cls._process_group_alive(process_group_id)
+
+    @classmethod
+    def _stop_launched_process(cls, process: subprocess.Popen[bytes]) -> list[str]:
+        process_group_id = process.pid
+        if not cls._process_group_alive(process_group_id):
+            process.poll()
+            return []
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            process.poll()
+            return []
+        except OSError as exc:
+            return [f"launched CZUR process-group termination failed: {exc}"]
+        if cls._wait_for_process_group_exit(process_group_id, timeout=2.0):
+            process.poll()
+            return []
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            process.poll()
+            return []
+        except OSError as exc:
+            return [f"launched CZUR process-group kill failed: {exc}"]
+        if not cls._wait_for_process_group_exit(process_group_id, timeout=2.0):
+            return ["launched CZUR process group did not exit after kill"]
+        process.poll()
+        return []
+
     def _visible_windows(self) -> list[str]:
         try:
             completed = subprocess.run(
@@ -841,7 +904,7 @@ class CzurCaptureBackend:
         if not self._launcher_ready():
             raise CzurAdapterError(f"CZUR launcher is not executable: {self.launcher}")
         try:
-            subprocess.Popen(
+            launched_process = subprocess.Popen(
                 [str(self.launcher)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -869,15 +932,48 @@ class CzurCaptureBackend:
             raise CzurAdapterError(
                 f"cannot execute CZUR launcher: {self.launcher}{suffix}"
             ) from exc
-        deadline = time.monotonic() + 12.0
-        while time.monotonic() < deadline:
-            windows = self._visible_windows()
-            if windows:
-                self._focus(windows[-1])
-                self._activate_curved_books_mode(windows[-1])
-                return
-            time.sleep(0.25)
-        raise CzurAdapterError("CZUR application did not expose a visible window")
+
+        try:
+            deadline = time.monotonic() + 12.0
+            while time.monotonic() < deadline:
+                windows = self._visible_windows()
+                if windows:
+                    self._focus(windows[-1])
+                    self._activate_curved_books_mode(windows[-1])
+                    return
+                if launched_process.poll() is not None:
+                    raise CzurAdapterError(
+                        "CZUR application exited before exposing a visible window"
+                    )
+                time.sleep(0.25)
+            raise CzurAdapterError(
+                "CZUR application did not expose a visible window"
+            )
+        except Exception as exc:
+            process_errors = self._stop_launched_process(launched_process)
+            if process_errors:
+                raise CzurAdapterError(
+                    f"{exc}; rollback incomplete: " + "; ".join(process_errors)
+                ) from exc
+            rollback_errors = self._rollback_failed_prelaunch(
+                output_dir=session_output,
+                output_existed=output_existed,
+                capture_root_existed=capture_root_existed,
+                backup=backup,
+                backup_existed=backup_existed,
+                backup_identity=backup_identity,
+                config_before=config_before,
+                config_before_mode=config_before_mode,
+                config_after=config_after,
+                config_after_identity=config_after_identity,
+            )
+            suffix = (
+                "; rollback incomplete: " + "; ".join(rollback_errors)
+                if rollback_errors
+                else ""
+            )
+            raise CzurAdapterError(f"{exc}{suffix}") from exc
+
 
     def capture(self) -> None:
         capture_key = os.environ.get("DIGITALISIERER_CZUR_CAPTURE_KEY")

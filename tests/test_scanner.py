@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -1643,6 +1645,63 @@ def test_finalize_uses_verified_snapshot_during_transient_source_rewrite(
     assert manifest["active_order"][0]["sha256"] == hashlib.sha256(
         original_bytes
     ).hexdigest()
+
+
+
+def test_finalize_verified_snapshot_is_readable_by_pdf_subprocess(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-finalize-subprocess-snapshot"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    _image(source, 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "finalize-subprocess-snapshot",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    expected_digest = hashlib.sha256(original_bytes).digest()
+
+    class _SubprocessPdf:
+        name = "subprocess-pdf"
+
+        def version(self) -> str:
+            return "test"
+
+        def __call__(self, images: list[Path], output: Path) -> None:
+            assert len(images) == 1
+            assert images[0] != preserved
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import hashlib,pathlib,sys;"
+                        "sys.stdout.buffer.write("
+                        "hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).digest()"
+                        ")"
+                    ),
+                    str(images[0]),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            output.write_bytes(b"PDF:" + completed.stdout)
+
+    exported = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_SubprocessPdf(),
+    )
+
+    assert (exported.export_dir / "master.pdf").read_bytes() == (
+        b"PDF:" + expected_digest
+    )
 
 
 def test_finalize_export_identity_includes_pdf_builder_provenance(tmp_path: Path) -> None:
