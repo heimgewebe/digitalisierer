@@ -60,8 +60,20 @@ class CzurCaptureBackend:
         self._session_output: Path | None = None
 
     def _load_config_payload(self) -> dict[str, Any]:
-        if not self.config_path.is_file():
-            raise CzurAdapterError(f"CZUR config is missing: {self.config_path}")
+        try:
+            config_stat = self.config_path.lstat()
+        except FileNotFoundError as exc:
+            raise CzurAdapterError(
+                f"CZUR config is missing: {self.config_path}"
+            ) from exc
+        except OSError as exc:
+            raise CzurAdapterError(
+                f"CZUR config cannot be inspected: {self.config_path}"
+            ) from exc
+        if not stat.S_ISREG(config_stat.st_mode):
+            raise CzurAdapterError(
+                f"CZUR config is not a regular file: {self.config_path}"
+            )
         try:
             raw = self.config_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -156,40 +168,12 @@ class CzurCaptureBackend:
         )
 
     def apply_curved_books_preset(self) -> dict[str, object]:
-        payload = self._load_config_payload()
-        self._require_config_write_ready()
-        setting = payload.setdefault("setting", {})
-        if not isinstance(setting, dict):
-            raise CzurAdapterError("CZUR config setting must be an object")
-        before: dict[str, object] = {}
-        for key, value in CURVED_BOOKS_SETTINGS.items():
-            before[key] = setting.get(key)
-            setting[key] = value
-
         backup = self.config_path.with_name(
             "config.pre-digitalisierer-curved-books.json"
         )
-        if not backup.exists():
-            shutil.copy2(self.config_path, backup)
-
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(
-            prefix=".config.json.digitalisierer.",
-            dir=str(self.config_path.parent),
+        before, _, _, _, _, _ = self._apply_curved_books_preset_transaction(
+            backup
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.config_path)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
         return before
 
     @staticmethod
@@ -205,21 +189,49 @@ class CzurCaptureBackend:
             stat.S_IMODE(value.st_mode),
         )
 
-    def _config_snapshot(
+    @staticmethod
+    def _same_claimed_preimage(
+        expected_content: bytes,
+        expected_identity: tuple[int, int, int, int, int, int],
+        actual_content: bytes,
+        actual_identity: tuple[int, int, int, int, int, int],
+    ) -> bool:
+        return (
+            actual_content == expected_content
+            and actual_identity[0] == expected_identity[0]
+            and actual_identity[1] == expected_identity[1]
+            and actual_identity[2] == expected_identity[2]
+            and actual_identity[3] == expected_identity[3]
+            and actual_identity[5] == expected_identity[5]
+        )
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _snapshot_regular_file(
         self,
+        path: Path,
     ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
         fd = os.open(
-            self.config_path,
+            path,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
         try:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode):
-                raise OSError("CZUR config is not a regular file")
+                raise OSError(f"not a regular file: {path}")
             with os.fdopen(os.dup(fd), "rb") as handle:
                 content = handle.read()
             after = os.fstat(fd)
-            current = self.config_path.lstat()
+            current = path.lstat()
             before_identity = self._config_stat_identity(before)
             after_identity = self._config_stat_identity(after)
             if (
@@ -227,74 +239,391 @@ class CzurCaptureBackend:
                 or after_identity != self._config_stat_identity(current)
                 or not stat.S_ISREG(current.st_mode)
             ):
-                raise OSError("CZUR config changed while being snapshotted")
+                raise OSError(f"file changed while being snapshotted: {path}")
             return content, after_identity
         finally:
             os.close(fd)
 
-    def _atomic_restore_config(self, content: bytes, mode: int) -> None:
-        fd, temporary = tempfile.mkstemp(
-            prefix=".config.json.digitalisierer.rollback.",
-            dir=str(self.config_path.parent),
-        )
+    def _config_snapshot(
+        self,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        return self._snapshot_regular_file(self.config_path)
+
+    def _create_backup_if_absent(
+        self,
+        backup: Path,
+        config_before: bytes,
+    ) -> tuple[int, int, int, int, int, int] | None:
+        if os.path.lexists(backup):
+            return None
+        descriptor = -1
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
+            descriptor = os.open(
+                backup,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+            )
+        except FileExistsError:
+            return None
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(config_before)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temporary, mode)
-            os.replace(temporary, self.config_path)
-            directory_fd = os.open(
-                self.config_path.parent,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            backup_content, backup_identity = self._snapshot_regular_file(backup)
+            if backup_content != config_before:
+                raise CzurAdapterError(
+                    "CZUR backup changed while Curved Books preset was being prepared"
+                )
+            self._fsync_directory(backup.parent)
+            return backup_identity
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _restore_claimed_path(self, claimed: Path, destination: Path) -> bool:
+        try:
+            claimed_before = claimed.lstat()
+            os.link(
+                claimed,
+                destination,
+                follow_symlinks=False,
             )
+            claimed_after = claimed.lstat()
+            current = destination.lstat()
+            if (
+                claimed_after.st_dev != current.st_dev
+                or claimed_after.st_ino != current.st_ino
+                or stat.S_IFMT(claimed_after.st_mode) != stat.S_IFMT(current.st_mode)
+                or claimed_before.st_dev != claimed_after.st_dev
+                or claimed_before.st_ino != claimed_after.st_ino
+            ):
+                return False
+            claimed.unlink()
+            self._fsync_directory(destination.parent)
+            return True
+        except (FileExistsError, FileNotFoundError, OSError):
+            return False
+
+    def _remove_owned_backup(
+        self,
+        backup: Path,
+        config_before: bytes,
+        backup_identity: tuple[int, int, int, int, int, int],
+    ) -> bool:
+        cleanup_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".config.json.digitalisierer.backup-claim.",
+                dir=str(backup.parent),
+            )
+        )
+        claimed_backup = cleanup_dir / "backup"
+        try:
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+                os.rename(backup, claimed_backup)
+            except (FileNotFoundError, OSError):
+                return False
+            try:
+                backup_content, current_identity = self._snapshot_regular_file(
+                    claimed_backup
+                )
+            except OSError:
+                self._restore_claimed_path(claimed_backup, backup)
+                return False
+            if not self._same_claimed_preimage(
+                config_before,
+                backup_identity,
+                backup_content,
+                current_identity,
+            ):
+                self._restore_claimed_path(claimed_backup, backup)
+                return False
+            claimed_backup.unlink()
+            self._fsync_directory(backup.parent)
+            return True
         finally:
             try:
-                os.unlink(temporary)
-            except FileNotFoundError:
+                cleanup_dir.rmdir()
+            except OSError:
                 pass
 
-    def _rollback_failed_prelaunch(
+    def _restore_claimed_config(self, claimed: Path) -> bool:
+        return self._restore_claimed_path(claimed, self.config_path)
+
+    def _rollback_published_claim(
         self,
         *,
+        claimed_preimage: Path,
+        preset_content: bytes,
+        published_identity: tuple[int, int, int, int, int, int],
+    ) -> bool:
+        rollback_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".config.json.digitalisierer.rollback-claim.",
+                dir=str(self.config_path.parent),
+            )
+        )
+        published_claim = rollback_dir / "published"
+        try:
+            try:
+                os.rename(self.config_path, published_claim)
+            except FileNotFoundError:
+                return False
+            try:
+                current_content, current_identity = self._snapshot_regular_file(
+                    published_claim
+                )
+            except OSError:
+                self._restore_claimed_config(published_claim)
+                return False
+            if not self._same_claimed_preimage(
+                preset_content,
+                published_identity,
+                current_content,
+                current_identity,
+            ):
+                self._restore_claimed_config(published_claim)
+                return False
+            if not self._restore_claimed_config(claimed_preimage):
+                return False
+            try:
+                published_after, published_after_identity = (
+                    self._snapshot_regular_file(published_claim)
+                )
+                if self._same_claimed_preimage(
+                    preset_content,
+                    published_identity,
+                    published_after,
+                    published_after_identity,
+                ):
+                    published_claim.unlink()
+                    self._fsync_directory(self.config_path.parent)
+            except OSError:
+                pass
+            return True
+        finally:
+            try:
+                rollback_dir.rmdir()
+            except OSError:
+                pass
+
+    def _apply_curved_books_preset_transaction(
+        self,
+        backup: Path,
+    ) -> tuple[
+        dict[str, object],
+        bytes,
+        int,
+        bytes,
+        tuple[int, int, int, int, int, int],
+        tuple[int, int, int, int, int, int] | None,
+    ]:
+        self._require_config_write_ready()
+        try:
+            config_before, config_before_identity = self._config_snapshot()
+            raw = config_before.decode("utf-8")
+        except UnicodeError as exc:
+            raise CzurAdapterError(
+                f"CZUR config cannot be read as UTF-8: {self.config_path}"
+            ) from exc
+        except OSError as exc:
+            raise CzurAdapterError(
+                f"CZUR config cannot be snapshotted before preset: {self.config_path}"
+            ) from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CzurAdapterError("CZUR config is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise CzurAdapterError("CZUR config root must be an object")
+        setting = payload.setdefault("setting", {})
+        if not isinstance(setting, dict):
+            raise CzurAdapterError("CZUR config setting must be an object")
+
+        before: dict[str, object] = {}
+        for key, value in CURVED_BOOKS_SETTINGS.items():
+            before[key] = setting.get(key)
+            setting[key] = value
+        preset_content = (
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+
+        current, current_identity = self._config_snapshot()
+        if current != config_before or current_identity != config_before_identity:
+            raise CzurAdapterError(
+                "CZUR config changed before Curved Books preset could be applied"
+            )
+
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".config.json.digitalisierer.",
+            dir=str(self.config_path.parent),
+        )
+        temporary = Path(temporary_name)
+        guard_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".config.json.digitalisierer.claim.",
+                dir=str(self.config_path.parent),
+            )
+        )
+        claimed_preimage = guard_dir / "preimage"
+        claimed = False
+        published = False
+        published_identity: tuple[int, int, int, int, int, int] | None = None
+        backup_identity: tuple[int, int, int, int, int, int] | None = None
+        rollback_complete = False
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(preset_content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+
+            current, current_identity = self._config_snapshot()
+            if (
+                current != config_before
+                or current_identity != config_before_identity
+            ):
+                raise CzurAdapterError(
+                    "CZUR config changed before Curved Books preset could be applied"
+                )
+
+            os.rename(self.config_path, claimed_preimage)
+            claimed = True
+            claimed_content, claimed_identity = self._snapshot_regular_file(
+                claimed_preimage
+            )
+            if not self._same_claimed_preimage(
+                config_before,
+                config_before_identity,
+                claimed_content,
+                claimed_identity,
+            ):
+                raise CzurAdapterError(
+                    "CZUR config changed while Curved Books preset was being claimed"
+                )
+
+            backup_identity = self._create_backup_if_absent(
+                backup,
+                config_before,
+            )
+
+            try:
+                os.link(
+                    temporary,
+                    self.config_path,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise CzurAdapterError(
+                    "CZUR config changed immediately before Curved Books preset publication"
+                ) from exc
+            published = True
+            published_identity = self._config_stat_identity(
+                os.stat(temporary, follow_symlinks=False)
+            )
+            self._fsync_directory(self.config_path.parent)
+
+            config_after, config_after_identity = self._config_snapshot()
+            if (
+                config_after != preset_content
+                or config_after_identity != published_identity
+            ):
+                raise CzurAdapterError(
+                    "CZUR config changed while Curved Books preset was being applied"
+                )
+
+            temporary.unlink()
+            self._fsync_directory(self.config_path.parent)
+            config_after, config_after_identity = self._config_snapshot()
+            if not self._same_claimed_preimage(
+                preset_content,
+                published_identity,
+                config_after,
+                config_after_identity,
+            ):
+                raise CzurAdapterError(
+                    "CZUR config changed while Curved Books preset was being finalized"
+                )
+
+            claimed_after, claimed_after_identity = self._snapshot_regular_file(
+                claimed_preimage
+            )
+            if (
+                claimed_after != claimed_content
+                or claimed_after_identity != claimed_identity
+            ):
+                raise CzurAdapterError(
+                    "CZUR config preimage changed while Curved Books preset was being applied"
+                )
+
+            claimed_preimage.unlink()
+            claimed = False
+            try:
+                guard_dir.rmdir()
+            except OSError:
+                pass
+            self._fsync_directory(self.config_path.parent)
+            return (
+                before,
+                config_before,
+                config_before_identity[-1],
+                config_after,
+                config_after_identity,
+                backup_identity,
+            )
+        except Exception as exc:
+            if published and published_identity is not None:
+                rollback_complete = self._rollback_published_claim(
+                    claimed_preimage=claimed_preimage,
+                    preset_content=preset_content,
+                    published_identity=published_identity,
+                )
+                if rollback_complete:
+                    claimed = False
+            elif claimed:
+                rollback_complete = self._restore_claimed_config(claimed_preimage)
+                if rollback_complete:
+                    claimed = False
+
+            backup_cleanup_failed = False
+            if rollback_complete and backup_identity is not None:
+                backup_cleanup_failed = not self._remove_owned_backup(
+                    backup,
+                    config_before,
+                    backup_identity,
+                )
+            if backup_cleanup_failed:
+                raise CzurAdapterError(
+                    f"{exc}; CZUR backup rollback refused"
+                ) from exc
+            raise
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            if not claimed:
+                try:
+                    guard_dir.rmdir()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _rollback_created_directories(
         output_dir: Path,
         output_existed: bool,
+        capture_root: Path,
         capture_root_existed: bool,
-        backup: Path,
-        backup_existed: bool,
-        config_before: bytes,
-        config_before_mode: int,
-        config_after: bytes,
-        config_after_identity: tuple[int, int, int, int, int, int],
     ) -> list[str]:
         errors: list[str] = []
-        config_restored = False
-        try:
-            current, current_identity = self._config_snapshot()
-            if current != config_after or current_identity != config_after_identity:
-                errors.append("CZUR config changed after preset; rollback refused")
-            else:
-                self._atomic_restore_config(config_before, config_before_mode)
-                config_restored = True
-        except OSError as exc:
-            errors.append(f"CZUR config rollback failed: {exc}")
-
-        if not backup_existed and backup.exists():
-            try:
-                if config_restored and backup.is_file() and backup.read_bytes() == config_before:
-                    backup.unlink()
-                else:
-                    errors.append("CZUR backup rollback refused")
-            except OSError as exc:
-                errors.append(f"CZUR backup rollback failed: {exc}")
-
         for path, existed, label in (
             (output_dir, output_existed, "session output"),
-            (self.capture_root, capture_root_existed, "capture root"),
+            (capture_root, capture_root_existed, "capture root"),
         ):
             if existed:
                 continue
@@ -304,6 +633,94 @@ class CzurCaptureBackend:
                 pass
             except OSError as exc:
                 errors.append(f"{label} rollback failed: {exc}")
+        return errors
+
+    def _restore_config_snapshot(
+        self,
+        *,
+        expected_content: bytes,
+        expected_identity: tuple[int, int, int, int, int, int],
+        restore_content: bytes,
+        restore_mode: int,
+    ) -> tuple[bool, Path | None]:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".config.json.digitalisierer.rollback-preimage.",
+            dir=str(self.config_path.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(restore_content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, restore_mode)
+            self._fsync_directory(self.config_path.parent)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+        restored = self._rollback_published_claim(
+            claimed_preimage=temporary,
+            preset_content=expected_content,
+            published_identity=expected_identity,
+        )
+        if restored:
+            return True, None
+        return False, temporary
+
+    def _rollback_failed_prelaunch(
+        self,
+        *,
+        output_dir: Path,
+        output_existed: bool,
+        capture_root_existed: bool,
+        backup: Path,
+        backup_existed: bool,
+        backup_identity: tuple[int, int, int, int, int, int] | None,
+        config_before: bytes,
+        config_before_mode: int,
+        config_after: bytes,
+        config_after_identity: tuple[int, int, int, int, int, int],
+    ) -> list[str]:
+        errors: list[str] = []
+        config_restored = False
+        try:
+            config_restored, preserved_preimage = self._restore_config_snapshot(
+                expected_content=config_after,
+                expected_identity=config_after_identity,
+                restore_content=config_before,
+                restore_mode=config_before_mode,
+            )
+            if not config_restored:
+                detail = "CZUR config changed after preset; rollback refused"
+                if preserved_preimage is not None:
+                    detail += f"; original preimage preserved at {preserved_preimage}"
+                errors.append(detail)
+        except OSError as exc:
+            errors.append(f"CZUR config rollback failed: {exc}")
+
+        if not backup_existed and backup_identity is not None:
+            if config_restored:
+                if not self._remove_owned_backup(
+                    backup,
+                    config_before,
+                    backup_identity,
+                ):
+                    errors.append("CZUR backup rollback refused")
+            elif os.path.lexists(backup):
+                errors.append("CZUR backup rollback refused")
+
+        errors.extend(
+            self._rollback_created_directories(
+                output_dir,
+                output_existed,
+                self.capture_root,
+                capture_root_existed,
+            )
+        )
         self._session_output = None
         return errors
 
@@ -368,26 +785,33 @@ class CzurCaptureBackend:
         backup = self.config_path.with_name(
             "config.pre-digitalisierer-curved-books.json"
         )
-        backup_existed = backup.exists()
-        try:
-            config_before, config_before_identity = self._config_snapshot()
-            config_before_mode = config_before_identity[-1]
-        except OSError as exc:
-            raise CzurAdapterError(
-                f"CZUR config cannot be snapshotted before launch: {self.config_path}"
-            ) from exc
+        backup_existed = os.path.lexists(backup)
 
         self._session_output = session_output
         self._session_output.mkdir(parents=True, exist_ok=True)
         self.capture_root.mkdir(parents=True, exist_ok=True)
-        self.apply_curved_books_preset()
         try:
-            config_after, config_after_identity = self._config_snapshot()
-        except OSError as exc:
+            (
+                _,
+                config_before,
+                config_before_mode,
+                config_after,
+                config_after_identity,
+                backup_identity,
+            ) = self._apply_curved_books_preset_transaction(backup)
+        except Exception as exc:
+            rollback_errors = self._rollback_created_directories(
+                session_output,
+                output_existed,
+                self.capture_root,
+                capture_root_existed,
+            )
             self._session_output = None
-            raise CzurAdapterError(
-                f"CZUR config cannot be verified after preset: {self.config_path}"
-            ) from exc
+            if rollback_errors:
+                raise CzurAdapterError(
+                    f"{exc}; rollback incomplete: " + "; ".join(rollback_errors)
+                ) from exc
+            raise
 
         if windows:
             self._focus(windows[-1])
@@ -411,6 +835,7 @@ class CzurCaptureBackend:
                 capture_root_existed=capture_root_existed,
                 backup=backup,
                 backup_existed=backup_existed,
+                backup_identity=backup_identity,
                 config_before=config_before,
                 config_before_mode=config_before_mode,
                 config_after=config_after,

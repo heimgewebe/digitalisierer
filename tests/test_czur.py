@@ -357,6 +357,531 @@ def test_start_refuses_rollback_after_foreign_config_mode_change(
     assert backend._session_output is None
 
 
+def test_start_does_not_overwrite_foreign_config_at_rollback_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_rename = os.rename
+    foreign = b'{"setting":{"unrelated":"foreign-at-rollback"}}\n'
+    raced = False
+
+    def racing_rename(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal raced
+        destination = Path(dst)
+        if (
+            not raced
+            and Path(src) == config
+            and destination.name == "published"
+            and destination.parent.name.startswith(
+                ".config.json.digitalisierer.rollback-claim."
+            )
+        ):
+            raced = True
+            replacement = tmp_path / "foreign-config.json"
+            replacement.write_bytes(foreign)
+            replacement.chmod(0o644)
+            os.replace(replacement, config)
+        original_rename(src, dst)
+
+    def fail_launcher(*args: object, **kwargs: object) -> None:
+        raise OSError("forced launcher failure")
+
+    monkeypatch.setattr("digitalisierer.czur.os.rename", racing_rename)
+    monkeypatch.setattr("digitalisierer.czur.subprocess.Popen", fail_launcher)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="CZUR config changed after preset; rollback refused",
+    ):
+        backend.start(output_dir)
+
+    assert raced is True
+    assert config.read_bytes() == foreign
+    assert config.stat().st_mode & 0o7777 == 0o644
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_start_does_not_restore_snapshot_older_than_preset_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text(
+        "#!/definitely/missing/digitalisierer-interpreter\nexit 0\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_snapshot = backend._config_snapshot
+    calls = 0
+    foreign = (
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "foreign",
+                    "scan_preview_capture_type": "foreign-single",
+                }
+            }
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    def snapshot_then_foreign_change(
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal calls
+        snapshot = original_snapshot()
+        calls += 1
+        if calls == 1:
+            config.write_bytes(foreign)
+            config.chmod(0o644)
+        return snapshot
+
+    monkeypatch.setattr(backend, "_config_snapshot", snapshot_then_foreign_change)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="changed before Curved Books preset could be applied",
+    ):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == foreign
+    assert config.stat().st_mode & 0o7777 == 0o644
+    assert not config.with_name("config.pre-digitalisierer-curved-books.json").exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_start_does_not_overwrite_foreign_config_created_at_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_link = os.link
+    raced = False
+    before = config.read_bytes()
+    foreign = b'{"setting":{"unrelated":"foreign-at-publication"}}\n'
+
+    def racing_link(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal raced
+        if (
+            not raced
+            and Path(dst) == config
+            and Path(src).name.startswith(".config.json.digitalisierer.")
+        ):
+            raced = True
+            config.write_bytes(foreign)
+            config.chmod(0o644)
+        original_link(src, dst, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("digitalisierer.czur.os.link", racing_link)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="changed immediately before Curved Books preset publication",
+    ):
+        backend.start(output_dir)
+
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    assert raced is True
+    assert config.read_bytes() == foreign
+    assert config.stat().st_mode & 0o7777 == 0o644
+    assert backup.read_bytes() == before
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_apply_preset_uses_same_fail_if_exists_publication_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    backend = CzurCaptureBackend(config_path=config)
+    original_link = os.link
+    raced = False
+    before = config.read_bytes()
+    foreign = b'{"setting":{"scan_preview_capture_type":"foreign"}}\n'
+
+    def racing_link(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal raced
+        if (
+            not raced
+            and Path(dst) == config
+            and Path(src).name.startswith(".config.json.digitalisierer.")
+        ):
+            raced = True
+            config.write_bytes(foreign)
+        original_link(src, dst, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("digitalisierer.czur.os.link", racing_link)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="changed immediately before Curved Books preset publication",
+    ):
+        backend.apply_curved_books_preset()
+
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    assert raced is True
+    assert config.read_bytes() == foreign
+    assert backup.read_bytes() == before
+
+
+def test_start_keeps_preimage_backup_when_foreign_write_follows_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_fsync_directory = backend._fsync_directory
+    calls = 0
+    before = config.read_bytes()
+    foreign = b'{"setting":{"unrelated":"foreign-after-publication"}}\n'
+
+    def fsync_then_foreign_write(directory: Path) -> None:
+        nonlocal calls
+        original_fsync_directory(directory)
+        calls += 1
+        if calls == 2:
+            config.write_bytes(foreign)
+
+    monkeypatch.setattr(backend, "_fsync_directory", fsync_then_foreign_write)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="changed while Curved Books preset was being applied",
+    ):
+        backend.start(output_dir)
+
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    assert config.read_bytes() == foreign
+    assert backup.read_bytes() == before
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+@pytest.mark.parametrize("backup_kind", ["file", "symlink"])
+def test_apply_preset_leaves_existing_backup_untouched(
+    tmp_path: Path,
+    backup_kind: str,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    target = tmp_path / "foreign-backup-target"
+    if backup_kind == "file":
+        backup.write_bytes(b"foreign-backup\n")
+    else:
+        target.write_bytes(b"foreign-symlink-target\n")
+        backup.symlink_to(target)
+    before_lstat = backup.lstat()
+    before_bytes = target.read_bytes() if backup_kind == "symlink" else backup.read_bytes()
+    before_target = os.readlink(backup) if backup_kind == "symlink" else None
+    backend = CzurCaptureBackend(config_path=config)
+
+    backend.apply_curved_books_preset()
+
+    after_lstat = backup.lstat()
+    assert (after_lstat.st_dev, after_lstat.st_ino, after_lstat.st_mode) == (
+        before_lstat.st_dev,
+        before_lstat.st_ino,
+        before_lstat.st_mode,
+    )
+    if backup_kind == "symlink":
+        assert backup.is_symlink()
+        assert os.readlink(backup) == before_target
+        assert target.read_bytes() == before_bytes
+    else:
+        assert backup.read_bytes() == before_bytes
+
+
+def test_failed_preset_cleanup_preserves_foreign_backup_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_link = os.link
+    original_rename = os.rename
+    foreign = b"foreign-backup-replacement\n"
+    cleanup_raced = False
+
+    def fail_publish_link(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if (
+            Path(dst) == config
+            and Path(src).name.startswith(".config.json.digitalisierer.")
+        ):
+            raise OSError("forced preset publication failure")
+        original_link(src, dst, follow_symlinks=follow_symlinks)
+
+    def race_backup_cleanup(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal cleanup_raced
+        source = Path(src)
+        destination = Path(dst)
+        if (
+            not cleanup_raced
+            and source == backup
+            and destination.name == "backup"
+            and destination.parent.name.startswith(
+                ".config.json.digitalisierer.backup-claim."
+            )
+        ):
+            cleanup_raced = True
+            replacement = tmp_path / "foreign-backup"
+            replacement.write_bytes(foreign)
+            os.replace(replacement, backup)
+        original_rename(src, dst)
+
+    monkeypatch.setattr("digitalisierer.czur.os.link", fail_publish_link)
+    monkeypatch.setattr("digitalisierer.czur.os.rename", race_backup_cleanup)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="CZUR backup rollback refused",
+    ):
+        backend.apply_curved_books_preset()
+
+    assert cleanup_raced is True
+    assert backup.read_bytes() == foreign
+
+
+def test_start_rejects_symlinked_config_and_rolls_back_created_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "real-config.json"
+    target.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = target.read_bytes()
+    config = tmp_path / "config.json"
+    config.symlink_to(target)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+
+    with pytest.raises(CzurAdapterError, match="config is not a regular file"):
+        backend.start(output_dir)
+
+    assert config.is_symlink()
+    assert target.read_bytes() == before
+    assert not config.with_name("config.pre-digitalisierer-curved-books.json").exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_start_preset_failure_preserves_existing_output_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    capture_root.mkdir()
+    output_dir.mkdir()
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_snapshot = backend._config_snapshot
+    calls = 0
+    foreign = b'{"setting":{"scan_preview_capture_type":"foreign"}}\n'
+
+    def snapshot_then_foreign_change(
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal calls
+        snapshot = original_snapshot()
+        calls += 1
+        if calls == 1:
+            config.write_bytes(foreign)
+        return snapshot
+
+    monkeypatch.setattr(backend, "_config_snapshot", snapshot_then_foreign_change)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="changed before Curved Books preset could be applied",
+    ):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == foreign
+    assert output_dir.is_dir()
+    assert capture_root.is_dir()
+    assert backend._session_output is None
+
+
 @pytest.mark.parametrize(
     ("raw_config", "message"),
     [
@@ -570,8 +1095,6 @@ def test_status_handles_config_read_failure(
     monkeypatch.setattr(Path, "read_text", fail_config_read)
 
     assert backend.status().ready is False
-    with pytest.raises(CzurAdapterError, match="cannot be read as UTF-8"):
-        backend.apply_curved_books_preset()
 
 def test_status_handles_xdotool_execution_failure_before_start_side_effects(
     tmp_path: Path,
