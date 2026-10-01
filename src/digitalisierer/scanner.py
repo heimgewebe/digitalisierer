@@ -15,6 +15,7 @@ import secrets
 import shutil
 import stat
 import statistics
+import tempfile
 from typing import Any, Iterator, Protocol
 
 from .domain import MediaAsset, MediaKind, ProcessingSession, QualityFinding, SessionAsset
@@ -715,7 +716,10 @@ def _inspect_image(path: Path) -> dict[str, object]:
     }
 
 
-def _write_thumbnail(source: Path, target: Path) -> None:
+def _write_thumbnail(
+    source: Path,
+    target: Path,
+) -> _CreatedArtifactState | None:
     Image, _ = _pillow_modules()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
@@ -730,6 +734,9 @@ def _write_thumbnail(source: Path, target: Path) -> None:
                 os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         expected_sha256 = _sha256_file(temporary)
+        expected_identity = _stat_identity(
+            os.stat(temporary, follow_symlinks=False)
+        )
         try:
             _rename_noreplace(temporary, target)
         except FileExistsError:
@@ -742,6 +749,35 @@ def _write_thumbnail(source: Path, target: Path) -> None:
                     f"scan thumbnail collision for {target.name}"
                 )
             temporary.unlink()
+            return None
+        expected_state = _CreatedArtifactState(
+            path=target,
+            sha256=expected_sha256,
+            identity=expected_identity,
+        )
+        try:
+            published_sha256, published_identity = _regular_file_snapshot(
+                target,
+                purpose="published scan thumbnail",
+            )
+            if (
+                published_identity != expected_identity
+                or not secrets.compare_digest(published_sha256, expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"scan thumbnail changed during publication: {target.name}"
+                )
+        except Exception as exc:
+            if not _remove_created_artifact(expected_state):
+                raise ScannerWorkflowError(
+                    f"failed to roll back published scan thumbnail: {target.name}"
+                ) from exc
+            raise
+        return _CreatedArtifactState(
+            path=target,
+            sha256=published_sha256,
+            identity=published_identity,
+        )
     finally:
         try:
             temporary.unlink()
@@ -790,6 +826,13 @@ def _existing_regular_file_hash(path: Path) -> str | None:
         ) from exc
     finally:
         os.close(fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _CreatedArtifactState:
+    path: Path
+    sha256: str
+    identity: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -972,11 +1015,19 @@ def _prepare_thumbnail_repair(
                 f"scan thumbnail changed while preparing repair: {thumbnail.name}"
             )
     try:
-        _write_thumbnail(source, thumbnail)
+        published = _write_thumbnail(source, thumbnail)
+        if published is None:
+            raise ScannerWorkflowError(
+                f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+            )
         published_sha256, published_identity = _regular_file_snapshot(
             thumbnail,
             purpose="repaired scan thumbnail",
         )
+        if published_identity[:2] != published.identity[:2]:
+            raise ScannerWorkflowError(
+                f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+            )
     except Exception as exc:
         if (
             preimage_claim is not None
@@ -1046,13 +1097,21 @@ def _cleanup_thumbnail_repair(state: _ThumbnailRepairState) -> None:
     )
 
 
+def _remove_created_artifact(state: _CreatedArtifactState) -> bool:
+    return _remove_owned_claim(
+        state.path,
+        state.sha256,
+        state.identity,
+    )
+
+
 def _copy_preserved(
     source: Path,
     target: Path,
     *,
     expected_sha256: str,
     expected_stat: os.stat_result,
-) -> None:
+) -> _CreatedArtifactState | None:
     target.parent.mkdir(parents=True, exist_ok=True)
     existing_hash = _existing_regular_file_hash(target)
     if existing_hash is not None:
@@ -1060,7 +1119,7 @@ def _copy_preserved(
             raise ScannerWorkflowError(
                 f"preserved source collision for {target.name}"
             )
-        return
+        return None
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     try:
         with _stable_source_descriptor(
@@ -1080,6 +1139,9 @@ def _copy_preserved(
                 f"scan source changed while preserving: {source}"
             )
         os.chmod(temporary, 0o600)
+        expected_identity = _stat_identity(
+            os.stat(temporary, follow_symlinks=False)
+        )
         try:
             os.link(temporary, target)
         except FileExistsError:
@@ -1088,7 +1150,37 @@ def _copy_preserved(
                 raise ScannerWorkflowError(
                     f"preserved source collision for {target.name}"
                 )
+            temporary.unlink()
+            return None
+        expected_state = _CreatedArtifactState(
+            path=target,
+            sha256=expected_sha256,
+            identity=expected_identity,
+        )
+        try:
+            published_sha256, published_identity = _regular_file_snapshot(
+                target,
+                purpose="published preserved source",
+            )
+            if (
+                published_identity != expected_identity
+                or not secrets.compare_digest(published_sha256, expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"preserved source changed during publication: {target.name}"
+                )
+        except Exception as exc:
+            if not _remove_created_artifact(expected_state):
+                raise ScannerWorkflowError(
+                    f"failed to roll back published preserved source: {target.name}"
+                ) from exc
+            raise
         temporary.unlink()
+        return _CreatedArtifactState(
+            path=target,
+            sha256=published_sha256,
+            identity=published_identity,
+        )
     finally:
         try:
             temporary.unlink()
@@ -1412,6 +1504,7 @@ def _observe_scan_folder_unlocked(
     imported: list[str] = []
     skipped: list[str] = []
     pending_thumbnail_repairs: list[tuple[dict[str, Any], Path, Path]] = []
+    created_artifacts: list[_CreatedArtifactState] = []
 
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
@@ -1487,27 +1580,47 @@ def _observe_scan_folder_unlocked(
         preserved_rel = f"sources/{asset_id}{suffix}"
         thumbnail_rel = f"thumbnails/{asset_id}.jpg"
         target = paths.root / preserved_rel
-        _copy_preserved(
-            source,
-            target,
-            expected_sha256=sha256,
-            expected_stat=source_stat,
-        )
-        image = _inspect_image(target)
-        thumbnail_path = paths.root / thumbnail_rel
-        _write_thumbnail(target, thumbnail_path)
-        thumbnail_sha256 = _sha256_file(thumbnail_path)
-        record: dict[str, Any] = {
-            "asset_id": asset_id,
-            "source_name": source.name,
-            "capture_source": str(source),
-            "sha256": sha256,
-            "bytes": source_stat.st_size,
-            "preserved_path": preserved_rel,
-            "thumbnail_path": thumbnail_rel,
-            "thumbnail_sha256": thumbnail_sha256,
-            "image": image,
-        }
+        attempt_created: list[_CreatedArtifactState] = []
+        try:
+            source_created = _copy_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+            if source_created is not None:
+                attempt_created.append(source_created)
+            image = _inspect_image(target)
+            thumbnail_path = paths.root / thumbnail_rel
+            thumbnail_created = _write_thumbnail(target, thumbnail_path)
+            if thumbnail_created is not None:
+                attempt_created.append(thumbnail_created)
+            thumbnail_sha256, _ = _regular_file_snapshot(
+                thumbnail_path,
+                purpose="scan thumbnail",
+            )
+            record: dict[str, Any] = {
+                "asset_id": asset_id,
+                "source_name": source.name,
+                "capture_source": str(source),
+                "sha256": sha256,
+                "bytes": source_stat.st_size,
+                "preserved_path": preserved_rel,
+                "thumbnail_path": thumbnail_rel,
+                "thumbnail_sha256": thumbnail_sha256,
+                "image": image,
+            }
+        except Exception as exc:
+            cleanup_failed = False
+            for state in reversed(attempt_created):
+                if not _remove_created_artifact(state):
+                    cleanup_failed = True
+            if cleanup_failed:
+                raise ScannerWorkflowError(
+                    "failed to roll back newly created scanner artifacts"
+                ) from exc
+            raise
+        created_artifacts.extend(attempt_created)
         assets.append(record)
         known_by_id[asset_id] = record
         known_by_capture_source[source_reference] = record
@@ -1546,22 +1659,23 @@ def _observe_scan_folder_unlocked(
             for path in current_selected
         ]
 
-    # Avoid publishing dependent metadata when capture membership or identity
-    # has already changed while processing.
-    if current_capture_signature() != before_signature:
-        raise ScannerWorkflowError(
-            "capture folder changed while Digitalisierer observed it"
-        )
-
-    findings_text = _json_text(
-        {
-            "schema_version": 1,
-            "kind": "digitalisierer.scan-findings",
-            "findings": [_finding_payload(item) for item in findings],
-        }
-    )
     thumbnail_rollbacks: list[_ThumbnailRepairState] = []
+    metadata_mutated = False
     try:
+        # Avoid publishing dependent metadata when capture membership or identity
+        # has already changed while processing.
+        if current_capture_signature() != before_signature:
+            raise ScannerWorkflowError(
+                "capture folder changed while Digitalisierer observed it"
+            )
+
+        findings_text = _json_text(
+            {
+                "schema_version": 1,
+                "kind": "digitalisierer.scan-findings",
+                "findings": [_finding_payload(item) for item in findings],
+            }
+        )
         for record, preserved, thumbnail in pending_thumbnail_repairs:
             rollback_state = _prepare_thumbnail_repair(
                 preserved,
@@ -1582,6 +1696,7 @@ def _observe_scan_folder_unlocked(
         # Keep repaired thumbnails and the final session commit in the same
         # rollback boundary so any reported observation failure restores the
         # previous filesystem and metadata snapshot.
+        metadata_mutated = True
         _atomic_write_text(paths.review_file, _json_text(review))
         _atomic_write_text(paths.findings_file, findings_text)
         if current_capture_signature() != before_signature:
@@ -1600,16 +1715,26 @@ def _observe_scan_folder_unlocked(
             except Exception as exc:
                 if rollback_error is None:
                     rollback_error = exc
-        for metadata_path, previous_text in (
-            (paths.session_file, previous_session_text),
-            (paths.review_file, previous_review_text),
-            (paths.findings_file, previous_findings_text),
-        ):
+        for created_state in reversed(created_artifacts):
             try:
-                _atomic_write_text(metadata_path, previous_text)
+                if not _remove_created_artifact(created_state):
+                    raise ScannerWorkflowError(
+                        "new scanner artifact changed before rollback"
+                    )
             except Exception as exc:
                 if rollback_error is None:
                     rollback_error = exc
+        if metadata_mutated:
+            for metadata_path, previous_text in (
+                (paths.session_file, previous_session_text),
+                (paths.review_file, previous_review_text),
+                (paths.findings_file, previous_findings_text),
+            ):
+                try:
+                    _atomic_write_text(metadata_path, previous_text)
+                except Exception as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
         if rollback_error is not None:
             raise ScannerWorkflowError(
                 "failed to restore scanner observation after failure"
@@ -1956,7 +2081,11 @@ def _verify_preserved_sources(
         ):
             raise ScannerWorkflowError("scan asset identity is incomplete")
         path = _preserved_source_path(paths, asset_id, relative)
-        if _sha256_file(path) != expected:
+        digest, identity = _regular_file_snapshot(
+            path,
+            purpose="preserved scanner source",
+        )
+        if not secrets.compare_digest(digest, expected):
             raise ScannerWorkflowError(
                 f"preserved scanner source hash mismatch: {asset_id}"
             )
@@ -1964,11 +2093,82 @@ def _verify_preserved_sources(
             {
                 "asset_id": asset_id,
                 "sha256": expected,
-                "bytes": path.stat().st_size,
+                "bytes": identity[2],
                 "path": relative,
             }
         )
     return verified
+
+
+@contextmanager
+def _verified_export_source_snapshots(
+    active: list[MediaAsset],
+    staging: Path,
+) -> Iterator[list[Path]]:
+    snapshots: list[Any] = []
+    bound_paths: list[Path] = []
+    try:
+        for asset in active:
+            expected_sha256 = asset.sha256
+            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+                raise ScannerWorkflowError(
+                    f"scanner source digest is invalid for export: {asset.asset_id}"
+                )
+            try:
+                source_fd = os.open(
+                    asset.path,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                )
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"preserved scanner source cannot be snapshotted: {asset.asset_id}"
+                ) from exc
+            snapshot = tempfile.TemporaryFile(mode="w+b", dir=staging)
+            snapshots.append(snapshot)
+            try:
+                before = os.fstat(source_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source is not regular: {asset.asset_id}"
+                    )
+                digest = hashlib.sha256()
+                with os.fdopen(os.dup(source_fd), "rb") as source_handle:
+                    for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        snapshot.write(chunk)
+                snapshot.flush()
+                os.fsync(snapshot.fileno())
+                after = os.fstat(source_fd)
+                try:
+                    current = asset.path.lstat()
+                except OSError as exc:
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {asset.asset_id}"
+                    ) from exc
+                snapshot_stat = os.fstat(snapshot.fileno())
+                if (
+                    _stat_identity(before) != _stat_identity(after)
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_dev != after.st_dev
+                    or current.st_ino != after.st_ino
+                    or _stat_identity(current) != _stat_identity(after)
+                    or snapshot_stat.st_size != after.st_size
+                    or not secrets.compare_digest(
+                        digest.hexdigest(),
+                        expected_sha256,
+                    )
+                ):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {asset.asset_id}"
+                    )
+                snapshot.seek(0)
+                bound_paths.append(Path(f"/proc/self/fd/{snapshot.fileno()}"))
+            finally:
+                os.close(source_fd)
+        yield bound_paths
+    finally:
+        for snapshot in reversed(snapshots):
+            snapshot.close()
 
 
 class _Img2PdfBuilder:
@@ -2161,7 +2361,8 @@ def finalize_scan_session(
         report = staging / "report.txt"
         manifest_path = staging / "manifest.json"
 
-        pdf_builder([asset.path for asset in active], master)
+        with _verified_export_source_snapshots(active, staging) as export_sources:
+            pdf_builder(export_sources, master)
         if not master.is_file():
             raise ScannerWorkflowError("master PDF builder produced no output")
         ocr_backend.searchable_pdf(

@@ -1298,6 +1298,8 @@ def test_observe_findings_failure_does_not_publish_session(
 
     for metadata_path, expected in before.items():
         assert metadata_path.read_bytes() == expected
+    assert list(paths.sources.iterdir()) == []
+    assert list(paths.thumbnails.iterdir()) == []
     with pytest.raises(
         ScannerWorkflowError,
         match="scanner session has no included pages",
@@ -1359,12 +1361,126 @@ def test_observe_session_commit_failure_restores_previous_metadata(
     assert failed is True
     for metadata_path, expected in before.items():
         assert metadata_path.read_bytes() == expected
+    assert list(paths.sources.iterdir()) == []
+    assert list(paths.thumbnails.iterdir()) == []
 
     monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
     resumed = observe_scan_folder(paths, capture)
     assert len(resumed.imported_asset_ids) == 1
     processing = load_processing_session(paths)
     assert len(processing.ordered_assets()) == 1
+
+
+@pytest.mark.parametrize("artifact_kind", ["source", "thumbnail"])
+def test_publication_verification_failure_removes_owned_new_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / "published"
+    output_dir.mkdir()
+    target = output_dir / ("source.jpg" if artifact_kind == "source" else "thumb.jpg")
+    original_snapshot = scanner_module._regular_file_snapshot
+    failed = False
+
+    def fail_published_snapshot(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal failed
+        if purpose.startswith("published ") and not failed:
+            failed = True
+            raise ScannerWorkflowError("synthetic post-publication verification failure")
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        fail_published_snapshot,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="synthetic post-publication verification failure",
+    ):
+        if artifact_kind == "source":
+            sha256, source_stat = scanner_module._stable_hash(source)
+            scanner_module._copy_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+        else:
+            scanner_module._write_thumbnail(source, target)
+
+    assert failed is True
+    assert not target.exists()
+    assert list(output_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("artifact_kind", ["source", "thumbnail"])
+def test_observe_rollback_preserves_foreign_replacement_of_new_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    capture = tmp_path / f"capture-new-artifact-foreign-{artifact_kind}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        f"new-artifact-foreign-{artifact_kind}",
+        tmp_path / "library",
+    )
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    original_write = scanner_module._atomic_write_text
+    foreign = f"foreign-{artifact_kind}-replacement".encode()
+    replacement_path: Path | None = None
+    failed = False
+
+    def fail_session_with_foreign_artifact(path: Path, content: str) -> None:
+        nonlocal failed, replacement_path
+        original_write(path, content)
+        if path == paths.session_file and not failed:
+            artifact_dir = (
+                paths.sources if artifact_kind == "source" else paths.thumbnails
+            )
+            created = list(artifact_dir.iterdir())
+            assert len(created) == 1
+            replacement_path = created[0]
+            replacement_path.unlink()
+            replacement_path.write_bytes(foreign)
+            failed = True
+            raise OSError(
+                f"synthetic session failure after foreign {artifact_kind} replacement"
+            )
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        fail_session_with_foreign_artifact,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="failed to restore scanner observation after failure",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert failed is True
+    assert replacement_path is not None
+    assert replacement_path.read_bytes() == foreign
+    other_dir = paths.thumbnails if artifact_kind == "source" else paths.sources
+    assert list(other_dir.iterdir()) == []
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_observe_rejects_capture_membership_change_at_commit_boundary(
@@ -1409,6 +1525,8 @@ def test_observe_rejects_capture_membership_change_at_commit_boundary(
     assert injected is True
     for metadata_path, expected in before.items():
         assert metadata_path.read_bytes() == expected
+    assert list(paths.sources.iterdir()) == []
+    assert list(paths.thumbnails.iterdir()) == []
 
     monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
     retried = observe_scan_folder(paths, capture)
@@ -1418,6 +1536,61 @@ def test_observe_rejects_capture_membership_change_at_commit_boundary(
         "image00001.jpg",
         "image00002.jpg",
     ]
+
+
+def test_finalize_uses_verified_snapshot_during_transient_source_rewrite(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-finalize-source-snapshot"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    _image(source, 100)
+    replacement = tmp_path / "replacement.jpg"
+    _image(replacement, 210)
+    paths = create_or_resume_scan_session(
+        "book",
+        "finalize-source-snapshot",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+    expected_digest = hashlib.sha256(original_bytes).digest()
+
+    class _RacingPdf:
+        name = "racing-pdf"
+
+        def version(self) -> str:
+            return "test"
+
+        def __call__(self, images: list[Path], output: Path) -> None:
+            assert len(images) == 1
+            assert images[0] != preserved
+            preserved.write_bytes(replacement_bytes)
+            try:
+                bound_bytes = images[0].read_bytes()
+            finally:
+                preserved.write_bytes(original_bytes)
+            output.write_bytes(b"PDF:" + hashlib.sha256(bound_bytes).digest())
+
+    exported = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_RacingPdf(),
+    )
+
+    assert preserved.read_bytes() == original_bytes
+    assert (exported.export_dir / "master.pdf").read_bytes() == (
+        b"PDF:" + expected_digest
+    )
+    manifest = json.loads(
+        (exported.export_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["active_order"][0]["sha256"] == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
 
 
 def test_finalize_export_identity_includes_pdf_builder_provenance(tmp_path: Path) -> None:
@@ -2229,9 +2402,10 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
     original_atomic_write = scanner_module._atomic_write_text
     failed = False
 
-    def renderer_with_changed_bytes(source_path: Path, target: Path) -> None:
-        original_thumbnail_writer(source_path, target)
+    def renderer_with_changed_bytes(source_path: Path, target: Path) -> object:
+        published = original_thumbnail_writer(source_path, target)
         target.write_bytes(target.read_bytes() + b"-renderer-drift")
+        return published
 
     def fail_session_once(path: Path, content: str) -> None:
         nonlocal failed
@@ -2306,12 +2480,13 @@ def test_thumbnail_rollback_refuses_replaced_preimage_claim(
     original_atomic_write = scanner_module._atomic_write_text
     failed = False
 
-    def replace_preimage_claim(source_path: Path, target: Path) -> None:
-        original_thumbnail_writer(source_path, target)
+    def replace_preimage_claim(source_path: Path, target: Path) -> object:
+        published = original_thumbnail_writer(source_path, target)
         claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
         assert len(claims) == 1
         claims[0].unlink()
         claims[0].write_bytes(foreign)
+        return published
 
     def fail_session_once(path: Path, content: str) -> None:
         nonlocal failed
