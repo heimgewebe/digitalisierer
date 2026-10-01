@@ -1110,6 +1110,90 @@ def test_observe_ignores_symlinked_image_entries(
     assert outside.read_bytes() != b""
 
 
+def test_stable_hash_rejects_symlink_swap_before_descriptor_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jpg"
+    outside = tmp_path / "outside.jpg"
+    _image(source, 90)
+    _image(outside, 180)
+    original_open = os.open
+    injected = False
+
+    def raced_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal injected
+        if os.fspath(path) == os.fspath(source) and not injected:
+            injected = True
+            source.unlink()
+            source.symlink_to(outside)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", raced_open)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        scanner_module._stable_hash(source)
+
+    assert injected is True
+    assert source.is_symlink()
+
+
+@pytest.mark.parametrize("preserve_name", ["_copy_preserved", "_replace_preserved"])
+def test_preserve_rejects_source_symlink_swap_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preserve_name: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    outside = tmp_path / "outside.jpg"
+    target = tmp_path / "preserved.jpg"
+    _image(source, 90)
+    _image(outside, 180)
+    expected_sha256, expected_stat = scanner_module._stable_hash(source)
+    original_open = os.open
+    injected = False
+
+    def raced_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal injected
+        if os.fspath(path) == os.fspath(source) and not injected:
+            injected = True
+            source.unlink()
+            source.symlink_to(outside)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", raced_open)
+    preserve = getattr(scanner_module, preserve_name)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        preserve(
+            source,
+            target,
+            expected_sha256=expected_sha256,
+            expected_stat=expected_stat,
+        )
+
+    assert injected is True
+    assert not target.exists()
+
+
 def test_default_pdf_builder_streams_to_img2pdf_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

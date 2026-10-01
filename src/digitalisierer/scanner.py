@@ -419,19 +419,78 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
 
 
-def _stable_hash(path: Path) -> tuple[str, os.stat_result]:
-    before = path.stat()
-    if not path.is_file():
-        raise ScannerWorkflowError(f"scan source must be a regular file: {path}")
-    if before.st_size <= 0 or before.st_size > MAX_SOURCE_IMAGE_BYTES:
-        raise ScannerWorkflowError(
-            f"scan source size is outside the supported boundary: {path}"
+@contextmanager
+def _stable_source_descriptor(
+    path: Path,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> Iterator[tuple[int, os.stat_result]]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
-    digest = _sha256_file(path)
-    after = path.stat()
-    if _stat_identity(before) != _stat_identity(after):
-        raise ScannerWorkflowError(f"scan source changed while hashing: {path}")
-    return digest, after
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"scan source must be a non-symlink regular file: {path}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"scan source must be a non-symlink regular file: {path}"
+            )
+        if before.st_size <= 0 or before.st_size > MAX_SOURCE_IMAGE_BYTES:
+            raise ScannerWorkflowError(
+                f"scan source size is outside the supported boundary: {path}"
+            )
+        if (
+            expected_stat is not None
+            and _stat_identity(before) != _stat_identity(expected_stat)
+        ):
+            raise ScannerWorkflowError(f"scan source changed while reading: {path}")
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scan source changed while reading: {path}"
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != before.st_dev
+            or current.st_ino != before.st_ino
+            or _stat_identity(current) != _stat_identity(before)
+        ):
+            raise ScannerWorkflowError(f"scan source changed while reading: {path}")
+
+        yield descriptor, before
+
+        after = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scan source changed while reading: {path}"
+            ) from exc
+        if (
+            _stat_identity(after) != _stat_identity(before)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+        ):
+            raise ScannerWorkflowError(f"scan source changed while reading: {path}")
+    finally:
+        os.close(descriptor)
+
+
+def _stable_hash(path: Path) -> tuple[str, os.stat_result]:
+    with _stable_source_descriptor(path) as (descriptor, source_stat):
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest(), source_stat
 
 
 def _natural_key(path: Path) -> tuple[list[int | str], str]:
@@ -738,16 +797,19 @@ def _copy_preserved(
         return
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     try:
-        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
-            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
-            target_handle.flush()
-            os.fsync(target_handle.fileno())
+        with _stable_source_descriptor(
+            source,
+            expected_stat=expected_stat,
+        ) as (source_descriptor, _):
+            with (
+                os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
+                temporary.open("xb") as target_handle,
+            ):
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
         copied_sha = _sha256_file(temporary)
-        after = source.stat()
-        if (
-            copied_sha != expected_sha256
-            or _stat_identity(after) != _stat_identity(expected_stat)
-        ):
+        if copied_sha != expected_sha256:
             raise ScannerWorkflowError(
                 f"scan source changed while preserving: {source}"
             )
@@ -793,16 +855,19 @@ def _replace_preserved(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     try:
-        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
-            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
-            target_handle.flush()
-            os.fsync(target_handle.fileno())
+        with _stable_source_descriptor(
+            source,
+            expected_stat=expected_stat,
+        ) as (source_descriptor, _):
+            with (
+                os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
+                temporary.open("xb") as target_handle,
+            ):
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
         copied_sha = _sha256_file(temporary)
-        after = source.stat()
-        if (
-            copied_sha != expected_sha256
-            or _stat_identity(after) != _stat_identity(expected_stat)
-        ):
+        if copied_sha != expected_sha256:
             raise ScannerWorkflowError(
                 f"scan source changed while repairing preserved copy: {source}"
             )
