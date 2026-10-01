@@ -520,6 +520,52 @@ def test_start_preserves_preset_if_launched_process_cannot_be_stopped(
 
 
 
+def test_stop_launched_process_reaps_zombie_leader_while_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ZombieLeader:
+        pid = 4545
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.reaped = False
+            self.poll_calls = 0
+
+        def poll(self) -> int | None:
+            self.poll_calls += 1
+            if self.terminated:
+                self.reaped = True
+                return 0
+            return None
+
+    process = _ZombieLeader()
+    group_signals: list[signal.Signals] = []
+    clock = iter((0.0, 0.0, 3.0))
+
+    def fake_killpg(process_group_id: int, sent_signal: int) -> None:
+        assert process_group_id == process.pid
+        if sent_signal == 0:
+            if process.terminated and process.reaped:
+                raise ProcessLookupError
+            return
+        group_signals.append(signal.Signals(sent_signal))
+        if sent_signal == signal.SIGTERM:
+            process.terminated = True
+            return
+        pytest.fail(f"unexpected process-group signal: {sent_signal}")
+
+    monkeypatch.setattr("digitalisierer.czur.os.killpg", fake_killpg)
+    monkeypatch.setattr("digitalisierer.czur.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr("digitalisierer.czur.time.sleep", lambda _seconds: None)
+
+    errors = CzurCaptureBackend._stop_launched_process(process)  # type: ignore[arg-type]
+
+    assert errors == []
+    assert group_signals == [signal.SIGTERM]
+    assert process.poll_calls >= 1
+    assert process.reaped is True
+
+
 def test_stop_launched_process_stops_group_after_leader_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

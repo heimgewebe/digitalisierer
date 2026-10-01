@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
+from http import HTTPStatus
 import json
 import os
 from threading import Barrier
@@ -1116,6 +1117,64 @@ def test_review_server_rejects_corrupted_preserved_source_bytes(
         client.close()
         handler_socket.close()
         review_server.server.server_close()
+
+
+def test_review_server_streams_verified_source_snapshot_after_in_place_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "source-post-verify-race"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "source-post-verify-race",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    assert original_bytes
+    raced_bytes = bytes((original_bytes[0] ^ 1,)) + original_bytes[1:]
+    assert len(raced_bytes) == len(original_bytes)
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    handler: Any = review_server.server.RequestHandlerClass
+    original_headers = handler._headers
+    raced = False
+
+    def mutate_after_verification(
+        self: Any,
+        status: Any,
+        *,
+        content_type: str,
+        content_length: int,
+    ) -> None:
+        nonlocal raced
+        if not raced and status == HTTPStatus.OK:
+            preserved.write_bytes(raced_bytes)
+            raced = True
+        original_headers(
+            self,
+            status,
+            content_type=content_type,
+            content_length=content_length,
+        )
+
+    monkeypatch.setattr(handler, "_headers", mutate_after_verification)
+    try:
+        response = _get_review_path(review_server, f"/source/{asset_id}")
+    finally:
+        review_server.server.server_close()
+
+    assert raced is True
+    assert b" 200 " in response.splitlines()[0]
+    _, body = response.split(b"\r\n\r\n", 1)
+    assert body == original_bytes
+    assert body != preserved.read_bytes()
 
 
 def test_review_replacement_choices_are_materialized_once(

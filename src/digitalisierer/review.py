@@ -11,6 +11,7 @@ from pathlib import Path
 import secrets
 import socket
 import stat
+import tempfile
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -552,7 +553,7 @@ def build_review_server(
             try:
                 descriptor = os.open(
                     target,
-                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                 )
             except FileNotFoundError:
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -613,54 +614,73 @@ def build_review_server(
                     self.wfile.write(payload)
                     return
 
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                after = os.fstat(source.fileno())
                 try:
-                    current = target.lstat()
+                    verified_source = tempfile.TemporaryFile(mode="w+b")
                 except OSError:
                     self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or (
-                        before.st_dev,
-                        before.st_ino,
-                        before.st_size,
-                        before.st_mtime_ns,
+                with verified_source:
+                    digest = hashlib.sha256()
+                    try:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            verified_source.write(chunk)
+                        verified_source.flush()
+                    except OSError:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    after = os.fstat(source.fileno())
+                    try:
+                        current = target.lstat()
+                    except OSError:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                        )
+                        != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
+                        or current.st_dev != after.st_dev
+                        or current.st_ino != after.st_ino
+                        or (
+                            current.st_size,
+                            current.st_mtime_ns,
+                        )
+                        != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
+                        or not secrets.compare_digest(
+                            digest.hexdigest(),
+                            expected_sha256,
+                        )
+                    ):
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    try:
+                        verified_source.seek(0)
+                    except OSError:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    self._headers(
+                        HTTPStatus.OK,
+                        content_type=content_type,
+                        content_length=after.st_size,
                     )
-                    != (
-                        after.st_dev,
-                        after.st_ino,
-                        after.st_size,
-                        after.st_mtime_ns,
-                    )
-                    or current.st_dev != after.st_dev
-                    or current.st_ino != after.st_ino
-                    or (
-                        current.st_size,
-                        current.st_mtime_ns,
-                    )
-                    != (
-                        after.st_size,
-                        after.st_mtime_ns,
-                    )
-                    or not secrets.compare_digest(
-                        digest.hexdigest(),
-                        expected_sha256,
-                    )
-                ):
-                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                    return
-                source.seek(0)
-                self._headers(
-                    HTTPStatus.OK,
-                    content_type=content_type,
-                    content_length=after.st_size,
-                )
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    self.wfile.write(chunk)
+                    for chunk in iter(
+                        lambda: verified_source.read(1024 * 1024),
+                        b"",
+                    ):
+                        self.wfile.write(chunk)
             return
 
         def do_POST(self) -> None:  # noqa: N802

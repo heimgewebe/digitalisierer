@@ -748,15 +748,18 @@ class CzurCaptureBackend:
     @classmethod
     def _wait_for_process_group_exit(
         cls,
+        process: subprocess.Popen[bytes],
         process_group_id: int,
         *,
         timeout: float,
     ) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            process.poll()
             if not cls._process_group_alive(process_group_id):
                 return True
             time.sleep(0.05)
+        process.poll()
         return not cls._process_group_alive(process_group_id)
 
     @classmethod
@@ -772,7 +775,7 @@ class CzurCaptureBackend:
             return []
         except OSError as exc:
             return [f"launched CZUR process-group termination failed: {exc}"]
-        if cls._wait_for_process_group_exit(process_group_id, timeout=2.0):
+        if cls._wait_for_process_group_exit(process, process_group_id, timeout=2.0):
             process.poll()
             return []
         try:
@@ -782,7 +785,7 @@ class CzurCaptureBackend:
             return []
         except OSError as exc:
             return [f"launched CZUR process-group kill failed: {exc}"]
-        if not cls._wait_for_process_group_exit(process_group_id, timeout=2.0):
+        if not cls._wait_for_process_group_exit(process, process_group_id, timeout=2.0):
             return ["launched CZUR process group did not exit after kill"]
         process.poll()
         return []
