@@ -814,8 +814,28 @@ class CzurCaptureBackend:
             raise
 
         if windows:
-            self._focus(windows[-1])
-            self._activate_curved_books_mode(windows[-1])
+            try:
+                self._focus(windows[-1])
+                self._activate_curved_books_mode(windows[-1])
+            except Exception as exc:
+                rollback_errors = self._rollback_failed_prelaunch(
+                    output_dir=session_output,
+                    output_existed=output_existed,
+                    capture_root_existed=capture_root_existed,
+                    backup=backup,
+                    backup_existed=backup_existed,
+                    backup_identity=backup_identity,
+                    config_before=config_before,
+                    config_before_mode=config_before_mode,
+                    config_after=config_after,
+                    config_after_identity=config_after_identity,
+                )
+                suffix = (
+                    "; rollback incomplete: " + "; ".join(rollback_errors)
+                    if rollback_errors
+                    else ""
+                )
+                raise CzurAdapterError(f"{exc}{suffix}") from exc
             return
 
         if not self._launcher_ready():

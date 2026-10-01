@@ -1263,6 +1263,58 @@ def test_observe_flushes_artifact_directories_before_dependent_metadata(
     assert thumbnails_fsync < first_metadata
 
 
+@pytest.mark.parametrize("failure_stage", ["second-hash", "findings"])
+def test_observe_precommit_failure_rolls_back_earlier_new_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    capture = tmp_path / f"capture-precommit-{failure_stage}"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 90)
+    _image(capture / "image00002.jpg", 160)
+    paths = create_or_resume_scan_session(
+        "book",
+        f"precommit-{failure_stage}",
+        tmp_path / "library",
+    )
+    before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+
+    if failure_stage == "second-hash":
+        original_hash = scanner_module._stable_hash
+        calls = 0
+
+        def fail_second_hash(path: Path) -> tuple[str, os.stat_result]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ScannerWorkflowError("synthetic second source hash failure")
+            return original_hash(path)
+
+        monkeypatch.setattr(scanner_module, "_stable_hash", fail_second_hash)
+        expected = "synthetic second source hash failure"
+    else:
+        def fail_findings(
+            assets: list[dict[str, object]],
+        ) -> list[object]:
+            del assets
+            raise ScannerWorkflowError("synthetic findings preparation failure")
+
+        monkeypatch.setattr(scanner_module, "_findings_from_assets", fail_findings)
+        expected = "synthetic findings preparation failure"
+
+    with pytest.raises(ScannerWorkflowError, match=expected):
+        observe_scan_folder(paths, capture)
+
+    assert list(paths.sources.iterdir()) == []
+    assert list(paths.thumbnails.iterdir()) == []
+    assert {path: path.read_bytes() for path in before} == before
+
+
 def test_observe_findings_failure_does_not_publish_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

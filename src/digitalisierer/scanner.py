@@ -1542,112 +1542,124 @@ def _observe_scan_folder_unlocked(
         existing_sequences.append(sequence)
     next_sequence = max([start - 1, *existing_sequences]) + 1
 
-    for source in selected:
-        sha256, source_stat = _stable_hash(source)
-        source_reference = str(source)
-        existing_occurrence = known_by_capture_source.get(source_reference)
-        if existing_occurrence is not None:
-            asset_id = existing_occurrence.get("asset_id")
-            if not isinstance(asset_id, str) or not asset_id:
-                raise ScannerWorkflowError("scan asset record has an invalid asset_id")
-            if existing_occurrence.get("sha256") != sha256:
-                raise ScannerWorkflowError(
-                    f"capture source changed since observation for {asset_id}"
+    try:
+        for source in selected:
+            sha256, source_stat = _stable_hash(source)
+            source_reference = str(source)
+            existing_occurrence = known_by_capture_source.get(source_reference)
+            if existing_occurrence is not None:
+                asset_id = existing_occurrence.get("asset_id")
+                if not isinstance(asset_id, str) or not asset_id:
+                    raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+                if existing_occurrence.get("sha256") != sha256:
+                    raise ScannerWorkflowError(
+                        f"capture source changed since observation for {asset_id}"
+                    )
+                pending_repair = _repair_recorded_asset(
+                    paths,
+                    source,
+                    existing_occurrence,
+                    expected_sha256=sha256,
+                    expected_stat=source_stat,
                 )
-            pending_repair = _repair_recorded_asset(
-                paths,
-                source,
-                existing_occurrence,
-                expected_sha256=sha256,
-                expected_stat=source_stat,
-            )
-            if pending_repair is not None:
-                pending_thumbnail_repairs.append(pending_repair)
-            skipped.append(asset_id)
-            continue
+                if pending_repair is not None:
+                    pending_thumbnail_repairs.append(pending_repair)
+                skipped.append(asset_id)
+                continue
 
-        base_asset_id = _asset_id(source.name, sha256)
-        asset_id = base_asset_id
-        existing = known_by_id.get(base_asset_id)
-        if existing is not None:
-            if existing.get("sha256") != sha256:
-                raise ScannerWorkflowError(
-                    f"asset identity collision for {base_asset_id}"
+            base_asset_id = _asset_id(source.name, sha256)
+            asset_id = base_asset_id
+            existing = known_by_id.get(base_asset_id)
+            if existing is not None:
+                if existing.get("sha256") != sha256:
+                    raise ScannerWorkflowError(
+                        f"asset identity collision for {base_asset_id}"
+                    )
+                asset_id = _next_collision_asset_id(base_asset_id, known_by_id)
+
+            suffix = source.suffix.lower()
+            preserved_rel = f"sources/{asset_id}{suffix}"
+            thumbnail_rel = f"thumbnails/{asset_id}.jpg"
+            target = paths.root / preserved_rel
+            attempt_created: list[_CreatedArtifactState] = []
+            try:
+                source_created = _copy_preserved(
+                    source,
+                    target,
+                    expected_sha256=sha256,
+                    expected_stat=source_stat,
                 )
-            asset_id = _next_collision_asset_id(base_asset_id, known_by_id)
-
-        suffix = source.suffix.lower()
-        preserved_rel = f"sources/{asset_id}{suffix}"
-        thumbnail_rel = f"thumbnails/{asset_id}.jpg"
-        target = paths.root / preserved_rel
-        attempt_created: list[_CreatedArtifactState] = []
-        try:
-            source_created = _copy_preserved(
-                source,
-                target,
-                expected_sha256=sha256,
-                expected_stat=source_stat,
-            )
-            if source_created is not None:
-                attempt_created.append(source_created)
-            image = _inspect_image(target)
-            thumbnail_path = paths.root / thumbnail_rel
-            thumbnail_created = _write_thumbnail(target, thumbnail_path)
-            if thumbnail_created is not None:
-                attempt_created.append(thumbnail_created)
-            thumbnail_sha256, _ = _regular_file_snapshot(
-                thumbnail_path,
-                purpose="scan thumbnail",
-            )
-            record: dict[str, Any] = {
-                "asset_id": asset_id,
-                "source_name": source.name,
-                "capture_source": str(source),
-                "sha256": sha256,
-                "bytes": source_stat.st_size,
-                "preserved_path": preserved_rel,
-                "thumbnail_path": thumbnail_rel,
-                "thumbnail_sha256": thumbnail_sha256,
-                "image": image,
+                if source_created is not None:
+                    attempt_created.append(source_created)
+                image = _inspect_image(target)
+                thumbnail_path = paths.root / thumbnail_rel
+                thumbnail_created = _write_thumbnail(target, thumbnail_path)
+                if thumbnail_created is not None:
+                    attempt_created.append(thumbnail_created)
+                thumbnail_sha256, _ = _regular_file_snapshot(
+                    thumbnail_path,
+                    purpose="scan thumbnail",
+                )
+                record: dict[str, Any] = {
+                    "asset_id": asset_id,
+                    "source_name": source.name,
+                    "capture_source": str(source),
+                    "sha256": sha256,
+                    "bytes": source_stat.st_size,
+                    "preserved_path": preserved_rel,
+                    "thumbnail_path": thumbnail_rel,
+                    "thumbnail_sha256": thumbnail_sha256,
+                    "image": image,
+                }
+            except Exception as exc:
+                cleanup_failed = False
+                for state in reversed(attempt_created):
+                    if not _remove_created_artifact(state):
+                        cleanup_failed = True
+                if cleanup_failed:
+                    raise ScannerWorkflowError(
+                        "failed to roll back newly created scanner artifacts"
+                    ) from exc
+                raise
+            created_artifacts.extend(attempt_created)
+            assets.append(record)
+            known_by_id[asset_id] = record
+            known_by_capture_source[source_reference] = record
+            review_items[asset_id] = {
+                "sequence": next_sequence,
+                "included": True,
+                "replacement_for": None,
             }
-        except Exception as exc:
-            cleanup_failed = False
-            for state in reversed(attempt_created):
-                if not _remove_created_artifact(state):
-                    cleanup_failed = True
-            if cleanup_failed:
-                raise ScannerWorkflowError(
-                    "failed to roll back newly created scanner artifacts"
-                ) from exc
-            raise
-        created_artifacts.extend(attempt_created)
-        assets.append(record)
-        known_by_id[asset_id] = record
-        known_by_capture_source[source_reference] = record
-        review_items[asset_id] = {
-            "sequence": next_sequence,
-            "included": True,
-            "replacement_for": None,
-        }
-        next_sequence += 1
-        imported.append(asset_id)
+            next_sequence += 1
+            imported.append(asset_id)
 
-    findings = _findings_from_assets(assets)
-    session["assets"] = assets
-    observations = session.setdefault("capture_observations", [])
-    if not isinstance(observations, list):
-        raise ScannerWorkflowError("capture observations must be a list")
-    observations.append(
-        {
-            "source_folder": str(source_root),
-            "selected_start": start,
-            "selected_count": len(selected),
-            "selected_names": [path.name for path in selected],
-            "imported_asset_ids": imported,
-            "skipped_asset_ids": skipped,
-        }
-    )
-    review["items"] = review_items
+        findings = _findings_from_assets(assets)
+        session["assets"] = assets
+        observations = session.setdefault("capture_observations", [])
+        if not isinstance(observations, list):
+            raise ScannerWorkflowError("capture observations must be a list")
+        observations.append(
+            {
+                "source_folder": str(source_root),
+                "selected_start": start,
+                "selected_count": len(selected),
+                "selected_names": [path.name for path in selected],
+                "imported_asset_ids": imported,
+                "skipped_asset_ids": skipped,
+            }
+        )
+        review["items"] = review_items
+
+    except Exception as exc:
+        cleanup_failed = False
+        for state in reversed(created_artifacts):
+            if not _remove_created_artifact(state):
+                cleanup_failed = True
+        if cleanup_failed:
+            raise ScannerWorkflowError(
+                "failed to roll back scanner observation preparation"
+            ) from exc
+        raise
 
     def current_capture_signature() -> list[tuple[str, int, int]]:
         current_sources = image_files(source_root)
