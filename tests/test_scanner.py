@@ -2278,6 +2278,115 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
     )
 
 
+def test_thumbnail_rollback_refuses_replaced_preimage_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-rollback-claim-race"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-rollback-claim-race",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    thumbnail = paths.root / session_before["assets"][0]["thumbnail_path"]
+    recorded_thumbnail_sha = session_before["assets"][0]["thumbnail_sha256"]
+    thumbnail.write_bytes(b"preexisting-corrupt-thumbnail")
+    metadata_before = {
+        paths.session_file: paths.session_file.read_bytes(),
+        paths.review_file: paths.review_file.read_bytes(),
+        paths.findings_file: paths.findings_file.read_bytes(),
+    }
+    foreign = b"foreign-rollback-preimage"
+    original_thumbnail_writer = scanner_module._write_thumbnail
+    original_atomic_write = scanner_module._atomic_write_text
+    failed = False
+
+    def replace_preimage_claim(source_path: Path, target: Path) -> None:
+        original_thumbnail_writer(source_path, target)
+        claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
+        assert len(claims) == 1
+        claims[0].unlink()
+        claims[0].write_bytes(foreign)
+
+    def fail_session_once(path: Path, content: str) -> None:
+        nonlocal failed
+        if path == paths.session_file and not failed:
+            failed = True
+            raise OSError("synthetic session failure with replaced rollback claim")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(scanner_module, "_write_thumbnail", replace_preimage_claim)
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_session_once)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="failed to restore scanner observation after failure",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert failed is True
+    assert thumbnail.read_bytes() != foreign
+    assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == recorded_thumbnail_sha
+    assert {path: path.read_bytes() for path in metadata_before} == metadata_before
+    claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == foreign
+
+
+def test_thumbnail_cleanup_does_not_delete_replaced_preimage_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-cleanup-claim-race"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-cleanup-claim-race",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    thumbnail = paths.root / session_before["assets"][0]["thumbnail_path"]
+    thumbnail.write_bytes(b"preexisting-corrupt-thumbnail")
+    foreign = b"foreign-success-cleanup-preimage"
+    original_atomic_write = scanner_module._atomic_write_text
+    injected = False
+
+    def replace_claim_before_session_commit(path: Path, content: str) -> None:
+        nonlocal injected
+        if path == paths.session_file and not injected:
+            claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
+            assert len(claims) == 1
+            claims[0].unlink()
+            claims[0].write_bytes(foreign)
+            injected = True
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        replace_claim_before_session_commit,
+    )
+    resumed = observe_scan_folder(paths, capture)
+
+    assert injected is True
+    assert resumed.imported_asset_ids == ()
+    assert resumed.skipped_asset_ids == (asset_id,)
+    repaired = json.loads(paths.session_file.read_text(encoding="utf-8"))["assets"][0]
+    assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+    claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == foreign
+
+
 @pytest.mark.parametrize(
     ("metadata_name", "content", "message"),
     [

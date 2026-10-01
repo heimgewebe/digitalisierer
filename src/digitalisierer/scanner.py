@@ -729,7 +729,19 @@ def _write_thumbnail(source: Path, target: Path) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(temporary, target)
+        expected_sha256 = _sha256_file(temporary)
+        try:
+            _rename_noreplace(temporary, target)
+        except FileExistsError:
+            existing_sha256, _ = _regular_file_snapshot(
+                target,
+                purpose="scan thumbnail",
+            )
+            if not secrets.compare_digest(existing_sha256, expected_sha256):
+                raise ScannerWorkflowError(
+                    f"scan thumbnail collision for {target.name}"
+                )
+            temporary.unlink()
     finally:
         try:
             temporary.unlink()
@@ -778,6 +790,260 @@ def _existing_regular_file_hash(path: Path) -> str | None:
         ) from exc
     finally:
         os.close(fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _ThumbnailRepairState:
+    thumbnail: Path
+    preimage_claim: Path | None
+    preimage_sha256: str | None
+    preimage_identity: tuple[int, int, int, int] | None
+    published_sha256: str
+    published_identity: tuple[int, int, int, int]
+
+
+def _regular_file_snapshot(
+    path: Path,
+    *,
+    purpose: str,
+) -> tuple[str, tuple[int, int, int, int]]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"{purpose} must be a non-symlink regular file: {path.name}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"{purpose} must be a non-symlink regular file: {path.name}"
+            )
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"{purpose} changed while reading: {path.name}"
+            ) from exc
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+        ):
+            raise ScannerWorkflowError(
+                f"{purpose} changed while reading: {path.name}"
+            )
+        return digest.hexdigest(), _stat_identity(after)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_claimed_file(claimed: Path, destination: Path) -> bool:
+    try:
+        claimed_before = claimed.lstat()
+        os.link(claimed, destination, follow_symlinks=False)
+        claimed_after = claimed.lstat()
+        current = destination.lstat()
+        if (
+            claimed_after.st_dev != current.st_dev
+            or claimed_after.st_ino != current.st_ino
+            or stat.S_IFMT(claimed_after.st_mode) != stat.S_IFMT(current.st_mode)
+            or claimed_before.st_dev != claimed_after.st_dev
+            or claimed_before.st_ino != claimed_after.st_ino
+        ):
+            return False
+        claimed.unlink()
+        _fsync_directory(destination.parent)
+        return True
+    except (FileExistsError, FileNotFoundError, OSError):
+        return False
+
+
+def _claim_owned_regular_file(
+    path: Path,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int],
+    *,
+    marker: str,
+) -> Path | None:
+    claimed = path.with_name(
+        f".{path.name}.{secrets.token_hex(8)}.{marker}"
+    )
+    try:
+        _rename_noreplace(path, claimed)
+    except (FileExistsError, FileNotFoundError, OSError, ScannerWorkflowError):
+        return None
+    try:
+        current_sha256, current_identity = _regular_file_snapshot(
+            claimed,
+            purpose="scanner claimed file",
+        )
+    except ScannerWorkflowError:
+        _restore_claimed_file(claimed, path)
+        return None
+    if (
+        current_identity != expected_identity
+        or not secrets.compare_digest(current_sha256, expected_sha256)
+    ):
+        _restore_claimed_file(claimed, path)
+        return None
+    return claimed
+
+
+def _restore_owned_claim(
+    claim: Path,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int],
+    destination: Path,
+) -> bool:
+    owned = _claim_owned_regular_file(
+        claim,
+        expected_sha256,
+        expected_identity,
+        marker="restore-claim",
+    )
+    if owned is None:
+        return False
+    return _restore_claimed_file(owned, destination)
+
+
+def _remove_owned_claim(
+    claim: Path,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int],
+) -> bool:
+    owned = _claim_owned_regular_file(
+        claim,
+        expected_sha256,
+        expected_identity,
+        marker="cleanup-claim",
+    )
+    if owned is None:
+        return False
+    try:
+        current_sha256, current_identity = _regular_file_snapshot(
+            owned,
+            purpose="scanner cleanup claim",
+        )
+        if (
+            current_identity != expected_identity
+            or not secrets.compare_digest(current_sha256, expected_sha256)
+        ):
+            _restore_claimed_file(owned, claim)
+            return False
+        owned.unlink()
+        _fsync_directory(owned.parent)
+        return True
+    except (OSError, ScannerWorkflowError):
+        _restore_claimed_file(owned, claim)
+        return False
+
+
+def _prepare_thumbnail_repair(
+    source: Path,
+    thumbnail: Path,
+) -> _ThumbnailRepairState:
+    preimage_claim: Path | None = None
+    preimage_sha256: str | None = None
+    preimage_identity: tuple[int, int, int, int] | None = None
+    if os.path.lexists(thumbnail):
+        preimage_sha256, preimage_identity = _regular_file_snapshot(
+            thumbnail,
+            purpose="scan thumbnail preimage",
+        )
+        preimage_claim = _claim_owned_regular_file(
+            thumbnail,
+            preimage_sha256,
+            preimage_identity,
+            marker="rollback-preimage",
+        )
+        if preimage_claim is None:
+            raise ScannerWorkflowError(
+                f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+            )
+    try:
+        _write_thumbnail(source, thumbnail)
+        published_sha256, published_identity = _regular_file_snapshot(
+            thumbnail,
+            purpose="repaired scan thumbnail",
+        )
+    except Exception as exc:
+        if (
+            preimage_claim is not None
+            and preimage_sha256 is not None
+            and preimage_identity is not None
+            and not _restore_owned_claim(
+                preimage_claim,
+                preimage_sha256,
+                preimage_identity,
+                thumbnail,
+            )
+        ):
+            raise ScannerWorkflowError(
+                "failed to restore scan thumbnail after repair preparation; "
+                f"original preimage preserved at {preimage_claim}"
+            ) from exc
+        raise
+    return _ThumbnailRepairState(
+        thumbnail=thumbnail,
+        preimage_claim=preimage_claim,
+        preimage_sha256=preimage_sha256,
+        preimage_identity=preimage_identity,
+        published_sha256=published_sha256,
+        published_identity=published_identity,
+    )
+
+
+def _rollback_thumbnail_repair(state: _ThumbnailRepairState) -> bool:
+    published_claim = _claim_owned_regular_file(
+        state.thumbnail,
+        state.published_sha256,
+        state.published_identity,
+        marker="rollback-published",
+    )
+    if published_claim is None:
+        return False
+    if state.preimage_claim is not None:
+        if state.preimage_sha256 is None or state.preimage_identity is None:
+            return False
+        if not _restore_owned_claim(
+            state.preimage_claim,
+            state.preimage_sha256,
+            state.preimage_identity,
+            state.thumbnail,
+        ):
+            _restore_claimed_file(published_claim, state.thumbnail)
+            return False
+    _remove_owned_claim(
+        published_claim,
+        state.published_sha256,
+        state.published_identity,
+    )
+    return True
+
+
+def _cleanup_thumbnail_repair(state: _ThumbnailRepairState) -> None:
+    if (
+        state.preimage_claim is None
+        or state.preimage_sha256 is None
+        or state.preimage_identity is None
+    ):
+        return
+    _remove_owned_claim(
+        state.preimage_claim,
+        state.preimage_sha256,
+        state.preimage_identity,
+    )
 
 
 def _copy_preserved(
@@ -1294,38 +1560,15 @@ def _observe_scan_folder_unlocked(
             "findings": [_finding_payload(item) for item in findings],
         }
     )
-    thumbnail_rollbacks: list[tuple[Path, Path | None]] = []
+    thumbnail_rollbacks: list[_ThumbnailRepairState] = []
     try:
         for record, preserved, thumbnail in pending_thumbnail_repairs:
-            backup: Path | None = None
-            if thumbnail.exists():
-                backup_candidate = thumbnail.with_name(
-                    f".{thumbnail.name}.{secrets.token_hex(8)}.rollback"
-                )
-                os.link(
-                    thumbnail,
-                    backup_candidate,
-                    follow_symlinks=False,
-                )
-                if backup_candidate.is_symlink() or not backup_candidate.is_file():
-                    backup_candidate.unlink(missing_ok=True)
-                    raise ScannerWorkflowError(
-                        f"scan thumbnail changed while preparing repair: {thumbnail.name}"
-                    )
-                backup = backup_candidate
-            thumbnail_rollbacks.append((thumbnail, backup))
-            if backup is not None:
-                directory_fd = os.open(
-                    thumbnail.parent,
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-
-            _write_thumbnail(preserved, thumbnail)
-            record["thumbnail_sha256"] = _sha256_file(thumbnail)
+            rollback_state = _prepare_thumbnail_repair(
+                preserved,
+                thumbnail,
+            )
+            thumbnail_rollbacks.append(rollback_state)
+            record["thumbnail_sha256"] = rollback_state.published_sha256
 
         # Dependent metadata must not become durable before the artifact
         # directory entries it references. New imports publish both preserved
@@ -1348,20 +1591,12 @@ def _observe_scan_folder_unlocked(
         _atomic_write_text(paths.session_file, _json_text(session))
     except Exception:
         rollback_error: Exception | None = None
-        for thumbnail, backup in reversed(thumbnail_rollbacks):
+        for rollback_state in reversed(thumbnail_rollbacks):
             try:
-                if backup is None:
-                    thumbnail.unlink(missing_ok=True)
-                else:
-                    os.replace(backup, thumbnail)
-                directory_fd = os.open(
-                    thumbnail.parent,
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                if not _rollback_thumbnail_repair(rollback_state):
+                    raise ScannerWorkflowError(
+                        "scan thumbnail changed while rolling back repair"
+                    )
             except Exception as exc:
                 if rollback_error is None:
                     rollback_error = exc
@@ -1381,23 +1616,8 @@ def _observe_scan_folder_unlocked(
             ) from rollback_error
         raise
     else:
-        for thumbnail, backup in thumbnail_rollbacks:
-            if backup is None:
-                continue
-            try:
-                backup.unlink()
-                directory_fd = os.open(
-                    thumbnail.parent,
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except OSError:
-                # The canonical thumbnail and metadata are already committed.
-                # Backup cleanup must not turn that commit into a false failure.
-                pass
+        for rollback_state in thumbnail_rollbacks:
+            _cleanup_thumbnail_repair(rollback_state)
     return ScanObservation(
         session_root=paths.root,
         imported_asset_ids=tuple(imported),
