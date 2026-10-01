@@ -29,6 +29,7 @@ SESSION_FILE = "session.json"
 REVIEW_FILE = "review.json"
 REVIEW_LOCK_FILE = ".review.lock"
 FINDINGS_FILE = "findings.json"
+OBSERVATION_COMMIT_FILE = ".observation-metadata-commit.json"
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 MAX_SOURCE_IMAGE_BYTES = 512 * 1024 * 1024
 
@@ -342,6 +343,8 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
         try:
             os.fchmod(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if os.path.lexists(root / OBSERVATION_COMMIT_FILE):
+                _recover_observation_metadata_commit(paths)
             yield
         finally:
             try:
@@ -651,7 +654,14 @@ def create_or_resume_scan_session(
         )
 
     # A resumed session is ready only when its individually valid metadata also
-    # forms one coherent scanner state.
+    # forms one coherent scanner state. Only an actual crash marker needs the
+    # session lock; ordinary resume remains side-effect free here.
+    if os.path.lexists(_observation_commit_path(paths)):
+        with _review_update_lock(paths):
+            pass
+
+    session = _load_json(paths.session_file)
+    _validate_session_identity(paths, session)
     review = _load_json(paths.review_file)
     _validate_review_payload(review)
     findings = _load_json(paths.findings_file)
@@ -891,6 +901,96 @@ def _regular_file_snapshot(
         os.close(descriptor)
 
 
+@contextmanager
+def _verified_preview_source_snapshot(
+    source: Path,
+    *,
+    expected_sha256: str,
+) -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix=".digitalisierer-preview-source.",
+    ) as directory_name:
+        snapshot = Path(directory_name) / f"source{source.suffix or '.bin'}"
+        try:
+            source_fd = os.open(
+                source,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"preserved scanner source cannot be snapshotted: {source.name}"
+            ) from exc
+        snapshot_fd = -1
+        try:
+            snapshot_fd = os.open(
+                snapshot,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o400,
+            )
+            os.fchmod(snapshot_fd, 0o400)
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ScannerWorkflowError(
+                    f"preserved scanner source is not regular: {source.name}"
+                )
+
+            digest = hashlib.sha256()
+            with (
+                os.fdopen(os.dup(source_fd), "rb") as source_handle,
+                os.fdopen(os.dup(snapshot_fd), "wb") as snapshot_handle,
+            ):
+                for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    snapshot_handle.write(chunk)
+                snapshot_handle.flush()
+                os.fsync(snapshot_handle.fileno())
+
+            after = os.fstat(source_fd)
+            try:
+                current = source.lstat()
+                snapshot_current = snapshot.lstat()
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"preserved scanner source changed while snapshotting: {source.name}"
+                ) from exc
+            snapshot_stat = os.fstat(snapshot_fd)
+            if (
+                _stat_identity(before) != _stat_identity(after)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_dev != after.st_dev
+                or current.st_ino != after.st_ino
+                or _stat_identity(current) != _stat_identity(after)
+                or not stat.S_ISREG(snapshot_current.st_mode)
+                or snapshot_current.st_dev != snapshot_stat.st_dev
+                or snapshot_current.st_ino != snapshot_stat.st_ino
+                or snapshot_stat.st_size != after.st_size
+                or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
+                or not secrets.compare_digest(digest.hexdigest(), expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"preserved scanner source changed while snapshotting: {source.name}"
+                )
+        finally:
+            if snapshot_fd >= 0:
+                os.close(snapshot_fd)
+            os.close(source_fd)
+
+        yield snapshot
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _restore_claimed_file(claimed: Path, destination: Path) -> bool:
     try:
         claimed_before = claimed.lstat()
@@ -1102,6 +1202,213 @@ def _remove_created_artifact(state: _CreatedArtifactState) -> bool:
         state.path,
         state.sha256,
         state.identity,
+    )
+
+
+def _observation_commit_path(paths: ScanSessionPaths) -> Path:
+    return paths.root / OBSERVATION_COMMIT_FILE
+
+
+def _metadata_text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _observation_commit_payload(
+    *,
+    previous_session_text: str,
+    previous_review_text: str,
+    previous_findings_text: str,
+    next_session_text: str,
+    next_review_text: str,
+    next_findings_text: str,
+) -> dict[str, Any]:
+    previous = {
+        "session": _metadata_text_sha256(previous_session_text),
+        "review": _metadata_text_sha256(previous_review_text),
+        "findings": _metadata_text_sha256(previous_findings_text),
+    }
+    next_state = {
+        "session": {
+            "sha256": _metadata_text_sha256(next_session_text),
+            "text": next_session_text,
+        },
+        "review": {
+            "sha256": _metadata_text_sha256(next_review_text),
+            "text": next_review_text,
+        },
+        "findings": {
+            "sha256": _metadata_text_sha256(next_findings_text),
+            "text": next_findings_text,
+        },
+    }
+    return {
+        "schema_version": 1,
+        "kind": "digitalisierer.observation-metadata-commit",
+        "previous": previous,
+        "next": next_state,
+    }
+
+
+def _clear_observation_commit_marker(
+    paths: ScanSessionPaths,
+    *,
+    expected_sha256: str,
+) -> None:
+    marker = _observation_commit_path(paths)
+    current_sha256, current_identity = _regular_file_snapshot(
+        marker,
+        purpose="observation metadata commit marker",
+    )
+    if not secrets.compare_digest(current_sha256, expected_sha256):
+        raise ScannerWorkflowError(
+            "observation metadata commit marker changed before cleanup"
+        )
+    claimed = _claim_owned_regular_file(
+        marker,
+        current_sha256,
+        current_identity,
+        marker="commit-cleanup",
+    )
+    if claimed is None:
+        raise ScannerWorkflowError(
+            "observation metadata commit marker changed before cleanup"
+        )
+    try:
+        claim_sha256, claim_identity = _regular_file_snapshot(
+            claimed,
+            purpose="claimed observation metadata commit marker",
+        )
+        if (
+            claim_identity != current_identity
+            or not secrets.compare_digest(claim_sha256, current_sha256)
+        ):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker changed before cleanup"
+            )
+        claimed.unlink()
+        _fsync_directory(paths.root)
+    except Exception:
+        if not os.path.lexists(marker):
+            _restore_claimed_file(claimed, marker)
+        raise
+
+
+def _recover_observation_metadata_commit(paths: ScanSessionPaths) -> None:
+    marker = _observation_commit_path(paths)
+    raw_marker = _stable_file_bytes(marker)
+    marker_sha256 = hashlib.sha256(raw_marker).hexdigest()
+    try:
+        payload = json.loads(raw_marker.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScannerWorkflowError(
+            "observation metadata commit marker is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "digitalisierer.observation-metadata-commit"
+        or set(payload) != {"schema_version", "kind", "previous", "next"}
+    ):
+        raise ScannerWorkflowError(
+            "observation metadata commit marker is invalid"
+        )
+    previous = payload.get("previous")
+    next_state = payload.get("next")
+    if (
+        not isinstance(previous, dict)
+        or not isinstance(next_state, dict)
+        or set(previous) != {"session", "review", "findings"}
+        or set(next_state) != {"session", "review", "findings"}
+    ):
+        raise ScannerWorkflowError(
+            "observation metadata commit marker is invalid"
+        )
+
+    paths_by_name = {
+        "session": paths.session_file,
+        "review": paths.review_file,
+        "findings": paths.findings_file,
+    }
+    next_text: dict[str, str] = {}
+    next_sha256: dict[str, str] = {}
+    for name in ("session", "review", "findings"):
+        previous_sha = previous.get(name)
+        entry = next_state.get(name)
+        if (
+            not _is_sha256(previous_sha)
+            or not isinstance(entry, dict)
+            or set(entry) != {"sha256", "text"}
+            or not _is_sha256(entry.get("sha256"))
+            or not isinstance(entry.get("text"), str)
+        ):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker is invalid"
+            )
+        text_value = entry["text"]
+        digest = _metadata_text_sha256(text_value)
+        if not secrets.compare_digest(digest, entry["sha256"]):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker is invalid"
+            )
+        next_text[name] = text_value
+        next_sha256[name] = digest
+
+    try:
+        next_session = json.loads(next_text["session"])
+        next_review = json.loads(next_text["review"])
+        next_findings = json.loads(next_text["findings"])
+    except json.JSONDecodeError as exc:
+        raise ScannerWorkflowError(
+            "observation metadata commit marker is invalid"
+        ) from exc
+    if (
+        not isinstance(next_session, dict)
+        or not isinstance(next_review, dict)
+        or not isinstance(next_findings, dict)
+    ):
+        raise ScannerWorkflowError(
+            "observation metadata commit marker is invalid"
+        )
+    _validate_session_identity(paths, next_session)
+    _validate_review_payload(next_review)
+    _validate_findings_payload(next_findings)
+    next_processing = _processing_session_from_payload(
+        paths,
+        next_session,
+        next_review,
+    )
+    _validate_findings_asset_ids(next_processing, next_findings)
+
+    current_sha256: dict[str, str] = {}
+    for name, metadata_path in paths_by_name.items():
+        current = hashlib.sha256(_stable_file_bytes(metadata_path)).hexdigest()
+        previous_sha = previous[name]
+        if (
+            not secrets.compare_digest(current, previous_sha)
+            and not secrets.compare_digest(current, next_sha256[name])
+        ):
+            raise ScannerWorkflowError(
+                f"scanner {name} metadata diverged during interrupted commit"
+            )
+        current_sha256[name] = current
+
+    for name, metadata_path in paths_by_name.items():
+        if not secrets.compare_digest(
+            current_sha256[name],
+            next_sha256[name],
+        ):
+            _atomic_write_text(metadata_path, next_text[name])
+
+    for name, metadata_path in paths_by_name.items():
+        current = hashlib.sha256(_stable_file_bytes(metadata_path)).hexdigest()
+        if not secrets.compare_digest(current, next_sha256[name]):
+            raise ScannerWorkflowError(
+                f"scanner {name} metadata recovery did not converge"
+            )
+
+    _clear_observation_commit_marker(
+        paths,
+        expected_sha256=marker_sha256,
     )
 
 
@@ -1612,9 +1919,16 @@ def _observe_scan_folder_unlocked(
                 )
                 if source_created is not None:
                     attempt_created.append(source_created)
-                image = _inspect_image(target)
-                thumbnail_path = paths.root / thumbnail_rel
-                thumbnail_created = _write_thumbnail(target, thumbnail_path)
+                with _verified_preview_source_snapshot(
+                    target,
+                    expected_sha256=sha256,
+                ) as preview_source:
+                    image = _inspect_image(preview_source)
+                    thumbnail_path = paths.root / thumbnail_rel
+                    thumbnail_created = _write_thumbnail(
+                        preview_source,
+                        thumbnail_path,
+                    )
                 if thumbnail_created is not None:
                     attempt_created.append(thumbnail_created)
                 thumbnail_sha256, _ = _regular_file_snapshot(
@@ -1694,6 +2008,7 @@ def _observe_scan_folder_unlocked(
 
     thumbnail_rollbacks: list[_ThumbnailRepairState] = []
     metadata_mutated = False
+    commit_marker_sha256: str | None = None
     try:
         # Avoid publishing dependent metadata when capture membership or identity
         # has already changed while processing.
@@ -1726,17 +2041,36 @@ def _observe_scan_folder_unlocked(
             _fsync_directory(paths.thumbnails)
 
         # review/findings depend on the prospective session.json asset set.
-        # Keep repaired thumbnails and the final session commit in the same
-        # rollback boundary so any reported observation failure restores the
-        # previous filesystem and metadata snapshot.
+        # Persist a recoverable previous/next marker before the first metadata
+        # write. Normal exceptions still roll back; a process/power loss leaves
+        # enough exact state to roll forward idempotently on the next locked read.
+        next_review_text = _json_text(review)
+        next_session_text = _json_text(session)
+        commit_payload = _observation_commit_payload(
+            previous_session_text=previous_session_text,
+            previous_review_text=previous_review_text,
+            previous_findings_text=previous_findings_text,
+            next_session_text=next_session_text,
+            next_review_text=next_review_text,
+            next_findings_text=findings_text,
+        )
+        commit_text = _json_text(commit_payload)
+        commit_path = _observation_commit_path(paths)
+        if os.path.lexists(commit_path):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker already exists"
+            )
+        _atomic_write_text(commit_path, commit_text)
+        commit_marker_sha256 = _metadata_text_sha256(commit_text)
+
         metadata_mutated = True
-        _atomic_write_text(paths.review_file, _json_text(review))
+        _atomic_write_text(paths.review_file, next_review_text)
         _atomic_write_text(paths.findings_file, findings_text)
         if current_capture_signature() != before_signature:
             raise ScannerWorkflowError(
                 "capture folder changed while Digitalisierer observed it"
             )
-        _atomic_write_text(paths.session_file, _json_text(session))
+        _atomic_write_text(paths.session_file, next_session_text)
     except Exception:
         rollback_error: Exception | None = None
         for rollback_state in reversed(thumbnail_rollbacks):
@@ -1768,12 +2102,25 @@ def _observe_scan_folder_unlocked(
                 except Exception as exc:
                     if rollback_error is None:
                         rollback_error = exc
+        if rollback_error is None and commit_marker_sha256 is not None:
+            try:
+                _clear_observation_commit_marker(
+                    paths,
+                    expected_sha256=commit_marker_sha256,
+                )
+            except Exception as exc:
+                rollback_error = exc
         if rollback_error is not None:
             raise ScannerWorkflowError(
                 "failed to restore scanner observation after failure"
             ) from rollback_error
         raise
     else:
+        if commit_marker_sha256 is not None:
+            _clear_observation_commit_marker(
+                paths,
+                expected_sha256=commit_marker_sha256,
+            )
         for rollback_state in thumbnail_rollbacks:
             _cleanup_thumbnail_repair(rollback_state)
     return ScanObservation(
@@ -2313,17 +2660,38 @@ _RENAME_NOREPLACE = 1
 
 def _fsync_regular_file(path: Path) -> None:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except OSError as exc:
         raise ScannerWorkflowError(
             f"scanner export artifact cannot be opened safely: {path.name}"
         ) from exc
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ScannerWorkflowError(
                 f"scanner export artifact is not a regular file: {path.name}"
             )
         os.fsync(fd)
+        after = os.fstat(fd)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scanner export artifact changed while syncing: {path.name}"
+            ) from exc
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+        ):
+            raise ScannerWorkflowError(
+                f"scanner export artifact changed while syncing: {path.name}"
+            )
     finally:
         os.close(fd)
 
@@ -2373,6 +2741,100 @@ def _rename_noreplace(source: Path, target: Path) -> None:
     if error == 17:
         raise FileExistsError(target)
     raise OSError(error, os.strerror(error), target)
+
+
+def _publish_verified_staging(
+    staging: Path,
+    final_dir: Path,
+    expected: dict[str, tuple[str, tuple[int, int, int, int]]],
+) -> None:
+    opened: list[
+        tuple[str, int, str, tuple[int, int, int, int]]
+    ] = []
+    published = False
+    try:
+        for name in sorted(expected):
+            expected_sha256, expected_identity = expected[name]
+            path = staging / name
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK,
+                )
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"scanner output changed during publication: {name}"
+                ) from exc
+            opened.append((name, descriptor, expected_sha256, expected_identity))
+            before = os.fstat(descriptor)
+            try:
+                current = path.lstat()
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"scanner output changed during publication: {name}"
+                ) from exc
+            digest = _descriptor_sha256(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or _stat_identity(before) != _stat_identity(after)
+                or _stat_identity(after) != expected_identity
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_dev != after.st_dev
+                or current.st_ino != after.st_ino
+                or _stat_identity(current) != _stat_identity(after)
+                or not secrets.compare_digest(digest, expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"scanner output changed during publication: {name}"
+                )
+
+        _rename_noreplace(staging, final_dir)
+        published = True
+
+        for name, descriptor, expected_sha256, expected_identity in opened:
+            final_path = final_dir / name
+            after = os.fstat(descriptor)
+            try:
+                current = final_path.lstat()
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"scanner output changed during publication: {name}"
+                ) from exc
+            digest = _descriptor_sha256(descriptor)
+            final_stat = os.fstat(descriptor)
+            if (
+                _stat_identity(after) != _stat_identity(final_stat)
+                or _stat_identity(final_stat) != expected_identity
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_dev != final_stat.st_dev
+                or current.st_ino != final_stat.st_ino
+                or _stat_identity(current) != _stat_identity(final_stat)
+                or not secrets.compare_digest(digest, expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"scanner output changed during publication: {name}"
+                )
+    except Exception as exc:
+        if published:
+            try:
+                if staging.exists() or not final_dir.is_dir():
+                    raise ScannerWorkflowError(
+                        "published scanner export cannot be rolled back safely"
+                    )
+                os.rename(final_dir, staging)
+                _fsync_directory(staging.parent)
+            except Exception as rollback_exc:
+                raise ScannerWorkflowError(
+                    "failed to roll back scanner export after publication verification"
+                ) from rollback_exc
+        raise exc
+    finally:
+        for _name, descriptor, _sha256, _identity in opened:
+            os.close(descriptor)
 
 
 def finalize_scan_session(
@@ -2432,13 +2894,23 @@ def finalize_scan_session(
 
         with _verified_export_source_snapshots(active, staging) as export_sources:
             pdf_builder(export_sources, master)
-        if not master.is_file():
-            raise ScannerWorkflowError("master PDF builder produced no output")
+        master_sha256, master_identity = _regular_file_snapshot(
+            master,
+            purpose="master PDF output",
+        )
         ocr_backend.searchable_pdf(
             master,
             searchable,
             text_file,
             language=language,
+        )
+        searchable_sha256, searchable_identity = _regular_file_snapshot(
+            searchable,
+            purpose="searchable PDF output",
+        )
+        text_sha256, text_identity = _regular_file_snapshot(
+            text_file,
+            purpose="OCR text output",
         )
 
         raw_findings = findings_payload.get("findings")
@@ -2465,9 +2937,24 @@ def finalize_scan_session(
             ),
         )
 
+        report_sha256, report_identity = _regular_file_snapshot(
+            report,
+            purpose="scanner report output",
+        )
         output_hashes = {
-            name: _sha256_file(staging / name)
-            for name in ("master.pdf", "searchable.pdf", "text.txt", "report.txt")
+            "master.pdf": master_sha256,
+            "searchable.pdf": searchable_sha256,
+            "text.txt": text_sha256,
+            "report.txt": report_sha256,
+        }
+        artifact_states: dict[
+            str,
+            tuple[str, tuple[int, int, int, int]],
+        ] = {
+            "master.pdf": (master_sha256, master_identity),
+            "searchable.pdf": (searchable_sha256, searchable_identity),
+            "text.txt": (text_sha256, text_identity),
+            "report.txt": (report_sha256, report_identity),
         }
         manifest: dict[str, object] = {
             "schema_version": 1,
@@ -2491,6 +2978,14 @@ def finalize_scan_session(
             "output_hashes": output_hashes,
         }
         _atomic_write_text(manifest_path, _json_text(manifest))
+        manifest_sha256, manifest_identity = _regular_file_snapshot(
+            manifest_path,
+            purpose="scanner manifest output",
+        )
+        artifact_states["manifest.json"] = (
+            manifest_sha256,
+            manifest_identity,
+        )
 
         for artifact in (master, searchable, text_file, report, manifest_path):
             _fsync_regular_file(artifact)
@@ -2502,8 +2997,15 @@ def finalize_scan_session(
             raise ScannerWorkflowError(
                 "preserved scanner sources changed while finalizing"
             )
-        for name, expected in output_hashes.items():
-            if _sha256_file(staging / name) != expected:
+        for name, (expected_sha256, expected_identity) in artifact_states.items():
+            current_sha256, current_identity = _regular_file_snapshot(
+                staging / name,
+                purpose="scanner staged output",
+            )
+            if (
+                current_identity != expected_identity
+                or not secrets.compare_digest(current_sha256, expected_sha256)
+            ):
                 raise ScannerWorkflowError(
                     f"scanner output changed before publication: {name}"
                 )
@@ -2524,7 +3026,11 @@ def finalize_scan_session(
                     "scanner session metadata changed while finalizing"
                 )
 
-            _rename_noreplace(staging, final_dir)
+            _publish_verified_staging(
+                staging,
+                final_dir,
+                artifact_states,
+            )
             _fsync_directory(paths.exports)
         staging = Path()
         return ScanExport(
@@ -2532,7 +3038,7 @@ def finalize_scan_session(
             export_dir=final_dir,
             output_hashes={
                 **output_hashes,
-                "manifest.json": _sha256_file(final_dir / "manifest.json"),
+                "manifest.json": manifest_sha256,
             },
         )
     except Exception:

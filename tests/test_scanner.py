@@ -3179,3 +3179,200 @@ def test_finalize_uses_atomic_writer_for_report_and_manifest(
 
     assert exported.export_dir.is_dir()
     assert [path.name for path in written] == ["report.txt", "manifest.json"]
+
+
+def test_observe_derives_preview_from_verified_preserved_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "preview-source-race"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    replacement = tmp_path / "replacement-preview.jpg"
+    _image(source, 80)
+    _image(replacement, 220)
+    original_bytes = source.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+    expected_image = scanner_module._inspect_image(source)
+    paths = create_or_resume_scan_session(
+        "book",
+        "preview-source-race",
+        tmp_path / "library",
+    )
+    source_sha = hashlib.sha256(original_bytes).hexdigest()
+    asset_id = scanner_module._asset_id(source.name, source_sha)
+    preserved = paths.sources / f"{asset_id}{source.suffix.lower()}"
+    original_inspect = scanner_module._inspect_image
+    original_thumbnail = scanner_module._write_thumbnail
+    attacked: list[str] = []
+
+    def inspect_with_rewrite(path: Path) -> dict[str, object]:
+        if path == preserved:
+            attacked.append("inspect")
+            preserved.write_bytes(replacement_bytes)
+            try:
+                return original_inspect(path)
+            finally:
+                preserved.write_bytes(original_bytes)
+        return original_inspect(path)
+
+    def thumbnail_with_rewrite(source_path: Path, target: Path) -> object:
+        if source_path == preserved:
+            attacked.append("thumbnail")
+            preserved.write_bytes(replacement_bytes)
+            try:
+                return original_thumbnail(source_path, target)
+            finally:
+                preserved.write_bytes(original_bytes)
+        return original_thumbnail(source_path, target)
+
+    monkeypatch.setattr(scanner_module, "_inspect_image", inspect_with_rewrite)
+    monkeypatch.setattr(scanner_module, "_write_thumbnail", thumbnail_with_rewrite)
+
+    observed = observe_scan_folder(paths, capture)
+    assert observed.imported_asset_ids == (asset_id,)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    assert attacked == []
+    assert asset["image"] == expected_image
+    assert preserved.read_bytes() == original_bytes
+    assert asset["sha256"] == source_sha
+
+
+def test_finalize_validates_ocr_outputs_before_path_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "ocr-output-safe-hash"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "ocr-output-safe-hash",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    class _SymlinkOcr(_FakeOcr):
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            target = output_pdf.with_name("searchable-target.pdf")
+            target.write_bytes(b"OCR-PDF")
+            output_pdf.symlink_to(target.name)
+            sidecar_txt.write_text("text", encoding="utf-8")
+
+    original_hash = scanner_module._sha256_file
+
+    def reject_unsafe_output_hash(path: Path) -> str:
+        if path.name in {"searchable.pdf", "text.txt"}:
+            raise AssertionError("OCR output reached path-following hash")
+        return original_hash(path)
+
+    monkeypatch.setattr(scanner_module, "_sha256_file", reject_unsafe_output_hash)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        finalize_scan_session(paths, _SymlinkOcr(), pdf_builder=_fake_pdf)
+
+    assert list(paths.exports.iterdir()) == []
+
+
+def test_finalize_revalidates_staging_artifacts_at_publication_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-boundary-race"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-boundary-race",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    injected = False
+
+    def mutate_then_rename(source: Path, target: Path) -> None:
+        nonlocal injected
+        if source.parent == paths.exports and ".staging-" in source.name:
+            (source / "text.txt").write_text(
+                "tampered-at-publication-boundary",
+                encoding="utf-8",
+            )
+            injected = True
+        original_rename(source, target)
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", mutate_then_rename)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="changed during publication",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert injected is True
+    assert list(paths.exports.iterdir()) == []
+
+
+@pytest.mark.parametrize("crash_after", ["review", "findings"])
+def test_observe_metadata_commit_recovers_after_process_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_after: str,
+) -> None:
+    capture = tmp_path / f"metadata-crash-{crash_after}"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 120)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        f"metadata-crash-{crash_after}",
+        library,
+    )
+    original_write = scanner_module._atomic_write_text
+    target = paths.review_file if crash_after == "review" else paths.findings_file
+    crashed = False
+
+    def crash_after_durable_write(path: Path, content: str) -> None:
+        nonlocal crashed
+        original_write(path, content)
+        if path == target and not crashed:
+            crashed = True
+            raise SystemExit(f"synthetic crash after {crash_after}")
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        crash_after_durable_write,
+    )
+
+    with pytest.raises(SystemExit, match="synthetic crash"):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+
+    resumed_paths = create_or_resume_scan_session(
+        "book",
+        f"metadata-crash-{crash_after}",
+        library,
+    )
+    session, review, findings, processing = scanner_module.load_review_state(resumed_paths)
+    assert len(session["assets"]) == 1
+    assert len(review["items"]) == 1
+    assert isinstance(findings["findings"], list)
+    assert len(processing.items) == 1
+
+    retried = observe_scan_folder(resumed_paths, capture)
+    assert retried.imported_asset_ids == ()
+    assert len(retried.skipped_asset_ids) == 1
