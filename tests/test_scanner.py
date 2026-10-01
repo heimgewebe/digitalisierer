@@ -326,6 +326,51 @@ def test_review_replacement_invariant_is_enforced(tmp_path: Path) -> None:
     assert len(processing.ordered_assets()) == 2
 
 
+def test_review_update_rolls_back_exact_verified_snapshot_after_path_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-review-rollback-race"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 40)
+    _image(capture / "image00002.jpg", 180)
+    paths = create_or_resume_scan_session(
+        "book",
+        "review-rollback-race",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    first, second = observed.imported_asset_ids
+    original_review = paths.review_file.read_bytes()
+    foreign_review = tmp_path / "foreign-review.json"
+    foreign_review.write_text('{"foreign":true}\n', encoding="utf-8")
+    foreign_bytes = foreign_review.read_bytes()
+    original_stable_bytes = scanner_module._stable_file_bytes
+    rebound = False
+
+    def rebind_after_verified_read(path: Path) -> bytes:
+        nonlocal rebound
+        raw = original_stable_bytes(path)
+        if path == paths.review_file and not rebound:
+            paths.review_file.unlink()
+            paths.review_file.symlink_to(foreign_review)
+            rebound = True
+        return raw
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_stable_file_bytes",
+        rebind_after_verified_read,
+    )
+
+    with pytest.raises(ScannerWorkflowError, match="requires replaced asset"):
+        update_review_item(paths, second, replacement_for=first)
+
+    assert rebound is True
+    assert paths.review_file.read_bytes() == original_review
+    assert foreign_review.read_bytes() == foreign_bytes
+
+
 class _FakeOcr:
     name = "fake-ocr"
 
@@ -2441,6 +2486,60 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     assert hashlib.sha256(preserved.read_bytes()).hexdigest() == repaired["sha256"]
     assert thumbnail.is_file()
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
+
+
+def test_observe_resume_repair_rejects_preserved_symlink_swap_before_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-repair-symlink-race"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-symlink-race",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    outside = tmp_path / "matching-outside.jpg"
+    outside.write_bytes(preserved.read_bytes())
+    original_open = os.open
+    rebound = False
+
+    def rebind_before_descriptor_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal rebound
+        if (
+            dir_fd is None
+            and not rebound
+            and isinstance(path, (str, bytes, os.PathLike))
+            and Path(os.fsdecode(path)) == preserved
+        ):
+            preserved.unlink()
+            preserved.symlink_to(outside)
+            rebound = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("digitalisierer.scanner.os.open", rebind_before_descriptor_open)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="non-symlink regular file",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert rebound is True
+    assert preserved.is_symlink()
+    assert preserved.resolve() == outside.resolve()
 
 
 def test_observe_resume_does_not_allow_missing_source_outside_selected_range(

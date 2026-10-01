@@ -679,6 +679,63 @@ def test_start_rolls_back_preset_when_executable_launcher_cannot_exec(
     assert backend._session_output is None
 
 
+def test_start_rolls_back_if_launcher_becomes_unready_after_preset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    readiness_calls = 0
+
+    def launcher_ready() -> bool:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        return readiness_calls == 1
+
+    monkeypatch.setattr(backend, "_launcher_ready", launcher_ready)
+    before = config.read_bytes()
+    before_mode = config.stat().st_mode & 0o7777
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    with pytest.raises(CzurAdapterError, match="launcher is not executable"):
+        backend.start(output_dir)
+
+    assert readiness_calls == 2
+    assert config.read_bytes() == before
+    assert config.stat().st_mode & 0o7777 == before_mode
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 def test_start_refuses_rollback_after_foreign_config_mode_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

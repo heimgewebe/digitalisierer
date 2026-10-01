@@ -1290,14 +1290,27 @@ def _repair_recorded_asset(
         raise ScannerWorkflowError(
             f"preserved scanner source must be a regular file: {expected_preserved_rel}"
         )
-    if not preserved.exists() or _sha256_file(preserved) != expected_sha256:
+    try:
+        preserved_sha256, _ = _regular_file_snapshot(
+            preserved,
+            purpose="preserved scanner source",
+        )
+    except ScannerWorkflowError:
+        if os.path.lexists(preserved):
+            raise
+        preserved_sha256 = None
+    if preserved_sha256 != expected_sha256:
         _replace_preserved(
             source,
             preserved,
             expected_sha256=expected_sha256,
             expected_stat=expected_stat,
         )
-    if _sha256_file(preserved) != expected_sha256:
+    preserved_sha256, _ = _regular_file_snapshot(
+        preserved,
+        purpose="preserved scanner source",
+    )
+    if not secrets.compare_digest(preserved_sha256, expected_sha256):
         raise ScannerWorkflowError(f"preserved source hash mismatch for {asset_id}")
 
     thumbnail = thumbnails_root / f"{asset_id}.jpg"
@@ -1968,14 +1981,26 @@ def _load_review_state_unlocked(
     dict[str, Any],
     dict[str, Any],
     ProcessingSession,
+    str,
 ]:
     session, _ = _stable_json_snapshot(paths.session_file)
-    review, _ = _stable_json_snapshot(paths.review_file)
+    review_raw = _stable_file_bytes(paths.review_file)
+    try:
+        review_text = review_raw.decode("utf-8")
+        review = json.loads(review_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScannerWorkflowError(
+            f"scanner session JSON is invalid: {paths.review_file}"
+        ) from exc
+    if not isinstance(review, dict):
+        raise ScannerWorkflowError(
+            f"scanner session JSON must be an object: {paths.review_file}"
+        )
     findings, _ = _stable_json_snapshot(paths.findings_file)
     _validate_findings_payload(findings)
     processing = _processing_session_from_payload(paths, session, review)
     _validate_findings_asset_ids(processing, findings)
-    return session, review, findings, processing
+    return session, review, findings, processing, review_text
 
 
 def load_review_state(
@@ -1987,7 +2012,8 @@ def load_review_state(
     ProcessingSession,
 ]:
     with _review_update_lock(paths):
-        return _load_review_state_unlocked(paths)
+        session, review, findings, processing, _ = _load_review_state_unlocked(paths)
+        return session, review, findings, processing
 
 
 def load_processing_session(paths: ScanSessionPaths) -> ProcessingSession:
@@ -2016,7 +2042,7 @@ def _update_review_item_unlocked(
     replacement_for: str | None | object = _UNSET,
     expected_snapshot: str | None = None,
 ) -> ProcessingSession:
-    _, review, _, _ = _load_review_state_unlocked(paths)
+    _, review, _, _, old_text = _load_review_state_unlocked(paths)
     items = review.get("items")
     if not isinstance(items, dict) or not isinstance(items.get(asset_id), dict):
         raise ScannerWorkflowError(f"unknown scanner asset: {asset_id}")
@@ -2042,7 +2068,6 @@ def _update_review_item_unlocked(
             raise ValueError("replacement_for must be a string or null")
         decision["replacement_for"] = replacement_for
 
-    old_text = paths.review_file.read_text(encoding="utf-8")
     _atomic_write_text(paths.review_file, _json_text(updated))
     try:
         processing = _load_review_state_unlocked(paths)[3]

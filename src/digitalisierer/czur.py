@@ -905,7 +905,26 @@ class CzurCaptureBackend:
             return
 
         if not self._launcher_ready():
-            raise CzurAdapterError(f"CZUR launcher is not executable: {self.launcher}")
+            rollback_errors = self._rollback_failed_prelaunch(
+                output_dir=session_output,
+                output_existed=output_existed,
+                capture_root_existed=capture_root_existed,
+                backup=backup,
+                backup_existed=backup_existed,
+                backup_identity=backup_identity,
+                config_before=config_before,
+                config_before_mode=config_before_mode,
+                config_after=config_after,
+                config_after_identity=config_after_identity,
+            )
+            suffix = (
+                "; rollback incomplete: " + "; ".join(rollback_errors)
+                if rollback_errors
+                else ""
+            )
+            raise CzurAdapterError(
+                f"CZUR launcher is not executable: {self.launcher}{suffix}"
+            )
         try:
             launched_process = subprocess.Popen(
                 [str(self.launcher)],
