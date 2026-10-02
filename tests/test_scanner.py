@@ -4454,6 +4454,140 @@ def test_finalize_keeps_published_artifacts_read_only_through_verification(
             assert artifact.stat().st_mode & 0o777 == 0o400
 
 
+
+def test_finalize_freezes_export_directory_entries_through_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-directory-entry-freeze"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-directory-entry-freeze",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    published = False
+    post_hashes = 0
+    replacement_succeeded = False
+    foreign = tmp_path / "foreign-manifest.json"
+    foreign.write_bytes(b"foreign-manifest\n")
+    foreign.chmod(0o400)
+
+    def track_publication(source: Path, target: Path) -> None:
+        nonlocal published
+        original_rename(source, target)
+        if source.parent == paths.exports and ".staging-" in source.name:
+            published = True
+
+    def replace_first_verified_entry(descriptor: int) -> str:
+        nonlocal post_hashes, replacement_succeeded
+        digest = original_descriptor_sha256(descriptor)
+        if published:
+            post_hashes += 1
+            if post_hashes == 2:
+                final_dirs = [
+                    item for item in paths.exports.iterdir() if item.is_dir()
+                ]
+                assert len(final_dirs) == 1
+                os.replace(foreign, final_dirs[0] / "manifest.json")
+                replacement_succeeded = True
+        return digest
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", track_publication)
+    monkeypatch.setattr(
+        scanner_module,
+        "_descriptor_sha256",
+        replace_first_verified_entry,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner output changed during commit verification: manifest.json",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published is True
+    assert post_hashes >= 2
+    assert replacement_succeeded is True
+
+
+def test_finalize_detects_rebind_after_entry_commit_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-commit-revalidation-rebind"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-commit-revalidation-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    original_fsync_directory = scanner_module._fsync_directory
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    published = False
+    commit_revalidation = False
+    commit_hashes = 0
+    replacement_succeeded = False
+    foreign = tmp_path / "foreign-late-manifest.json"
+    foreign.write_bytes(b"foreign-late-manifest\n")
+    foreign.chmod(0o400)
+
+    def track_publication(source: Path, target: Path) -> None:
+        nonlocal published
+        original_rename(source, target)
+        if source.parent == paths.exports and ".staging-" in source.name:
+            published = True
+
+    def track_commit_boundary(directory: Path) -> None:
+        nonlocal commit_revalidation
+        original_fsync_directory(directory)
+        if published and directory == paths.exports:
+            commit_revalidation = True
+
+    def replace_already_revalidated_entry(descriptor: int) -> str:
+        nonlocal commit_hashes, replacement_succeeded
+        digest = original_descriptor_sha256(descriptor)
+        if commit_revalidation:
+            commit_hashes += 1
+            if commit_hashes == 2:
+                final_dirs = [
+                    item for item in paths.exports.iterdir() if item.is_dir()
+                ]
+                assert len(final_dirs) == 1
+                manifest = final_dirs[0] / "manifest.json"
+                saved = tmp_path / "saved-manifest.json"
+                os.replace(manifest, saved)
+                os.replace(foreign, manifest)
+                os.replace(saved, manifest)
+                replacement_succeeded = True
+        return digest
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", track_publication)
+    monkeypatch.setattr(scanner_module, "_fsync_directory", track_commit_boundary)
+    monkeypatch.setattr(
+        scanner_module,
+        "_descriptor_sha256",
+        replace_already_revalidated_entry,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scanner export directory changed during commit verification",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published is True
+    assert commit_hashes >= 2
+    assert replacement_succeeded is True
+
+
 def test_finalize_detaches_preopened_writer_from_published_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

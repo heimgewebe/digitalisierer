@@ -3624,35 +3624,72 @@ def _publish_verified_staging(
                 "published scanner export directory changed during publication"
             )
 
-        for name, descriptor, expected_sha256, expected_identity in opened:
-            final_path = final_dir / name
-            after = os.fstat(descriptor)
+        def verify_opened_publications(*, phase: str) -> None:
+            for name, descriptor, expected_sha256, expected_identity in opened:
+                final_path = final_dir / name
+                after = os.fstat(descriptor)
+                try:
+                    current = final_path.lstat()
+                except OSError as exc:
+                    raise ScannerWorkflowError(
+                        f"scanner output changed during {phase}: {name}"
+                    ) from exc
+                digest = _descriptor_sha256(descriptor)
+                final_stat = os.fstat(descriptor)
+                if (
+                    _stat_identity(after) != _stat_identity(final_stat)
+                    or _stat_identity(final_stat) != expected_identity
+                    or stat.S_IMODE(final_stat.st_mode) != 0o400
+                    or not stat.S_ISREG(current.st_mode)
+                    or stat.S_IMODE(current.st_mode) != 0o400
+                    or current.st_dev != final_stat.st_dev
+                    or current.st_ino != final_stat.st_ino
+                    or _stat_identity(current) != _stat_identity(final_stat)
+                    or not secrets.compare_digest(digest, expected_sha256)
+                ):
+                    raise ScannerWorkflowError(
+                        f"scanner output changed during {phase}: {name}"
+                    )
+
+        def commit_directory_state() -> tuple[int, int, int, int]:
             try:
-                current = final_path.lstat()
+                current = final_dir.lstat()
             except OSError as exc:
                 raise ScannerWorkflowError(
-                    f"scanner output changed during publication: {name}"
+                    "scanner export directory changed during commit verification"
                 ) from exc
-            digest = _descriptor_sha256(descriptor)
-            final_stat = os.fstat(descriptor)
             if (
-                _stat_identity(after) != _stat_identity(final_stat)
-                or _stat_identity(final_stat) != expected_identity
-                or stat.S_IMODE(final_stat.st_mode) != 0o400
-                or not stat.S_ISREG(current.st_mode)
-                or stat.S_IMODE(current.st_mode) != 0o400
-                or current.st_dev != final_stat.st_dev
-                or current.st_ino != final_stat.st_ino
-                or _stat_identity(current) != _stat_identity(final_stat)
-                or not secrets.compare_digest(digest, expected_sha256)
+                not stat.S_ISDIR(current.st_mode)
+                or published_directory_identity is None
+                or (current.st_dev, current.st_ino)
+                != published_directory_identity
             ):
                 raise ScannerWorkflowError(
-                    f"scanner output changed during publication: {name}"
+                    "scanner export directory changed during commit verification"
                 )
+            return (
+                current.st_dev,
+                current.st_ino,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+
+        verify_opened_publications(phase="publication")
 
         # The directory-entry publication is not durable until its parent has
         # been synced. Keep that durability step inside this rollback boundary.
         _fsync_directory(final_dir.parent)
+
+        # Bind the final success decision to a fresh complete pass. The
+        # directory timestamps detect a rebind of an entry that occurs after
+        # that entry's second path/descriptor/hash check but before the pass
+        # completes.
+        directory_state = commit_directory_state()
+        verify_opened_publications(phase="commit verification")
+        if commit_directory_state() != directory_state:
+            raise ScannerWorkflowError(
+                "scanner export directory changed during commit verification"
+            )
     except Exception as exc:
         if published:
             try:
