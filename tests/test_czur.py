@@ -1585,6 +1585,79 @@ def test_status_handles_config_read_failure(
 
     assert backend.status().ready is False
 
+def test_status_rejects_xdotool_display_failure_before_start_side_effects(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"Error: Can't open display: (null)\" >&2\n"
+        "printf '%s\\n' \"Failed creating new xdo instance\" >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+
+    status = backend.status()
+
+    assert status.ready is False
+    assert status.connected is False
+    assert "Can't open display" in status.detail
+    with pytest.raises(
+        CzurAdapterError,
+        match="xdotool window search failed: Error: Can't open display",
+    ):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert not backup.exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
+def test_status_accepts_xdotool_search_no_match_without_stderr(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"setting": {}}', encoding="utf-8")
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    backend = CzurCaptureBackend(
+        capture_root=tmp_path / "captures",
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+
+    assert backend._visible_windows() == []
+    status = backend.status()
+    assert status.connected is False
+    assert status.ready is True
+
+
 def test_status_handles_xdotool_execution_failure_before_start_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

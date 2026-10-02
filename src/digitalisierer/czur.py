@@ -155,11 +155,13 @@ class CzurCaptureBackend:
         else:
             config_ready = self._config_write_ready()
         xdotool_ready = self._xdotool_ready()
+        xdotool_error: str | None = None
         if xdotool_ready:
             try:
                 windows = self._visible_windows()
-            except CzurAdapterError:
+            except CzurAdapterError as exc:
                 xdotool_ready = False
+                xdotool_error = str(exc)
                 windows = []
         else:
             windows = []
@@ -174,7 +176,8 @@ class CzurCaptureBackend:
                 and (connected or executable_ready)
             ),
             detail=(
-                "official CZUR app + Curved Books preset + capture-folder observation"
+                xdotool_error
+                or "official CZUR app + Curved Books preset + capture-folder observation"
             ),
         )
 
@@ -849,7 +852,7 @@ class CzurCaptureBackend:
                 [self.xdotool, "search", "--onlyvisible", "--class", "CzurScanner"],
                 text=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 check=False,
             )
         except OSError as exc:
@@ -857,6 +860,9 @@ class CzurCaptureBackend:
                 f"cannot execute xdotool: {self.xdotool}"
             ) from exc
         if completed.returncode != 0:
+            detail = (completed.stderr or "").strip()
+            if detail:
+                raise CzurAdapterError(f"xdotool window search failed: {detail}")
             return []
         return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
