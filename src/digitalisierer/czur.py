@@ -535,21 +535,9 @@ class CzurCaptureBackend:
                     "CZUR config changed before Curved Books preset could be applied"
                 )
 
-            os.rename(self.config_path, claimed_preimage)
-            claimed = True
-            claimed_content, claimed_identity = self._snapshot_regular_file(
-                claimed_preimage
-            )
-            if not self._same_claimed_preimage(
-                config_before,
-                config_before_identity,
-                claimed_content,
-                claimed_identity,
-            ):
-                raise CzurAdapterError(
-                    "CZUR config changed while Curved Books preset was being claimed"
-                )
-
+            # Make the recovery copy durable before removing the canonical
+            # config pathname. A process or power loss after the following
+            # claim can then always recover the exact pre-preset bytes.
             backup_identity = self._create_backup_if_absent(
                 backup,
                 config_before,
@@ -568,6 +556,21 @@ class CzurCaptureBackend:
                         "CZUR backup changed while Curved Books preset was being prepared"
                     )
                 self._fsync_directory(backup.parent)
+
+            os.rename(self.config_path, claimed_preimage)
+            claimed = True
+            claimed_content, claimed_identity = self._snapshot_regular_file(
+                claimed_preimage
+            )
+            if not self._same_claimed_preimage(
+                config_before,
+                config_before_identity,
+                claimed_content,
+                claimed_identity,
+            ):
+                raise CzurAdapterError(
+                    "CZUR config changed while Curved Books preset was being claimed"
+                )
 
             try:
                 os.link(
@@ -648,7 +651,10 @@ class CzurCaptureBackend:
                     claimed = False
 
             backup_cleanup_failed = False
-            if rollback_complete and backup_identity is not None:
+            backup_cleanup_safe = rollback_complete or (
+                not claimed and not published
+            )
+            if backup_cleanup_safe and backup_identity is not None:
                 backup_cleanup_failed = not self._remove_owned_backup(
                     backup,
                     config_before,

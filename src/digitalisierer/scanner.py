@@ -345,6 +345,7 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             if os.path.lexists(root / OBSERVATION_COMMIT_FILE):
                 _recover_observation_metadata_commit(paths)
+            _recover_interrupted_thumbnail_repairs(paths)
             yield
         finally:
             try:
@@ -863,11 +864,15 @@ class _CreatedArtifactState:
 @dataclass(frozen=True, slots=True)
 class _ThumbnailRepairState:
     thumbnail: Path
+    replacement_path: Path
     preimage_claim: Path | None
     preimage_sha256: str | None
     preimage_identity: tuple[int, int, int, int] | None
     published_sha256: str
     published_identity: tuple[int, int, int, int]
+    intent_path: Path
+    intent_sha256: str
+    intent_identity: tuple[int, int, int, int]
 
 
 def _regular_file_snapshot(
@@ -1056,10 +1061,15 @@ def _claim_owned_regular_file(
     expected_identity: tuple[int, int, int, int],
     *,
     marker: str,
+    claimed_path: Path | None = None,
 ) -> Path | None:
-    claimed = path.with_name(
-        f".{path.name}.{secrets.token_hex(8)}.{marker}"
+    claimed = (
+        claimed_path
+        if claimed_path is not None
+        else path.with_name(f".{path.name}.{secrets.token_hex(8)}.{marker}")
     )
+    if claimed == path or claimed.parent != path.parent:
+        return None
     try:
         _rename_noreplace(path, claimed)
     except (FileExistsError, FileNotFoundError, OSError, ScannerWorkflowError):
@@ -1076,6 +1086,11 @@ def _claim_owned_regular_file(
         current_identity != expected_identity
         or not secrets.compare_digest(current_sha256, expected_sha256)
     ):
+        _restore_claimed_file(claimed, path)
+        return None
+    try:
+        _fsync_directory(path.parent)
+    except Exception:
         _restore_claimed_file(claimed, path)
         return None
     return claimed
@@ -1130,11 +1145,43 @@ def _remove_owned_claim(
         return False
 
 
+def _thumbnail_repair_intent_path(thumbnail: Path) -> Path:
+    return thumbnail.with_name(f".{thumbnail.name}.repair-intent.json")
+
+
 def _prepare_thumbnail_repair(
     source: Path | int,
     thumbnail: Path,
+    *,
+    asset_id: str,
+    recorded_thumbnail_sha256: str,
 ) -> _ThumbnailRepairState:
-    preimage_claim: Path | None = None
+    if not asset_id or not _is_sha256(recorded_thumbnail_sha256):
+        raise ScannerWorkflowError("thumbnail repair metadata binding is invalid")
+
+    token = secrets.token_hex(8)
+    replacement_path = thumbnail.with_name(
+        f".{thumbnail.name}.{token}.repair-replacement"
+    )
+    preimage_claim_path = thumbnail.with_name(
+        f".{thumbnail.name}.{token}.rollback-preimage"
+    )
+    intent_path = _thumbnail_repair_intent_path(thumbnail)
+    if (
+        os.path.lexists(intent_path)
+        or os.path.lexists(replacement_path)
+        or os.path.lexists(preimage_claim_path)
+    ):
+        raise ScannerWorkflowError(
+            f"unfinished scan thumbnail repair exists for {thumbnail.name}"
+        )
+
+    replacement = _write_thumbnail(source, replacement_path)
+    if replacement is None:
+        raise ScannerWorkflowError(
+            f"scan thumbnail repair staging collided for {thumbnail.name}"
+        )
+
     preimage_sha256: str | None = None
     preimage_identity: tuple[int, int, int, int] | None = None
     if os.path.lexists(thumbnail):
@@ -1142,36 +1189,127 @@ def _prepare_thumbnail_repair(
             thumbnail,
             purpose="scan thumbnail preimage",
         )
-        preimage_claim = _claim_owned_regular_file(
-            thumbnail,
-            preimage_sha256,
-            preimage_identity,
-            marker="rollback-preimage",
-        )
-        if preimage_claim is None:
-            raise ScannerWorkflowError(
-                f"scan thumbnail changed while preparing repair: {thumbnail.name}"
-            )
-    published: _CreatedArtifactState | None = None
+
+    intent_payload: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "digitalisierer.thumbnail-repair-intent",
+        "asset_id": asset_id,
+        "thumbnail_name": thumbnail.name,
+        "recorded_thumbnail_sha256": recorded_thumbnail_sha256,
+        "replacement": {
+            "path_name": replacement_path.name,
+            "sha256": replacement.sha256,
+            "identity": list(replacement.identity),
+        },
+        "preimage": None,
+    }
+    if preimage_sha256 is not None and preimage_identity is not None:
+        intent_payload["preimage"] = {
+            "path_name": preimage_claim_path.name,
+            "sha256": preimage_sha256,
+            "identity": list(preimage_identity),
+        }
+
     try:
-        published = _write_thumbnail(source, thumbnail)
-        if published is None:
-            raise ScannerWorkflowError(
-                f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+        _atomic_write_text(intent_path, _json_text(intent_payload))
+        intent_sha256, intent_identity = _regular_file_snapshot(
+            intent_path,
+            purpose="thumbnail repair intent",
+        )
+    except Exception:
+        _remove_created_artifact(replacement)
+        raise
+
+    preimage_claim: Path | None = None
+    published_state: _CreatedArtifactState | None = None
+    try:
+        if preimage_sha256 is not None and preimage_identity is not None:
+            preimage_claim = _claim_owned_regular_file(
+                thumbnail,
+                preimage_sha256,
+                preimage_identity,
+                marker="rollback-preimage",
+                claimed_path=preimage_claim_path,
             )
+            if preimage_claim is None:
+                raise ScannerWorkflowError(
+                    f"scan thumbnail changed while preparing repair: {thumbnail.name}"
+                )
+
+        _rename_noreplace(replacement_path, thumbnail)
         published_sha256, published_identity = _regular_file_snapshot(
             thumbnail,
             purpose="repaired scan thumbnail",
         )
         if (
-            published_identity != published.identity
-            or not secrets.compare_digest(published_sha256, published.sha256)
+            published_identity != replacement.identity
+            or not secrets.compare_digest(
+                published_sha256,
+                replacement.sha256,
+            )
         ):
             raise ScannerWorkflowError(
                 f"scan thumbnail changed while preparing repair: {thumbnail.name}"
             )
+        published_state = _CreatedArtifactState(
+            path=thumbnail,
+            sha256=published_sha256,
+            identity=published_identity,
+        )
     except Exception as exc:
-        if published is not None and not _remove_created_artifact(published):
+        rollback_ok = True
+        if published_state is not None:
+            if os.path.lexists(replacement_path):
+                rollback_ok = False
+            else:
+                moved = _claim_owned_regular_file(
+                    thumbnail,
+                    published_state.sha256,
+                    published_state.identity,
+                    marker="repair-replacement",
+                    claimed_path=replacement_path,
+                )
+                rollback_ok = moved is not None
+        elif not os.path.lexists(replacement_path):
+            moved = _claim_owned_regular_file(
+                thumbnail,
+                replacement.sha256,
+                replacement.identity,
+                marker="repair-replacement",
+                claimed_path=replacement_path,
+            )
+            rollback_ok = moved is not None
+
+        if (
+            rollback_ok
+            and preimage_claim is not None
+            and preimage_sha256 is not None
+            and preimage_identity is not None
+        ):
+            rollback_ok = _restore_owned_claim(
+                preimage_claim,
+                preimage_sha256,
+                preimage_identity,
+                thumbnail,
+            )
+            if rollback_ok:
+                preimage_claim = None
+
+        if rollback_ok and os.path.lexists(replacement_path):
+            rollback_ok = _remove_created_artifact(
+                _CreatedArtifactState(
+                    path=replacement_path,
+                    sha256=replacement.sha256,
+                    identity=replacement.identity,
+                )
+            )
+        if rollback_ok:
+            rollback_ok = _remove_owned_claim(
+                intent_path,
+                intent_sha256,
+                intent_identity,
+            )
+        if not rollback_ok:
             detail = (
                 f"; original preimage preserved at {preimage_claim}"
                 if preimage_claim is not None
@@ -1181,41 +1319,44 @@ def _prepare_thumbnail_repair(
                 "failed to roll back published scan thumbnail after repair preparation"
                 + detail
             ) from exc
-        if (
-            preimage_claim is not None
-            and preimage_sha256 is not None
-            and preimage_identity is not None
-            and not _restore_owned_claim(
-                preimage_claim,
-                preimage_sha256,
-                preimage_identity,
-                thumbnail,
-            )
-        ):
-            raise ScannerWorkflowError(
-                "failed to restore scan thumbnail after repair preparation; "
-                f"original preimage preserved at {preimage_claim}"
-            ) from exc
         raise
+
+    assert published_state is not None
     return _ThumbnailRepairState(
         thumbnail=thumbnail,
+        replacement_path=replacement_path,
         preimage_claim=preimage_claim,
         preimage_sha256=preimage_sha256,
         preimage_identity=preimage_identity,
-        published_sha256=published_sha256,
-        published_identity=published_identity,
+        published_sha256=published_state.sha256,
+        published_identity=published_state.identity,
+        intent_path=intent_path,
+        intent_sha256=intent_sha256,
+        intent_identity=intent_identity,
+    )
+
+
+def _clear_thumbnail_repair_intent(state: _ThumbnailRepairState) -> bool:
+    return _remove_owned_claim(
+        state.intent_path,
+        state.intent_sha256,
+        state.intent_identity,
     )
 
 
 def _rollback_thumbnail_repair(state: _ThumbnailRepairState) -> bool:
+    if os.path.lexists(state.replacement_path):
+        return False
     published_claim = _claim_owned_regular_file(
         state.thumbnail,
         state.published_sha256,
         state.published_identity,
-        marker="rollback-published",
+        marker="repair-replacement",
+        claimed_path=state.replacement_path,
     )
     if published_claim is None:
         return False
+
     if state.preimage_claim is not None:
         if state.preimage_sha256 is None or state.preimage_identity is None:
             return False
@@ -1227,26 +1368,31 @@ def _rollback_thumbnail_repair(state: _ThumbnailRepairState) -> bool:
         ):
             _restore_claimed_file(published_claim, state.thumbnail)
             return False
-    _remove_owned_claim(
-        published_claim,
-        state.published_sha256,
-        state.published_identity,
-    )
-    return True
+
+    if not _remove_created_artifact(
+        _CreatedArtifactState(
+            path=state.replacement_path,
+            sha256=state.published_sha256,
+            identity=state.published_identity,
+        )
+    ):
+        return False
+    return _clear_thumbnail_repair_intent(state)
 
 
 def _cleanup_thumbnail_repair(state: _ThumbnailRepairState) -> None:
     if (
-        state.preimage_claim is None
-        or state.preimage_sha256 is None
-        or state.preimage_identity is None
+        state.preimage_claim is not None
+        and state.preimage_sha256 is not None
+        and state.preimage_identity is not None
+        and not _remove_owned_claim(
+            state.preimage_claim,
+            state.preimage_sha256,
+            state.preimage_identity,
+        )
     ):
         return
-    _remove_owned_claim(
-        state.preimage_claim,
-        state.preimage_sha256,
-        state.preimage_identity,
-    )
+    _clear_thumbnail_repair_intent(state)
 
 
 def _remove_created_artifact(state: _CreatedArtifactState) -> bool:
@@ -1255,6 +1401,376 @@ def _remove_created_artifact(state: _CreatedArtifactState) -> bool:
         state.sha256,
         state.identity,
     )
+
+
+def _recover_interrupted_thumbnail_repairs(paths: ScanSessionPaths) -> None:
+    if paths.thumbnails.is_symlink() or not paths.thumbnails.is_dir():
+        raise ScannerWorkflowError("scanner thumbnails directory is invalid")
+
+    for intent_path in sorted(paths.thumbnails.glob(".*.repair-intent.json")):
+        raw_intent = _stable_file_bytes(intent_path)
+        intent_sha256, intent_identity = _regular_file_snapshot(
+            intent_path,
+            purpose="thumbnail repair intent",
+        )
+        if not secrets.compare_digest(
+            hashlib.sha256(raw_intent).hexdigest(),
+            intent_sha256,
+        ):
+            raise ScannerWorkflowError("thumbnail repair intent changed while reading")
+        try:
+            intent = json.loads(raw_intent.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ScannerWorkflowError("thumbnail repair intent is invalid") from exc
+        if (
+            not isinstance(intent, dict)
+            or intent.get("schema_version") != 1
+            or intent.get("kind") != "digitalisierer.thumbnail-repair-intent"
+            or set(intent) != {
+                "schema_version",
+                "kind",
+                "asset_id",
+                "thumbnail_name",
+                "recorded_thumbnail_sha256",
+                "replacement",
+                "preimage",
+            }
+        ):
+            raise ScannerWorkflowError("thumbnail repair intent is invalid")
+
+        asset_id = intent.get("asset_id")
+        thumbnail_name = intent.get("thumbnail_name")
+        recorded_sha256 = intent.get("recorded_thumbnail_sha256")
+        replacement = intent.get("replacement")
+        preimage = intent.get("preimage")
+        if (
+            not isinstance(asset_id, str)
+            or not asset_id
+            or not isinstance(thumbnail_name, str)
+            or Path(thumbnail_name).name != thumbnail_name
+            or not thumbnail_name.endswith(".jpg")
+            or not _is_sha256(recorded_sha256)
+            or not isinstance(replacement, dict)
+            or set(replacement) != {"path_name", "sha256", "identity"}
+        ):
+            raise ScannerWorkflowError("thumbnail repair intent is invalid")
+        assert isinstance(recorded_sha256, str)
+
+        def parse_state(
+            value: dict[str, object],
+            *,
+            suffix: str,
+        ) -> tuple[Path, str, tuple[int, int, int, int]]:
+            path_name = value.get("path_name")
+            sha256 = value.get("sha256")
+            identity = value.get("identity")
+            if (
+                not isinstance(path_name, str)
+                or Path(path_name).name != path_name
+                or not path_name.endswith(suffix)
+                or not _is_sha256(sha256)
+                or not isinstance(identity, list)
+                or len(identity) != 4
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int)
+                    for item in identity
+                )
+            ):
+                raise ScannerWorkflowError("thumbnail repair intent is invalid")
+            return (
+                paths.thumbnails / path_name,
+                str(sha256),
+                tuple(identity),
+            )
+
+        replacement_path, replacement_sha256, replacement_identity = parse_state(
+            replacement,
+            suffix=".repair-replacement",
+        )
+        preimage_path: Path | None = None
+        preimage_sha256: str | None = None
+        preimage_identity: tuple[int, int, int, int] | None = None
+        if preimage is not None:
+            if not isinstance(preimage, dict) or set(preimage) != {
+                "path_name",
+                "sha256",
+                "identity",
+            }:
+                raise ScannerWorkflowError("thumbnail repair intent is invalid")
+            preimage_path, preimage_sha256, preimage_identity = parse_state(
+                preimage,
+                suffix=".rollback-preimage",
+            )
+
+        thumbnail = paths.thumbnails / thumbnail_name
+        if intent_path != _thumbnail_repair_intent_path(thumbnail):
+            raise ScannerWorkflowError("thumbnail repair intent path is invalid")
+        expected_prefix = f".{thumbnail.name}."
+        if (
+            not replacement_path.name.startswith(expected_prefix)
+            or (
+                preimage_path is not None
+                and not preimage_path.name.startswith(expected_prefix)
+            )
+        ):
+            raise ScannerWorkflowError("thumbnail repair intent path is invalid")
+
+        session, _ = _stable_json_snapshot(paths.session_file)
+        _validate_session_identity(paths, session)
+        assets = session.get("assets")
+        if not isinstance(assets, list):
+            raise ScannerWorkflowError("scan session assets must be a list")
+        matches = [
+            item
+            for item in assets
+            if isinstance(item, dict) and item.get("asset_id") == asset_id
+        ]
+        if len(matches) != 1:
+            raise ScannerWorkflowError("thumbnail repair asset binding is invalid")
+        record = matches[0]
+        if record.get("thumbnail_path") != f"thumbnails/{thumbnail_name}":
+            raise ScannerWorkflowError("thumbnail repair asset binding is invalid")
+        current_recorded_sha = record.get("thumbnail_sha256")
+        if current_recorded_sha == replacement_sha256:
+            commit_repair = True
+        elif current_recorded_sha == recorded_sha256:
+            commit_repair = (
+                preimage_sha256 is None
+                or not secrets.compare_digest(
+                    preimage_sha256,
+                    recorded_sha256,
+                )
+            )
+        else:
+            raise ScannerWorkflowError(
+                "thumbnail repair metadata diverged during interrupted repair"
+            )
+
+        def exact_state(
+            path: Path,
+            sha256: str,
+            identity: tuple[int, int, int, int],
+            *,
+            purpose: str,
+        ) -> bool:
+            if not os.path.lexists(path):
+                return False
+            current_sha, current_identity = _regular_file_snapshot(
+                path,
+                purpose=purpose,
+            )
+            return current_identity == identity and secrets.compare_digest(
+                current_sha,
+                sha256,
+            )
+
+        canonical_replacement = exact_state(
+            thumbnail,
+            replacement_sha256,
+            replacement_identity,
+            purpose="interrupted repaired thumbnail",
+        )
+        staged_replacement = exact_state(
+            replacement_path,
+            replacement_sha256,
+            replacement_identity,
+            purpose="staged interrupted repaired thumbnail",
+        )
+        canonical_preimage = (
+            preimage_sha256 is not None
+            and preimage_identity is not None
+            and exact_state(
+                thumbnail,
+                preimage_sha256,
+                preimage_identity,
+                purpose="interrupted thumbnail preimage",
+            )
+        )
+        claimed_preimage = (
+            preimage_path is not None
+            and preimage_sha256 is not None
+            and preimage_identity is not None
+            and exact_state(
+                preimage_path,
+                preimage_sha256,
+                preimage_identity,
+                purpose="claimed interrupted thumbnail preimage",
+            )
+        )
+
+        if commit_repair:
+            if not canonical_replacement:
+                if not staged_replacement:
+                    raise ScannerWorkflowError(
+                        "thumbnail repair replacement is missing during recovery"
+                    )
+                if os.path.lexists(thumbnail):
+                    if (
+                        not canonical_preimage
+                        or preimage_path is None
+                        or preimage_sha256 is None
+                        or preimage_identity is None
+                    ):
+                        raise ScannerWorkflowError(
+                            "scan thumbnail changed during interrupted repair recovery"
+                        )
+                    if claimed_preimage:
+                        raise ScannerWorkflowError(
+                            "thumbnail repair preimage state is ambiguous"
+                        )
+                    claimed = _claim_owned_regular_file(
+                        thumbnail,
+                        preimage_sha256,
+                        preimage_identity,
+                        marker="rollback-preimage",
+                        claimed_path=preimage_path,
+                    )
+                    if claimed is None:
+                        raise ScannerWorkflowError(
+                            "scan thumbnail changed during interrupted repair recovery"
+                        )
+                    claimed_preimage = True
+                _rename_noreplace(replacement_path, thumbnail)
+                if not exact_state(
+                    thumbnail,
+                    replacement_sha256,
+                    replacement_identity,
+                    purpose="recovered repaired thumbnail",
+                ):
+                    raise ScannerWorkflowError(
+                        "recovered thumbnail changed during publication"
+                    )
+                canonical_replacement = True
+                staged_replacement = False
+
+            if current_recorded_sha != replacement_sha256:
+                record["thumbnail_sha256"] = replacement_sha256
+                _atomic_write_text(paths.session_file, _json_text(session))
+                recovered_session, _ = _stable_json_snapshot(paths.session_file)
+                recovered_assets = recovered_session.get("assets")
+                if not isinstance(recovered_assets, list):
+                    raise ScannerWorkflowError(
+                        "thumbnail repair metadata recovery did not converge"
+                    )
+                recovered_matches = [
+                    item
+                    for item in recovered_assets
+                    if isinstance(item, dict)
+                    and item.get("asset_id") == asset_id
+                ]
+                if (
+                    len(recovered_matches) != 1
+                    or recovered_matches[0].get("thumbnail_sha256")
+                    != replacement_sha256
+                ):
+                    raise ScannerWorkflowError(
+                        "thumbnail repair metadata recovery did not converge"
+                    )
+                current_recorded_sha = replacement_sha256
+
+            if staged_replacement and not _remove_created_artifact(
+                _CreatedArtifactState(
+                    path=replacement_path,
+                    sha256=replacement_sha256,
+                    identity=replacement_identity,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean duplicate thumbnail replacement"
+                )
+            if (
+                claimed_preimage
+                and preimage_path is not None
+                and preimage_sha256 is not None
+                and preimage_identity is not None
+                and not _remove_owned_claim(
+                    preimage_path,
+                    preimage_sha256,
+                    preimage_identity,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean committed thumbnail preimage"
+                )
+        else:
+            if canonical_replacement:
+                if staged_replacement:
+                    raise ScannerWorkflowError(
+                        "thumbnail repair replacement state is ambiguous"
+                    )
+                moved = _claim_owned_regular_file(
+                    thumbnail,
+                    replacement_sha256,
+                    replacement_identity,
+                    marker="repair-replacement",
+                    claimed_path=replacement_path,
+                )
+                if moved is None:
+                    raise ScannerWorkflowError(
+                        "scan thumbnail changed during interrupted repair rollback"
+                    )
+                staged_replacement = True
+                canonical_replacement = False
+            elif os.path.lexists(thumbnail) and not canonical_preimage:
+                raise ScannerWorkflowError(
+                    "scan thumbnail changed during interrupted repair rollback"
+                )
+
+            if preimage_path is not None:
+                if preimage_sha256 is None or preimage_identity is None:
+                    raise ScannerWorkflowError(
+                        "thumbnail repair preimage binding is invalid"
+                    )
+                if not canonical_preimage:
+                    if not claimed_preimage:
+                        raise ScannerWorkflowError(
+                            "thumbnail repair preimage is missing during recovery"
+                        )
+                    if not _restore_owned_claim(
+                        preimage_path,
+                        preimage_sha256,
+                        preimage_identity,
+                        thumbnail,
+                    ):
+                        raise ScannerWorkflowError(
+                            "failed to restore interrupted thumbnail preimage"
+                        )
+                    canonical_preimage = True
+                    claimed_preimage = False
+                elif claimed_preimage:
+                    if not _remove_owned_claim(
+                        preimage_path,
+                        preimage_sha256,
+                        preimage_identity,
+                    ):
+                        raise ScannerWorkflowError(
+                            "failed to clean duplicate thumbnail preimage"
+                        )
+                    claimed_preimage = False
+            elif os.path.lexists(thumbnail):
+                raise ScannerWorkflowError(
+                    "unexpected thumbnail exists during interrupted repair rollback"
+                )
+
+            if staged_replacement and not _remove_created_artifact(
+                _CreatedArtifactState(
+                    path=replacement_path,
+                    sha256=replacement_sha256,
+                    identity=replacement_identity,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean interrupted thumbnail replacement"
+                )
+
+        if not _remove_owned_claim(
+            intent_path,
+            intent_sha256,
+            intent_identity,
+        ):
+            raise ScannerWorkflowError(
+                "failed to clear thumbnail repair intent"
+            )
 
 
 def _observation_commit_path(paths: ScanSessionPaths) -> Path:
@@ -2082,6 +2598,14 @@ def _observe_scan_folder_unlocked(
                 raise ScannerWorkflowError(
                     "scan asset record has an invalid sha256"
                 )
+            recorded_thumbnail_sha256 = record.get("thumbnail_sha256")
+            if (
+                not isinstance(recorded_thumbnail_sha256, str)
+                or not _is_sha256(recorded_thumbnail_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    "scan asset record has an invalid thumbnail_sha256"
+                )
             with _verified_preview_source_snapshot(
                 preserved,
                 expected_sha256=recorded_sha256,
@@ -2089,6 +2613,8 @@ def _observe_scan_folder_unlocked(
                 rollback_state = _prepare_thumbnail_repair(
                     preview_source,
                     thumbnail,
+                    asset_id=str(record["asset_id"]),
+                    recorded_thumbnail_sha256=recorded_thumbnail_sha256,
                 )
             thumbnail_rollbacks.append(rollback_state)
             record["thumbnail_sha256"] = rollback_state.published_sha256
@@ -2808,6 +3334,47 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+_SCANNER_EXPORT_STAGING_FILES = frozenset(
+    {
+        "master.pdf",
+        "searchable.pdf",
+        "text.txt",
+        "report.txt",
+        "manifest.json",
+    }
+)
+
+
+def _cleanup_scanner_export_staging(
+    staging: Path,
+    directory_fd: int,
+    directory_identity: tuple[int, int],
+) -> None:
+    """Clean only the staging directory already bound by the directory fd."""
+
+    try:
+        current = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != directory_identity
+        ):
+            return
+        names = set(os.listdir(directory_fd))
+    except OSError:
+        return
+
+    for name in names & _SCANNER_EXPORT_STAGING_FILES:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            pass
+
+    # Do not remove the top-level staging pathname here. There is no
+    # race-free name-based rmdir-if-inode-matches primitive; another same-user
+    # process could replace that pathname after any identity check. Leaving an
+    # empty owned staging directory is safer than deleting a replacement.
+
+
 def _rename_noreplace(source: Path, target: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
@@ -3158,6 +3725,25 @@ def finalize_scan_session(
     staging_stat = staging.lstat()
     staging_directory_identity = (staging_stat.st_dev, staging_stat.st_ino)
     try:
+        staging_directory_fd = os.open(
+            staging,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            "scanner export staging directory cannot be bound safely"
+        ) from exc
+    bound_staging = os.fstat(staging_directory_fd)
+    if (
+        not stat.S_ISDIR(bound_staging.st_mode)
+        or (bound_staging.st_dev, bound_staging.st_ino)
+        != staging_directory_identity
+    ):
+        os.close(staging_directory_fd)
+        raise ScannerWorkflowError(
+            "scanner export staging directory changed during reservation"
+        )
+    try:
         master = staging / "master.pdf"
         searchable = staging / "searchable.pdf"
         text_file = staging / "text.txt"
@@ -3313,16 +3899,12 @@ def finalize_scan_session(
             },
         )
     except Exception:
-        if staging != Path() and os.path.lexists(staging):
-            try:
-                current_staging = staging.lstat()
-            except OSError:
-                pass
-            else:
-                if (
-                    stat.S_ISDIR(current_staging.st_mode)
-                    and (current_staging.st_dev, current_staging.st_ino)
-                    == staging_directory_identity
-                ):
-                    shutil.rmtree(staging, ignore_errors=True)
+        if staging != Path():
+            _cleanup_scanner_export_staging(
+                staging,
+                staging_directory_fd,
+                staging_directory_identity,
+            )
         raise
+    finally:
+        os.close(staging_directory_fd)

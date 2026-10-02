@@ -409,6 +409,14 @@ class _FakePdf:
 _fake_pdf = _FakePdf()
 
 
+def _assert_failed_finalize_cleanup_is_safe(exports: Path) -> None:
+    for entry in exports.iterdir():
+        assert entry.is_dir()
+        assert ".staging-" in entry.name
+        assert list(entry.iterdir()) == []
+
+
+
 def test_near_duplicate_findings_aggregate_large_similarity_group() -> None:
     assets = [
         {
@@ -710,7 +718,7 @@ def test_finalize_uses_one_review_snapshot_when_review_changes_during_ocr(
 
     current_review = json.loads(paths.review_file.read_text(encoding="utf-8"))
     assert current_review["items"][first]["included"] is False
-    assert list(paths.exports.iterdir()) == []
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
 def test_observe_resume_rejects_known_asset_missing_review_state(
     tmp_path: Path,
@@ -1037,7 +1045,7 @@ def test_finalize_initial_snapshot_serializes_observe_publication(
     assert isinstance(finalizer_failures[0], ScannerWorkflowError)
     assert "metadata changed while finalizing" in str(finalizer_failures[0])
     assert len(load_processing_session(paths).items) == 2
-    assert list(paths.exports.iterdir()) == []
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
 
 def test_finalize_serializes_review_update_through_publication(
@@ -2746,7 +2754,12 @@ def test_thumbnail_prepare_verification_failure_restores_preimage(
     )
 
     with pytest.raises(ScannerWorkflowError):
-        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+        scanner_module._prepare_thumbnail_repair(
+            source,
+            thumbnail,
+            asset_id="test-asset",
+            recorded_thumbnail_sha256="0" * 64,
+        )
 
     assert failed is True
     if preimage is None:
@@ -2796,7 +2809,12 @@ def test_thumbnail_prepare_verification_failure_preserves_foreign_replacement(
         ScannerWorkflowError,
         match="failed to roll back published scan thumbnail after repair preparation",
     ):
-        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+        scanner_module._prepare_thumbnail_repair(
+            source,
+            thumbnail,
+            asset_id="test-asset",
+            recorded_thumbnail_sha256="0" * 64,
+        )
 
     assert injected is True
     assert thumbnail.read_bytes() == foreign
@@ -2867,7 +2885,12 @@ def test_thumbnail_prepare_rejects_same_inode_state_change(
         ScannerWorkflowError,
         match="failed to roll back published scan thumbnail after repair preparation",
     ):
-        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+        scanner_module._prepare_thumbnail_repair(
+            source,
+            thumbnail,
+            asset_id="test-asset",
+            recorded_thumbnail_sha256="0" * 64,
+        )
 
     assert injected is True
     assert thumbnail.read_bytes() != preimage
@@ -2876,6 +2899,124 @@ def test_thumbnail_prepare_rejects_same_inode_state_change(
     assert claims[0].read_bytes() == preimage
     assert not list(tmp_path.glob(".*.rollback-published"))
     assert not list(tmp_path.glob(".*.restore-claim"))
+
+
+
+def test_thumbnail_repair_crash_recovers_before_review_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-repair-crash"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-repair-crash",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    original_digest = session_before["assets"][0]["thumbnail_sha256"]
+    thumbnail = paths.root / session_before["assets"][0]["thumbnail_path"]
+    thumbnail.write_bytes(b"force-repair-before-crash")
+
+    original_writer = scanner_module._write_thumbnail
+    original_prepare = scanner_module._prepare_thumbnail_repair
+    crashed = False
+
+    def alternate_writer(source_path: Path | int, target: Path) -> object:
+        published = original_writer(source_path, target)
+        assert published is not None
+        with target.open("ab") as handle:
+            handle.write(b"-alternate-render")
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest, identity = scanner_module._regular_file_snapshot(
+            target,
+            purpose="alternate repaired thumbnail",
+        )
+        return scanner_module._CreatedArtifactState(
+            path=target,
+            sha256=digest,
+            identity=identity,
+        )
+
+    def crash_after_repair(
+        source_path: Path | int,
+        target: Path,
+        *,
+        asset_id: str,
+        recorded_thumbnail_sha256: str,
+    ) -> object:
+        nonlocal crashed
+        original_prepare(
+            source_path,
+            target,
+            asset_id=asset_id,
+            recorded_thumbnail_sha256=recorded_thumbnail_sha256,
+        )
+        crashed = True
+        raise SystemExit("synthetic crash after thumbnail repair publication")
+
+    monkeypatch.setattr(scanner_module, "_write_thumbnail", alternate_writer)
+    monkeypatch.setattr(
+        scanner_module,
+        "_prepare_thumbnail_repair",
+        crash_after_repair,
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash after thumbnail repair publication",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    monkeypatch.setattr(
+        scanner_module,
+        "_prepare_thumbnail_repair",
+        original_prepare,
+    )
+
+    original_atomic_write = scanner_module._atomic_write_text
+    recovery_crashed = False
+
+    def crash_after_recovery_session_write(path: Path, content: str) -> None:
+        nonlocal recovery_crashed
+        original_atomic_write(path, content)
+        if path == paths.session_file and not recovery_crashed:
+            recovery_crashed = True
+            raise SystemExit("synthetic crash during thumbnail repair recovery")
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        crash_after_recovery_session_write,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash during thumbnail repair recovery",
+    ):
+        scanner_module.load_review_state(paths)
+    assert recovery_crashed is True
+    assert list(paths.thumbnails.glob(".*.repair-intent.json"))
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        original_atomic_write,
+    )
+    session, _review, _findings, _processing = scanner_module.load_review_state(paths)
+    repaired = next(
+        item for item in session["assets"] if item["asset_id"] == asset_id
+    )
+    current_digest = hashlib.sha256(thumbnail.read_bytes()).hexdigest()
+    assert repaired["thumbnail_sha256"] == current_digest
+    assert current_digest != original_digest
+    assert not list(paths.thumbnails.glob(".*.repair-intent.json"))
+    assert not list(paths.thumbnails.glob(".*.rollback-preimage"))
 
 
 def test_thumbnail_rollback_refuses_replaced_preimage_claim(
@@ -2902,17 +3043,37 @@ def test_thumbnail_rollback_refuses_replaced_preimage_claim(
         paths.findings_file: paths.findings_file.read_bytes(),
     }
     foreign = b"foreign-rollback-preimage"
-    original_thumbnail_writer = scanner_module._write_thumbnail
+    original_claim = scanner_module._claim_owned_regular_file
     original_atomic_write = scanner_module._atomic_write_text
     failed = False
+    injected = False
 
-    def replace_preimage_claim(source_path: Path, target: Path) -> object:
-        published = original_thumbnail_writer(source_path, target)
-        claims = list(paths.thumbnails.glob(".*.rollback-preimage"))
-        assert len(claims) == 1
-        claims[0].unlink()
-        claims[0].write_bytes(foreign)
-        return published
+    def replace_preimage_claim(
+        path: Path,
+        expected_sha256: str,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        marker: str,
+        claimed_path: Path | None = None,
+    ) -> Path | None:
+        nonlocal injected
+        claimed = original_claim(
+            path,
+            expected_sha256,
+            expected_identity,
+            marker=marker,
+            claimed_path=claimed_path,
+        )
+        if (
+            claimed is not None
+            and marker == "rollback-preimage"
+            and claimed.parent == paths.thumbnails
+            and not injected
+        ):
+            claimed.unlink()
+            claimed.write_bytes(foreign)
+            injected = True
+        return claimed
 
     def fail_session_once(path: Path, content: str) -> None:
         nonlocal failed
@@ -2921,7 +3082,11 @@ def test_thumbnail_rollback_refuses_replaced_preimage_claim(
             raise OSError("synthetic session failure with replaced rollback claim")
         original_atomic_write(path, content)
 
-    monkeypatch.setattr(scanner_module, "_write_thumbnail", replace_preimage_claim)
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        replace_preimage_claim,
+    )
     monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_session_once)
 
     with pytest.raises(
@@ -2931,6 +3096,7 @@ def test_thumbnail_rollback_refuses_replaced_preimage_claim(
         observe_scan_folder(paths, capture)
 
     assert failed is True
+    assert injected is True
     assert thumbnail.read_bytes() != foreign
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == recorded_thumbnail_sha
     assert {path: path.read_bytes() for path in metadata_before} == metadata_before
@@ -3440,7 +3606,15 @@ def test_finalize_validates_ocr_outputs_before_path_hashing(
     ):
         finalize_scan_session(paths, _SymlinkOcr(), pdf_builder=_fake_pdf)
 
-    assert list(paths.exports.iterdir()) == []
+    staging_entries = list(paths.exports.iterdir())
+    assert len(staging_entries) == 1
+    leftover = staging_entries[0]
+    assert leftover.is_dir()
+    assert ".staging-" in leftover.name
+    assert (leftover / "searchable-target.pdf").read_bytes() == b"OCR-PDF"
+    assert not (leftover / "master.pdf").exists()
+    assert not (leftover / "searchable.pdf").exists()
+    assert not (leftover / "text.txt").exists()
 
 
 def test_finalize_revalidates_staging_artifacts_at_publication_boundary(
@@ -3479,7 +3653,7 @@ def test_finalize_revalidates_staging_artifacts_at_publication_boundary(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert injected is True
-    assert list(paths.exports.iterdir()) == []
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
 
 @pytest.mark.parametrize("crash_after", ["review", "findings"])
@@ -3685,6 +3859,65 @@ def test_observe_preview_derivation_remains_bound_after_snapshot_path_rebind(
     asset = session["assets"][0]
     assert asset["image"] == expected_image
     assert asset["thumbnail_sha256"] == expected_thumbnail_sha
+
+
+
+def test_finalize_cleanup_keeps_foreign_staging_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "staging-cleanup-rebind"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "staging-cleanup-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    displaced = tmp_path / "displaced-staging-cleanup"
+    foreign = b"foreign-staging-directory\n"
+    attacked = False
+
+    class FailingOcr(_FakeOcr):
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            nonlocal attacked
+            super().searchable_pdf(
+                master_pdf,
+                output_pdf,
+                sidecar_txt,
+                language=language,
+            )
+            staging = output_pdf.parent
+            os.rename(staging, displaced)
+            staging.mkdir()
+            (staging / "foreign.txt").write_bytes(foreign)
+            attacked = True
+            raise ScannerWorkflowError("synthetic staging cleanup failure")
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="synthetic staging cleanup failure",
+    ):
+        finalize_scan_session(paths, FailingOcr(), pdf_builder=_fake_pdf)
+
+    assert attacked is True
+    replacements = [
+        path
+        for path in paths.exports.iterdir()
+        if (path / "foreign.txt").is_file()
+    ]
+    assert len(replacements) == 1
+    assert (replacements[0] / "foreign.txt").read_bytes() == foreign
+    assert displaced.is_dir()
+    assert list(displaced.iterdir()) == []
 
 
 def test_finalize_rollback_preserves_foreign_replacement_of_published_directory(
@@ -3896,7 +4129,7 @@ def test_finalize_rolls_back_publication_when_exports_fsync_fails(
         finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
 
     assert failed is True
-    assert list(paths.exports.iterdir()) == []
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
     monkeypatch.setattr(scanner_module, "_fsync_directory", original_fsync_directory)
     exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)

@@ -1066,6 +1066,63 @@ def test_apply_preset_uses_same_fail_if_exists_publication_semantics(
     assert backup.read_bytes() == before
 
 
+
+def test_apply_preset_crash_after_config_claim_keeps_durable_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    backend = CzurCaptureBackend(config_path=config)
+    before = config.read_bytes()
+    original_rename = os.rename
+    crashed = False
+
+    def crash_after_claim(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal crashed
+        destination = Path(dst)
+        if (
+            not crashed
+            and Path(src) == config
+            and destination.name == "preimage"
+            and destination.parent.name.startswith(
+                ".config.json.digitalisierer.claim."
+            )
+        ):
+            original_rename(src, dst)
+            crashed = True
+            raise SystemExit("synthetic crash after config claim")
+        original_rename(src, dst)
+
+    monkeypatch.setattr("digitalisierer.czur.os.rename", crash_after_claim)
+
+    with pytest.raises(SystemExit, match="synthetic crash after config claim"):
+        backend.apply_curved_books_preset()
+
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    assert crashed is True
+    assert backup.read_bytes() == before
+    claims = list(tmp_path.glob(".config.json.digitalisierer.claim.*/preimage"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == before
+    assert not config.exists()
+
+
 def test_start_keeps_preimage_backup_when_foreign_write_follows_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
