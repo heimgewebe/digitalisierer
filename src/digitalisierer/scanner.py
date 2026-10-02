@@ -1152,6 +1152,7 @@ def _prepare_thumbnail_repair(
             raise ScannerWorkflowError(
                 f"scan thumbnail changed while preparing repair: {thumbnail.name}"
             )
+    published: _CreatedArtifactState | None = None
     try:
         published = _write_thumbnail(source, thumbnail)
         if published is None:
@@ -1167,6 +1168,16 @@ def _prepare_thumbnail_repair(
                 f"scan thumbnail changed while preparing repair: {thumbnail.name}"
             )
     except Exception as exc:
+        if published is not None and not _remove_created_artifact(published):
+            detail = (
+                f"; original preimage preserved at {preimage_claim}"
+                if preimage_claim is not None
+                else ""
+            )
+            raise ScannerWorkflowError(
+                "failed to roll back published scan thumbnail after repair preparation"
+                + detail
+            ) from exc
         if (
             preimage_claim is not None
             and preimage_sha256 is not None

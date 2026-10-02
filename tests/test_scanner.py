@@ -2720,6 +2720,104 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
     )
 
 
+@pytest.mark.parametrize("thumbnail_existed", [True, False])
+def test_thumbnail_prepare_verification_failure_restores_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    thumbnail_existed: bool,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 110)
+    thumbnail = tmp_path / "thumbnail.jpg"
+    if thumbnail_existed:
+        thumbnail.write_bytes(b"preexisting-thumbnail")
+        preimage: bytes | None = thumbnail.read_bytes()
+    else:
+        preimage = None
+    original_snapshot = scanner_module._regular_file_snapshot
+    failed = False
+
+    def fail_repaired_snapshot(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal failed
+        if path == thumbnail and purpose == "repaired scan thumbnail" and not failed:
+            failed = True
+            raise ScannerWorkflowError(
+                "synthetic repaired thumbnail verification failure"
+            )
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        fail_repaired_snapshot,
+    )
+
+    with pytest.raises(ScannerWorkflowError):
+        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+
+    assert failed is True
+    if preimage is None:
+        assert not thumbnail.exists()
+    else:
+        assert thumbnail.read_bytes() == preimage
+    assert not list(tmp_path.glob(".*.rollback-preimage"))
+    assert not list(tmp_path.glob(".*.rollback-published"))
+    assert not list(tmp_path.glob(".*.restore-claim"))
+
+
+def test_thumbnail_prepare_verification_failure_preserves_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 110)
+    thumbnail = tmp_path / "thumbnail.jpg"
+    preimage = b"preexisting-thumbnail"
+    thumbnail.write_bytes(preimage)
+    foreign = b"foreign-thumbnail-replacement"
+    original_snapshot = scanner_module._regular_file_snapshot
+    injected = False
+
+    def replace_before_repaired_snapshot(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal injected
+        if path == thumbnail and purpose == "repaired scan thumbnail" and not injected:
+            thumbnail.unlink()
+            thumbnail.write_bytes(foreign)
+            injected = True
+            raise ScannerWorkflowError(
+                "synthetic repaired thumbnail verification failure"
+            )
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        replace_before_repaired_snapshot,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="failed to roll back published scan thumbnail after repair preparation",
+    ):
+        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+
+    assert injected is True
+    assert thumbnail.read_bytes() == foreign
+    claims = list(tmp_path.glob(".*.rollback-preimage"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == preimage
+    assert not list(tmp_path.glob(".*.rollback-published"))
+    assert not list(tmp_path.glob(".*.restore-claim"))
+
+
 def test_thumbnail_rollback_refuses_replaced_preimage_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
