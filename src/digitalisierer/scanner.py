@@ -3705,7 +3705,7 @@ def _publish_verified_staging(
             raise ScannerWorkflowError(
                 "scanner export directory changed during commit verification"
             )
-    except Exception as exc:
+    except BaseException as exc:
         if published:
             try:
                 if staging.exists() or published_directory_identity is None:

@@ -4615,6 +4615,53 @@ def test_finalize_cleans_publication_preimage_when_frozen_validation_is_interrup
     _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
 
+def test_finalize_rolls_back_published_export_when_verification_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "published-verification-interrupted"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "published-verification-interrupted",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    published = False
+    interrupted = False
+
+    def track_publication(source: Path, target: Path) -> None:
+        nonlocal published
+        original_rename(source, target)
+        if source.parent == paths.exports and ".staging-" in source.name:
+            published = True
+
+    def interrupt_first_post_publication_hash(descriptor: int) -> str:
+        nonlocal interrupted
+        digest = original_descriptor_sha256(descriptor)
+        if published and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return digest
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", track_publication)
+    monkeypatch.setattr(
+        scanner_module,
+        "_descriptor_sha256",
+        interrupt_first_post_publication_hash,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published is True
+    assert interrupted is True
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
+
+
 def test_finalize_freezes_export_directory_entries_through_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
