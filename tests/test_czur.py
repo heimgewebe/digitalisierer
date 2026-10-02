@@ -1320,6 +1320,55 @@ def test_start_rejects_symlinked_config_and_rolls_back_created_directories(
     assert backend._session_output is None
 
 
+def test_start_rolls_back_new_output_when_capture_root_creation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    launcher = tmp_path / "czur-scanner"
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    xdotool = tmp_path / "xdotool"
+    xdotool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    xdotool.chmod(0o700)
+    capture_root = tmp_path / "captures"
+    output_dir = tmp_path / "session"
+    backend = CzurCaptureBackend(
+        capture_root=capture_root,
+        config_path=config,
+        launcher=launcher,
+        xdotool=str(xdotool),
+    )
+    monkeypatch.setattr(backend, "_visible_windows", lambda: [])
+    original_mkdir = Path.mkdir
+
+    def fail_capture_root_mkdir(
+        self: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if self == capture_root:
+            raise OSError("synthetic capture-root mkdir failure")
+        original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", fail_capture_root_mkdir)
+
+    with pytest.raises(OSError, match="synthetic capture-root mkdir failure"):
+        backend.start(output_dir)
+
+    assert config.read_bytes() == before
+    assert not config.with_name("config.pre-digitalisierer-curved-books.json").exists()
+    assert not output_dir.exists()
+    assert not capture_root.exists()
+    assert backend._session_output is None
+
+
 def test_start_preset_failure_preserves_existing_output_directories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

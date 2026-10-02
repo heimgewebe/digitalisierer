@@ -913,9 +913,9 @@ class CzurCaptureBackend:
         backup_existed = os.path.lexists(backup)
 
         self._session_output = session_output
-        self._session_output.mkdir(parents=True, exist_ok=True)
-        self.capture_root.mkdir(parents=True, exist_ok=True)
         try:
+            self._session_output.mkdir(parents=True, exist_ok=True)
+            self.capture_root.mkdir(parents=True, exist_ok=True)
             (
                 _,
                 config_before,
