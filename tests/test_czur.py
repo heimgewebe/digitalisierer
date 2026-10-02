@@ -1865,3 +1865,48 @@ def test_backup_post_publication_failure_rolls_back_without_new_allocation(
     assert not list(
         tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
     )
+
+
+def test_backup_helper_does_not_validate_staging_after_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_snapshot = backend._snapshot_regular_file
+    post_link_staging_snapshot = False
+
+    def reject_staging_snapshot_after_publication(
+        path: Path,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal post_link_staging_snapshot
+        if (
+            path.name == "backup"
+            and path.parent.name.startswith(
+                ".config.json.digitalisierer.backup-stage."
+            )
+            and os.path.lexists(backup)
+        ):
+            post_link_staging_snapshot = True
+            raise OSError("synthetic forbidden post-link staging snapshot")
+        return original_snapshot(path)
+
+    monkeypatch.setattr(
+        backend,
+        "_snapshot_regular_file",
+        reject_staging_snapshot_after_publication,
+    )
+
+    backend.apply_curved_books_preset()
+
+    assert post_link_staging_snapshot is False
+    assert backup.read_bytes() == before
+    assert not list(
+        tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
+    )

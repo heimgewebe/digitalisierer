@@ -309,30 +309,13 @@ class CzurCaptureBackend:
             except FileExistsError:
                 return None
 
-            staged_after_content, backup_identity = self._snapshot_regular_file(
-                staged_backup
-            )
-            if (
-                staged_after_content != config_before
-                or backup_identity[0] != staged_identity[0]
-                or backup_identity[1] != staged_identity[1]
-            ):
-                raise CzurAdapterError(
-                    "CZUR backup staging changed during publication"
-                )
-
-            staged_backup.unlink()
-            try:
-                staging_dir.rmdir()
-            except OSError:
-                pass
-            return backup_identity
+            return staged_identity
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
             try:
                 staged_backup.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
             try:
                 staging_dir.rmdir()
