@@ -1131,7 +1131,7 @@ def _remove_owned_claim(
 
 
 def _prepare_thumbnail_repair(
-    source: Path,
+    source: Path | int,
     thumbnail: Path,
 ) -> _ThumbnailRepairState:
     preimage_claim: Path | None = None
@@ -2063,10 +2063,19 @@ def _observe_scan_folder_unlocked(
             }
         )
         for record, preserved, thumbnail in pending_thumbnail_repairs:
-            rollback_state = _prepare_thumbnail_repair(
+            recorded_sha256 = record.get("sha256")
+            if not isinstance(recorded_sha256, str) or not _is_sha256(recorded_sha256):
+                raise ScannerWorkflowError(
+                    "scan asset record has an invalid sha256"
+                )
+            with _verified_preview_source_snapshot(
                 preserved,
-                thumbnail,
-            )
+                expected_sha256=recorded_sha256,
+            ) as preview_source:
+                rollback_state = _prepare_thumbnail_repair(
+                    preview_source,
+                    thumbnail,
+                )
             thumbnail_rollbacks.append(rollback_state)
             record["thumbnail_sha256"] = rollback_state.published_sha256
 
@@ -2098,8 +2107,8 @@ def _observe_scan_folder_unlocked(
             raise ScannerWorkflowError(
                 "observation metadata commit marker already exists"
             )
-        _atomic_write_text(commit_path, commit_text)
         commit_marker_sha256 = _metadata_text_sha256(commit_text)
+        _atomic_write_text(commit_path, commit_text)
 
         metadata_mutated = True
         _atomic_write_text(paths.review_file, next_review_text)
@@ -2127,7 +2136,11 @@ def _observe_scan_folder_unlocked(
                 except Exception as exc:
                     if rollback_error is None:
                         rollback_error = exc
-        if rollback_error is None and commit_marker_sha256 is not None:
+        if (
+            rollback_error is None
+            and commit_marker_sha256 is not None
+            and os.path.lexists(commit_path)
+        ):
             try:
                 _clear_observation_commit_marker(
                     paths,

@@ -3742,3 +3742,131 @@ def test_finalize_rolls_back_publication_when_exports_fsync_fails(
     monkeypatch.setattr(scanner_module, "_fsync_directory", original_fsync_directory)
     exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
     assert exported.export_dir.is_dir()
+
+
+def test_observe_marker_publish_failure_clears_published_marker_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "marker-publish-failure"
+    capture.mkdir()
+    _image(capture / "page.jpg", 120)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "marker-publish-failure",
+        library,
+    )
+    original_write = scanner_module._atomic_write_text
+    commit_path = paths.root / scanner_module.OBSERVATION_COMMIT_FILE
+    failed = False
+
+    def publish_marker_then_fail(path: Path, text: str) -> None:
+        nonlocal failed
+        original_write(path, text)
+        if path == commit_path and not failed:
+            failed = True
+            raise OSError("synthetic marker publication failure after replace")
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", publish_marker_then_fail)
+
+    with pytest.raises(
+        OSError,
+        match="synthetic marker publication failure after replace",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert failed is True
+    assert not os.path.lexists(commit_path)
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    resumed = create_or_resume_scan_session(
+        "book",
+        "marker-publish-failure",
+        library,
+    )
+    session, review, findings, processing = scanner_module.load_review_state(resumed)
+    assert session["assets"] == []
+    assert review["items"] == {}
+    assert findings["findings"] == []
+    assert processing.items == []
+
+    retried = observe_scan_folder(resumed, capture)
+    assert len(retried.imported_asset_ids) == 1
+    assert retried.skipped_asset_ids == ()
+
+
+def test_observe_resume_thumbnail_repair_uses_verified_preserved_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-thumbnail-preview-rebind"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    replacement = tmp_path / "replacement-resume-preview.jpg"
+    _image(source, 80)
+    _image(replacement, 220)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-thumbnail-preview-rebind",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    thumbnail = paths.root / asset["thumbnail_path"]
+    original_preserved = preserved.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+
+    expected_thumbnail = tmp_path / "expected-resume-thumbnail.jpg"
+    scanner_module._write_thumbnail(preserved, expected_thumbnail)
+    expected_thumbnail_sha, _ = scanner_module._regular_file_snapshot(
+        expected_thumbnail,
+        purpose="expected repaired thumbnail",
+    )
+    thumbnail.write_bytes(b"force-thumbnail-repair")
+
+    original_thumbnail_writer = scanner_module._write_thumbnail
+    attacked = False
+    descriptor_bound = False
+
+    def thumbnail_after_preserved_rebind(
+        source_path: Path | int,
+        target: Path,
+    ) -> object:
+        nonlocal attacked, descriptor_bound
+        if isinstance(source_path, int):
+            descriptor_bound = True
+        if not attacked and source_path == preserved:
+            saved = preserved.with_name(f".{preserved.name}.test-preimage")
+            os.rename(preserved, saved)
+            injected = preserved.with_name(f".{preserved.name}.test-foreign")
+            injected.write_bytes(replacement_bytes)
+            os.replace(injected, preserved)
+            attacked = True
+            try:
+                return original_thumbnail_writer(source_path, target)
+            finally:
+                preserved.unlink()
+                os.rename(saved, preserved)
+        return original_thumbnail_writer(source_path, target)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_write_thumbnail",
+        thumbnail_after_preserved_rebind,
+    )
+
+    resumed = observe_scan_folder(paths, capture)
+
+    assert attacked is False
+    assert descriptor_bound is True
+    assert resumed.imported_asset_ids == ()
+    assert resumed.skipped_asset_ids == (asset_id,)
+    repaired = json.loads(paths.session_file.read_text(encoding="utf-8"))["assets"][0]
+    assert preserved.read_bytes() == original_preserved
+    assert repaired["sha256"] == asset["sha256"]
+    assert repaired["thumbnail_sha256"] == expected_thumbnail_sha
+    assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == expected_thumbnail_sha
