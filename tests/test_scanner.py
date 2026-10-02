@@ -4455,6 +4455,166 @@ def test_finalize_keeps_published_artifacts_read_only_through_verification(
 
 
 
+def test_finalize_cleans_staged_artifacts_when_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "interrupted-finalize-cleanup"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "interrupted-finalize-cleanup",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_fsync_directory = scanner_module._fsync_directory
+    interrupted = False
+
+    def interrupt_after_staging_fsync(path: Path) -> None:
+        nonlocal interrupted
+        original_fsync_directory(path)
+        if (
+            not interrupted
+            and path.parent == paths.exports
+            and ".staging-" in path.name
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_fsync_directory",
+        interrupt_after_staging_fsync,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert interrupted is True
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
+
+
+def test_finalize_cleans_publication_preimage_when_snapshot_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-preimage-rename-failure"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-preimage-rename-failure",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    injected = False
+
+    def fail_snapshot_publication(source: Path, target: Path) -> None:
+        nonlocal injected
+        if not injected and source.name.endswith(".publication-snapshot"):
+            injected = True
+            raise FileExistsError(target)
+        original_rename(source, target)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_rename_noreplace",
+        fail_snapshot_publication,
+    )
+
+    with pytest.raises(FileExistsError):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert injected is True
+    assert not list(paths.exports.rglob("*.publication-preimage"))
+
+
+def test_finalize_cleans_publication_preimage_when_frozen_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-preimage-validation-failure"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-preimage-validation-failure",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_snapshot = scanner_module._regular_file_snapshot
+    injected = False
+
+    def fail_frozen_validation(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal injected
+        if not injected and purpose == "scanner frozen publication artifact":
+            injected = True
+            raise ScannerWorkflowError("synthetic frozen publication validation failure")
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        fail_frozen_validation,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="synthetic frozen publication validation failure",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert injected is True
+    assert not list(paths.exports.rglob("*.publication-preimage"))
+
+
+def test_finalize_cleans_publication_preimage_when_frozen_validation_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-preimage-interrupted"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-preimage-interrupted",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_snapshot = scanner_module._regular_file_snapshot
+    injected = False
+
+    def interrupt_frozen_validation(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal injected
+        if not injected and purpose == "scanner frozen publication artifact":
+            injected = True
+            raise KeyboardInterrupt
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        interrupt_frozen_validation,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert injected is True
+    assert not list(paths.exports.rglob("*.publication-preimage"))
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
+
+
 def test_finalize_freezes_export_directory_entries_through_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

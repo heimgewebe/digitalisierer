@@ -3440,6 +3440,7 @@ def _freeze_publication_artifact(
     )
     source_descriptor = -1
     snapshot_descriptor = -1
+    claimed: Path | None = None
     try:
         try:
             source_descriptor = os.open(
@@ -3545,6 +3546,7 @@ def _freeze_publication_artifact(
             raise ScannerWorkflowError(
                 f"scanner publication preimage cleanup failed: {path.name}"
             )
+        claimed = None
 
         descriptor = os.open(
             path,
@@ -3560,6 +3562,19 @@ def _freeze_publication_artifact(
                 f"scanner frozen publication artifact changed: {path.name}"
             )
         return descriptor, published_identity
+    except BaseException as exc:
+        if claimed is not None:
+            if not _remove_owned_claim(
+                claimed,
+                expected_sha256,
+                expected_identity,
+            ):
+                raise ScannerWorkflowError(
+                    f"scanner publication preimage cleanup failed after freeze error: "
+                    f"{path.name}"
+                ) from exc
+            claimed = None
+        raise
     finally:
         if snapshot_descriptor >= 0:
             os.close(snapshot_descriptor)
@@ -3956,13 +3971,11 @@ def finalize_scan_session(
                 "manifest.json": manifest_sha256,
             },
         )
-    except Exception:
+    finally:
         if staging != Path():
             _cleanup_scanner_export_staging(
                 staging,
                 staging_directory_fd,
                 staging_directory_identity,
             )
-        raise
-    finally:
         os.close(staging_directory_fd)
