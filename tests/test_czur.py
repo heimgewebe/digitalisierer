@@ -1619,7 +1619,14 @@ def test_backup_fsync_failure_removes_exact_new_backup(
             target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
         except OSError:
             target = None
-        if not failed and target == backup:
+        if (
+            not failed
+            and target is not None
+            and target.name == "backup"
+            and target.parent.name.startswith(
+                ".config.json.digitalisierer.backup-stage."
+            )
+        ):
             failed = True
             raise OSError("synthetic backup fsync failure")
         original_fsync(descriptor)
@@ -1631,3 +1638,151 @@ def test_backup_fsync_failure_removes_exact_new_backup(
 
     assert failed is True
     assert not os.path.lexists(backup)
+
+
+def test_backup_fsync_failure_needs_no_post_failure_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_fsync = os.fsync
+    original_mkdtemp = tempfile.mkdtemp
+    allocations = 0
+    fsync_failed = False
+
+    def allow_only_initial_stage_allocation(
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        nonlocal allocations
+        allocations += 1
+        if allocations > 1:
+            raise OSError(28, "No space left on device")
+        return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
+
+    def fail_staged_backup_fsync(descriptor: int) -> None:
+        nonlocal fsync_failed
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            target = None
+        if (
+            not fsync_failed
+            and target is not None
+            and target.name == "backup"
+            and target.parent.name.startswith(
+                ".config.json.digitalisierer.backup-stage."
+            )
+        ):
+            fsync_failed = True
+            raise OSError("synthetic backup fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "digitalisierer.czur.tempfile.mkdtemp",
+        allow_only_initial_stage_allocation,
+    )
+    monkeypatch.setattr("digitalisierer.czur.os.fsync", fail_staged_backup_fsync)
+
+    with pytest.raises(OSError, match="synthetic backup fsync failure"):
+        backend._create_backup_if_absent(backup, before)
+
+    assert allocations == 1
+    assert fsync_failed is True
+    assert not os.path.lexists(backup)
+    assert not list(
+        tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
+    )
+
+def test_backup_content_is_durable_before_canonical_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_fsync = os.fsync
+    canonical_visible_during_content_fsync: bool | None = None
+
+    def fail_content_fsync(descriptor: int) -> None:
+        nonlocal canonical_visible_during_content_fsync
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            target = None
+        if (
+            canonical_visible_during_content_fsync is None
+            and target is not None
+            and target.name == "backup"
+            and target.parent.name.startswith(
+                ".config.json.digitalisierer.backup-stage."
+            )
+        ):
+            canonical_visible_during_content_fsync = os.path.lexists(backup)
+            raise OSError("synthetic backup content fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr("digitalisierer.czur.os.fsync", fail_content_fsync)
+
+    with pytest.raises(OSError, match="synthetic backup content fsync failure"):
+        backend._create_backup_if_absent(backup, before)
+
+    assert canonical_visible_during_content_fsync is False
+    assert not os.path.lexists(backup)
+
+
+def test_backup_publication_enospc_leaves_no_canonical_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_link = os.link
+    publication_attempted = False
+
+    def fail_backup_publication(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal publication_attempted
+        if Path(dst) == backup:
+            publication_attempted = True
+            assert Path(src).parent.name.startswith(
+                ".config.json.digitalisierer.backup-stage."
+            )
+            raise OSError(28, "No space left on device")
+        original_link(src, dst, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("digitalisierer.czur.os.link", fail_backup_publication)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        backend._create_backup_if_absent(backup, before)
+
+    assert publication_attempted is True
+    assert not os.path.lexists(backup)
+    assert not list(
+        tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
+    )

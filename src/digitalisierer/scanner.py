@@ -2826,6 +2826,148 @@ def _rename_noreplace(source: Path, target: Path) -> None:
     raise OSError(error, os.strerror(error), target)
 
 
+
+def _freeze_publication_artifact(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int],
+) -> tuple[int, tuple[int, int, int, int]]:
+    snapshot = path.with_name(
+        f".{path.name}.{secrets.token_hex(8)}.publication-snapshot"
+    )
+    source_descriptor = -1
+    snapshot_descriptor = -1
+    try:
+        try:
+            source_descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scanner output changed during publication: {path.name}"
+            ) from exc
+        before = os.fstat(source_descriptor)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"scanner output changed during publication: {path.name}"
+            ) from exc
+        digest = _descriptor_sha256(source_descriptor)
+        after = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _stat_identity(before) != _stat_identity(after)
+            or _stat_identity(after) != expected_identity
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or _stat_identity(current) != _stat_identity(after)
+            or not secrets.compare_digest(digest, expected_sha256)
+        ):
+            raise ScannerWorkflowError(
+                f"scanner output changed during publication: {path.name}"
+            )
+
+        snapshot_descriptor = os.open(
+            snapshot,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o400,
+        )
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        with (
+            os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
+            os.fdopen(os.dup(snapshot_descriptor), "wb") as snapshot_handle,
+        ):
+            shutil.copyfileobj(source_handle, snapshot_handle, length=1024 * 1024)
+            snapshot_handle.flush()
+            os.fsync(snapshot_handle.fileno())
+        os.fchmod(snapshot_descriptor, 0o400)
+        os.fsync(snapshot_descriptor)
+        os.close(snapshot_descriptor)
+        snapshot_descriptor = -1
+
+        snapshot_sha256, snapshot_identity = _regular_file_snapshot(
+            snapshot,
+            purpose="scanner publication snapshot",
+        )
+        snapshot_stat = snapshot.lstat()
+        if (
+            not secrets.compare_digest(snapshot_sha256, expected_sha256)
+            or not stat.S_ISREG(snapshot_stat.st_mode)
+            or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
+            or _stat_identity(snapshot_stat) != snapshot_identity
+        ):
+            raise ScannerWorkflowError(
+                f"scanner publication snapshot is invalid: {path.name}"
+            )
+
+        claimed = _claim_owned_regular_file(
+            path,
+            expected_sha256,
+            expected_identity,
+            marker="publication-preimage",
+        )
+        if claimed is None:
+            raise ScannerWorkflowError(
+                f"scanner output changed before publication snapshot: {path.name}"
+            )
+        _rename_noreplace(snapshot, path)
+
+        published_sha256, published_identity = _regular_file_snapshot(
+            path,
+            purpose="scanner frozen publication artifact",
+        )
+        published_stat = path.lstat()
+        if (
+            published_identity != snapshot_identity
+            or not secrets.compare_digest(published_sha256, expected_sha256)
+            or not stat.S_ISREG(published_stat.st_mode)
+            or stat.S_IMODE(published_stat.st_mode) != 0o400
+            or _stat_identity(published_stat) != published_identity
+        ):
+            raise ScannerWorkflowError(
+                f"scanner frozen publication artifact is invalid: {path.name}"
+            )
+        if not _remove_owned_claim(
+            claimed,
+            expected_sha256,
+            expected_identity,
+        ):
+            raise ScannerWorkflowError(
+                f"scanner publication preimage cleanup failed: {path.name}"
+            )
+
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        descriptor_stat = os.fstat(descriptor)
+        if (
+            _stat_identity(descriptor_stat) != published_identity
+            or stat.S_IMODE(descriptor_stat.st_mode) != 0o400
+        ):
+            os.close(descriptor)
+            raise ScannerWorkflowError(
+                f"scanner frozen publication artifact changed: {path.name}"
+            )
+        return descriptor, published_identity
+    finally:
+        if snapshot_descriptor >= 0:
+            os.close(snapshot_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        try:
+            snapshot.unlink()
+        except FileNotFoundError:
+            pass
+
 def _publish_verified_staging(
     staging: Path,
     final_dir: Path,
@@ -2840,41 +2982,16 @@ def _publish_verified_staging(
         for name in sorted(expected):
             expected_sha256, expected_identity = expected[name]
             path = staging / name
-            try:
-                descriptor = os.open(
-                    path,
-                    os.O_RDONLY
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW
-                    | os.O_NONBLOCK,
-                )
-            except OSError as exc:
-                raise ScannerWorkflowError(
-                    f"scanner output changed during publication: {name}"
-                ) from exc
-            opened.append((name, descriptor, expected_sha256, expected_identity))
-            before = os.fstat(descriptor)
-            try:
-                current = path.lstat()
-            except OSError as exc:
-                raise ScannerWorkflowError(
-                    f"scanner output changed during publication: {name}"
-                ) from exc
-            digest = _descriptor_sha256(descriptor)
-            after = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or _stat_identity(before) != _stat_identity(after)
-                or _stat_identity(after) != expected_identity
-                or not stat.S_ISREG(current.st_mode)
-                or current.st_dev != after.st_dev
-                or current.st_ino != after.st_ino
-                or _stat_identity(current) != _stat_identity(after)
-                or not secrets.compare_digest(digest, expected_sha256)
-            ):
-                raise ScannerWorkflowError(
-                    f"scanner output changed during publication: {name}"
-                )
+            descriptor, frozen_identity = _freeze_publication_artifact(
+                path,
+                expected_sha256=expected_sha256,
+                expected_identity=expected_identity,
+            )
+            opened.append(
+                (name, descriptor, expected_sha256, frozen_identity)
+            )
+
+        _fsync_directory(staging)
 
         try:
             staging_stat = staging.lstat()
@@ -2919,7 +3036,9 @@ def _publish_verified_staging(
             if (
                 _stat_identity(after) != _stat_identity(final_stat)
                 or _stat_identity(final_stat) != expected_identity
+                or stat.S_IMODE(final_stat.st_mode) != 0o400
                 or not stat.S_ISREG(current.st_mode)
+                or stat.S_IMODE(current.st_mode) != 0o400
                 or current.st_dev != final_stat.st_dev
                 or current.st_ino != final_stat.st_ino
                 or _stat_identity(current) != _stat_identity(final_stat)

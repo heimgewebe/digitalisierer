@@ -3304,6 +3304,7 @@ def test_finalize_revalidates_staging_artifacts_at_publication_boundary(
     def mutate_then_rename(source: Path, target: Path) -> None:
         nonlocal injected
         if source.parent == paths.exports and ".staging-" in source.name:
+            os.chmod(source / "text.txt", 0o600)
             (source / "text.txt").write_text(
                 "tampered-at-publication-boundary",
                 encoding="utf-8",
@@ -3870,3 +3871,134 @@ def test_observe_resume_thumbnail_repair_uses_verified_preserved_snapshot(
     assert repaired["sha256"] == asset["sha256"]
     assert repaired["thumbnail_sha256"] == expected_thumbnail_sha
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == expected_thumbnail_sha
+
+
+def test_finalize_keeps_published_artifacts_read_only_through_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-read-only"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-read-only",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    published = False
+    post_publication_hashes = 0
+    rewrite_blocked = False
+    rewrite_succeeded = False
+
+    def track_publication(source: Path, target: Path) -> None:
+        nonlocal published
+        original_rename(source, target)
+        if source.parent == paths.exports and ".staging-" in source.name:
+            published = True
+
+    def attack_after_first_verified_artifact(descriptor: int) -> str:
+        nonlocal post_publication_hashes, rewrite_blocked, rewrite_succeeded
+        digest = original_descriptor_sha256(descriptor)
+        if published:
+            post_publication_hashes += 1
+            if post_publication_hashes == 2:
+                final_dirs = [path for path in paths.exports.iterdir() if path.is_dir()]
+                assert len(final_dirs) == 1
+                already_verified = final_dirs[0] / "manifest.json"
+                try:
+                    already_verified.write_bytes(b"tampered-after-verification")
+                except PermissionError:
+                    rewrite_blocked = True
+                else:
+                    rewrite_succeeded = True
+        return digest
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", track_publication)
+    monkeypatch.setattr(
+        scanner_module,
+        "_descriptor_sha256",
+        attack_after_first_verified_artifact,
+    )
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published is True
+    assert post_publication_hashes >= 2
+    assert rewrite_blocked is True
+    assert rewrite_succeeded is False
+    for artifact in exported.export_dir.iterdir():
+        if artifact.is_file():
+            assert artifact.stat().st_mode & 0o777 == 0o400
+
+
+def test_finalize_detaches_preopened_writer_from_published_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-preopened-writer"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-preopened-writer",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_publish = scanner_module._publish_verified_staging
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    preopened_fd = -1
+    final_path: Path | None = None
+    post_hashes = 0
+    tampered_old_inode = False
+
+    def publish_with_preopened_manifest(
+        staging: Path,
+        final_dir: Path,
+        expected: dict[str, tuple[str, tuple[int, int, int, int]]],
+    ) -> None:
+        nonlocal preopened_fd, final_path
+        descriptor = os.open(
+            staging / "manifest.json",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        preopened_fd = descriptor
+        final_path = final_dir
+        try:
+            original_publish(staging, final_dir, expected)
+        finally:
+            os.close(descriptor)
+            preopened_fd = -1
+
+    def write_through_preopened_fd_after_manifest_verification(descriptor: int) -> str:
+        nonlocal post_hashes, tampered_old_inode
+        digest = original_descriptor_sha256(descriptor)
+        if preopened_fd >= 0 and final_path is not None and final_path.exists():
+            post_hashes += 1
+            if post_hashes == 2:
+                os.lseek(preopened_fd, 0, os.SEEK_SET)
+                os.write(preopened_fd, b"PREOPEN-TAMPER")
+                os.fsync(preopened_fd)
+                tampered_old_inode = True
+        return digest
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_publish_verified_staging",
+        publish_with_preopened_manifest,
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "_descriptor_sha256",
+        write_through_preopened_fd_after_manifest_verification,
+    )
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert tampered_old_inode is True
+    manifest = exported.export_dir / "manifest.json"
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == exported.output_hashes[
+        "manifest.json"
+    ]

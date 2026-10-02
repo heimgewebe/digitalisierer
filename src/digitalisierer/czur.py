@@ -267,11 +267,18 @@ class CzurCaptureBackend:
     ) -> tuple[int, int, int, int, int, int] | None:
         if os.path.lexists(backup):
             return None
+
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=".config.json.digitalisierer.backup-stage.",
+                dir=str(backup.parent),
+            )
+        )
+        staged_backup = staging_dir / "backup"
         descriptor = -1
-        created_inode: tuple[int, int] | None = None
         try:
             descriptor = os.open(
-                backup,
+                staged_backup,
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
@@ -279,35 +286,63 @@ class CzurCaptureBackend:
                 | os.O_NOFOLLOW,
                 0o600,
             )
-        except FileExistsError:
-            return None
-        try:
-            created_stat = os.fstat(descriptor)
-            created_inode = (created_stat.st_dev, created_stat.st_ino)
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = -1
                 handle.write(config_before)
                 handle.flush()
                 os.fsync(handle.fileno())
+
+            staged_content, staged_identity = self._snapshot_regular_file(
+                staged_backup
+            )
+            if staged_content != config_before:
+                raise CzurAdapterError(
+                    "CZUR backup staging changed while Curved Books preset was being prepared"
+                )
+
+            try:
+                os.link(
+                    staged_backup,
+                    backup,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                return None
+
             backup_content, backup_identity = self._snapshot_regular_file(backup)
-            if backup_content != config_before:
+            staged_after_content, staged_after_identity = self._snapshot_regular_file(
+                staged_backup
+            )
+            if (
+                backup_content != config_before
+                or staged_after_content != config_before
+                or backup_identity[0] != staged_after_identity[0]
+                or backup_identity[1] != staged_after_identity[1]
+                or staged_after_identity[0] != staged_identity[0]
+                or staged_after_identity[1] != staged_identity[1]
+            ):
                 raise CzurAdapterError(
                     "CZUR backup changed while Curved Books preset was being prepared"
                 )
+
+            staged_backup.unlink()
+            try:
+                staging_dir.rmdir()
+            except OSError:
+                pass
             self._fsync_directory(backup.parent)
             return backup_identity
-        except Exception as exc:
-            if (
-                created_inode is None
-                or not self._remove_created_backup_inode(backup, created_inode)
-            ):
-                raise CzurAdapterError(
-                    "CZUR incomplete backup cleanup refused"
-                ) from exc
-            raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+            try:
+                staged_backup.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                staging_dir.rmdir()
+            except OSError:
+                pass
 
     def _restore_claimed_path(self, claimed: Path, destination: Path) -> bool:
         try:
@@ -332,43 +367,6 @@ class CzurCaptureBackend:
             return True
         except (FileExistsError, FileNotFoundError, OSError):
             return False
-
-    def _remove_created_backup_inode(
-        self,
-        backup: Path,
-        expected_inode: tuple[int, int],
-    ) -> bool:
-        cleanup_dir = Path(
-            tempfile.mkdtemp(
-                prefix=".config.json.digitalisierer.incomplete-backup-claim.",
-                dir=str(backup.parent),
-            )
-        )
-        claimed_backup = cleanup_dir / "backup"
-        try:
-            try:
-                os.rename(backup, claimed_backup)
-            except (FileNotFoundError, OSError):
-                return False
-            try:
-                current = claimed_backup.lstat()
-            except OSError:
-                self._restore_claimed_path(claimed_backup, backup)
-                return False
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or (current.st_dev, current.st_ino) != expected_inode
-            ):
-                self._restore_claimed_path(claimed_backup, backup)
-                return False
-            claimed_backup.unlink()
-            self._fsync_directory(backup.parent)
-            return True
-        finally:
-            try:
-                cleanup_dir.rmdir()
-            except OSError:
-                pass
 
     def _remove_owned_backup(
         self,
