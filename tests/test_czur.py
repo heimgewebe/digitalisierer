@@ -1596,3 +1596,38 @@ def test_status_rejects_non_executable_xdotool_path(tmp_path: Path) -> None:
 
     assert status.ready is False
     assert status.connected is False
+
+
+def test_backup_fsync_failure_removes_exact_new_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_new_backup_fsync(descriptor: int) -> None:
+        nonlocal failed
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            target = None
+        if not failed and target == backup:
+            failed = True
+            raise OSError("synthetic backup fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr("digitalisierer.czur.os.fsync", fail_new_backup_fsync)
+
+    with pytest.raises(OSError, match="synthetic backup fsync failure"):
+        backend._create_backup_if_absent(backup, before)
+
+    assert failed is True
+    assert not os.path.lexists(backup)

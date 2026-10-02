@@ -3474,3 +3474,167 @@ def test_review_update_validates_before_publishing_invalid_state(
 
     assert wrote_invalid_review is False
     assert paths.review_file.read_bytes() == review_before
+
+
+def test_observe_preview_derivation_remains_bound_after_snapshot_path_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "preview-snapshot-rebind"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    replacement = tmp_path / "replacement-preview-snapshot.jpg"
+    _image(source, 80)
+    _image(replacement, 220)
+    expected_image = scanner_module._inspect_image(source)
+    expected_thumbnail = tmp_path / "expected-thumbnail.jpg"
+    scanner_module._write_thumbnail(source, expected_thumbnail)
+    expected_thumbnail_sha, _ = scanner_module._regular_file_snapshot(
+        expected_thumbnail,
+        purpose="expected thumbnail",
+    )
+    replacement_bytes = replacement.read_bytes()
+    paths = create_or_resume_scan_session(
+        "book",
+        "preview-snapshot-rebind",
+        tmp_path / "library",
+    )
+    original_inspect = scanner_module._inspect_image
+    attacked = False
+
+    def inspect_after_snapshot_rebind(path: Path | int) -> dict[str, object]:
+        nonlocal attacked
+        if not attacked:
+            if isinstance(path, int):
+                backing = Path(os.readlink(f"/proc/self/fd/{path}"))
+            else:
+                backing = path
+            if backing.parent.name.startswith(".digitalisierer-preview-source."):
+                injected = backing.with_name("replacement-injected.jpg")
+                injected.write_bytes(replacement_bytes)
+                os.replace(injected, backing)
+                attacked = True
+        return original_inspect(path)
+
+    monkeypatch.setattr(scanner_module, "_inspect_image", inspect_after_snapshot_rebind)
+
+    observed = observe_scan_folder(paths, capture)
+
+    assert attacked is True
+    assert len(observed.imported_asset_ids) == 1
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    assert asset["image"] == expected_image
+    assert asset["thumbnail_sha256"] == expected_thumbnail_sha
+
+
+def test_finalize_rollback_preserves_foreign_replacement_of_published_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-directory-rebind"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-directory-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_rename = scanner_module._rename_noreplace
+    displaced = tmp_path / "displaced-published-export"
+    foreign = b"foreign-export-directory\n"
+    published_path: Path | None = None
+    injected = False
+
+    def rebind_after_publication(source: Path, target: Path) -> None:
+        nonlocal injected, published_path
+        if (
+            not injected
+            and source.parent == paths.exports
+            and ".staging-" in source.name
+        ):
+            original_rename(source, target)
+            os.rename(target, displaced)
+            target.mkdir()
+            (target / "foreign.txt").write_bytes(foreign)
+            published_path = target
+            injected = True
+            return
+        original_rename(source, target)
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", rebind_after_publication)
+
+    with pytest.raises(ScannerWorkflowError):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert injected is True
+    assert published_path is not None
+    assert (published_path / "foreign.txt").read_bytes() == foreign
+    assert displaced.is_dir()
+
+
+def test_finalize_rollback_preserves_replacement_raced_after_identity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-rollback-rebind"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-rollback-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_publish_rename = scanner_module._rename_noreplace
+    original_os_rename = os.rename
+    original_descriptor_sha256 = scanner_module._descriptor_sha256
+    displaced = tmp_path / "displaced-during-rollback"
+    foreign = b"foreign-during-rollback\n"
+    final_path: Path | None = None
+    published = False
+    failed_postcheck = False
+    raced = False
+
+    def track_publication(source: Path, target: Path) -> None:
+        nonlocal published, final_path
+        original_publish_rename(source, target)
+        if source.parent == paths.exports and ".staging-" in source.name:
+            published = True
+            final_path = target
+
+    def fail_first_postpublication_hash(descriptor: int) -> str:
+        nonlocal failed_postcheck
+        if published and not failed_postcheck:
+            failed_postcheck = True
+            raise ScannerWorkflowError("synthetic post-publication verification failure")
+        return original_descriptor_sha256(descriptor)
+
+    def rebind_at_rollback(source: Path, target: Path) -> None:
+        nonlocal raced
+        if (
+            not raced
+            and final_path is not None
+            and source == final_path
+            and ".staging-" in target.name
+        ):
+            original_os_rename(source, displaced)
+            source.mkdir()
+            (source / "foreign.txt").write_bytes(foreign)
+            raced = True
+        original_os_rename(source, target)
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", track_publication)
+    monkeypatch.setattr(scanner_module, "_descriptor_sha256", fail_first_postpublication_hash)
+    monkeypatch.setattr("digitalisierer.scanner.os.rename", rebind_at_rollback)
+
+    with pytest.raises(ScannerWorkflowError):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published is True
+    assert failed_postcheck is True
+    assert raced is True
+    assert final_path is not None
+    assert (final_path / "foreign.txt").read_bytes() == foreign
+    assert displaced.is_dir()

@@ -701,18 +701,29 @@ def _average_hash(image: Any) -> str:
     return f"{int(bits, 2):0256x}"
 
 
-def _inspect_image(path: Path) -> dict[str, object]:
+@contextmanager
+def _pillow_image_source(source: Path | int) -> Iterator[Any]:
+    if isinstance(source, int):
+        os.lseek(source, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(source), "rb") as handle:
+            yield handle
+        return
+    yield source
+
+
+def _inspect_image(path: Path | int) -> dict[str, object]:
     Image, ImageStat = _pillow_modules()
-    with Image.open(path) as image:
-        image.load()
-        width, height = image.size
-        dpi_raw = image.info.get("dpi") or (0.0, 0.0)
-        work = image.convert("L")
-        work.thumbnail((256, 256))
-        stat = ImageStat.Stat(work)
-        values = _pixel_values(work)
-        dark_ratio = sum(value < 210 for value in values) / max(1, len(values))
-        average_hash = _average_hash(image)
+    with _pillow_image_source(path) as image_source:
+        with Image.open(image_source) as image:
+            image.load()
+            width, height = image.size
+            dpi_raw = image.info.get("dpi") or (0.0, 0.0)
+            work = image.convert("L")
+            work.thumbnail((256, 256))
+            stat = ImageStat.Stat(work)
+            values = _pixel_values(work)
+            dark_ratio = sum(value < 210 for value in values) / max(1, len(values))
+            average_hash = _average_hash(image)
     dpi_x = float(dpi_raw[0]) if len(dpi_raw) >= 1 else 0.0
     dpi_y = float(dpi_raw[1]) if len(dpi_raw) >= 2 else 0.0
     return {
@@ -727,21 +738,22 @@ def _inspect_image(path: Path) -> dict[str, object]:
 
 
 def _write_thumbnail(
-    source: Path,
+    source: Path | int,
     target: Path,
 ) -> _CreatedArtifactState | None:
     Image, _ = _pillow_modules()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     try:
-        with Image.open(source) as image:
-            image.load()
-            thumbnail = image.convert("RGB")
-            thumbnail.thumbnail((720, 960))
-            with temporary.open("xb") as handle:
-                thumbnail.save(handle, format="JPEG", quality=82, optimize=True)
-                handle.flush()
-                os.fsync(handle.fileno())
+        with _pillow_image_source(source) as image_source:
+            with Image.open(image_source) as image:
+                image.load()
+                thumbnail = image.convert("RGB")
+                thumbnail.thumbnail((720, 960))
+                with temporary.open("xb") as handle:
+                    thumbnail.save(handle, format="JPEG", quality=82, optimize=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         expected_sha256 = _sha256_file(temporary)
         expected_identity = _stat_identity(
@@ -909,7 +921,7 @@ def _verified_preview_source_snapshot(
     source: Path,
     *,
     expected_sha256: str,
-) -> Iterator[Path]:
+) -> Iterator[int]:
     with tempfile.TemporaryDirectory(
         prefix=".digitalisierer-preview-source.",
     ) as directory_name:
@@ -924,65 +936,88 @@ def _verified_preview_source_snapshot(
                 f"preserved scanner source cannot be snapshotted: {source.name}"
             ) from exc
         snapshot_fd = -1
+        snapshot_read_fd = -1
         try:
-            snapshot_fd = os.open(
-                snapshot,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_CLOEXEC
-                | os.O_NOFOLLOW,
-                0o400,
-            )
-            os.fchmod(snapshot_fd, 0o400)
-            before = os.fstat(source_fd)
-            if not stat.S_ISREG(before.st_mode):
-                raise ScannerWorkflowError(
-                    f"preserved scanner source is not regular: {source.name}"
-                )
-
-            digest = hashlib.sha256()
-            with (
-                os.fdopen(os.dup(source_fd), "rb") as source_handle,
-                os.fdopen(os.dup(snapshot_fd), "wb") as snapshot_handle,
-            ):
-                for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    snapshot_handle.write(chunk)
-                snapshot_handle.flush()
-                os.fsync(snapshot_handle.fileno())
-
-            after = os.fstat(source_fd)
             try:
-                current = source.lstat()
-                snapshot_current = snapshot.lstat()
-            except OSError as exc:
-                raise ScannerWorkflowError(
-                    f"preserved scanner source changed while snapshotting: {source.name}"
-                ) from exc
-            snapshot_stat = os.fstat(snapshot_fd)
-            if (
-                _stat_identity(before) != _stat_identity(after)
-                or not stat.S_ISREG(current.st_mode)
-                or current.st_dev != after.st_dev
-                or current.st_ino != after.st_ino
-                or _stat_identity(current) != _stat_identity(after)
-                or not stat.S_ISREG(snapshot_current.st_mode)
-                or snapshot_current.st_dev != snapshot_stat.st_dev
-                or snapshot_current.st_ino != snapshot_stat.st_ino
-                or snapshot_stat.st_size != after.st_size
-                or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
-                or not secrets.compare_digest(digest.hexdigest(), expected_sha256)
-            ):
-                raise ScannerWorkflowError(
-                    f"preserved scanner source changed while snapshotting: {source.name}"
+                snapshot_fd = os.open(
+                    snapshot,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o400,
                 )
-        finally:
-            if snapshot_fd >= 0:
-                os.close(snapshot_fd)
-            os.close(source_fd)
+                os.fchmod(snapshot_fd, 0o400)
+                before = os.fstat(source_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source is not regular: {source.name}"
+                    )
 
-        yield snapshot
+                digest = hashlib.sha256()
+                with (
+                    os.fdopen(os.dup(source_fd), "rb") as source_handle,
+                    os.fdopen(os.dup(snapshot_fd), "wb") as snapshot_handle,
+                ):
+                    for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        snapshot_handle.write(chunk)
+                    snapshot_handle.flush()
+                    os.fsync(snapshot_handle.fileno())
+
+                after = os.fstat(source_fd)
+                try:
+                    current = source.lstat()
+                    snapshot_current = snapshot.lstat()
+                except OSError as exc:
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {source.name}"
+                    ) from exc
+                snapshot_stat = os.fstat(snapshot_fd)
+                if (
+                    _stat_identity(before) != _stat_identity(after)
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_dev != after.st_dev
+                    or current.st_ino != after.st_ino
+                    or _stat_identity(current) != _stat_identity(after)
+                    or not stat.S_ISREG(snapshot_current.st_mode)
+                    or snapshot_current.st_dev != snapshot_stat.st_dev
+                    or snapshot_current.st_ino != snapshot_stat.st_ino
+                    or snapshot_stat.st_size != after.st_size
+                    or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
+                    or not secrets.compare_digest(digest.hexdigest(), expected_sha256)
+                ):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {source.name}"
+                    )
+
+                snapshot_read_fd = os.open(
+                    snapshot,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                )
+                snapshot_read_stat = os.fstat(snapshot_read_fd)
+                snapshot_read_current = snapshot.lstat()
+                if (
+                    not stat.S_ISREG(snapshot_read_stat.st_mode)
+                    or snapshot_read_current.st_dev != snapshot_read_stat.st_dev
+                    or snapshot_read_current.st_ino != snapshot_read_stat.st_ino
+                    or _stat_identity(snapshot_read_current)
+                    != _stat_identity(snapshot_read_stat)
+                    or _stat_identity(snapshot_read_stat) != _stat_identity(snapshot_stat)
+                ):
+                    raise ScannerWorkflowError(
+                        f"preview snapshot changed before derivation: {source.name}"
+                    )
+            finally:
+                if snapshot_fd >= 0:
+                    os.close(snapshot_fd)
+                os.close(source_fd)
+
+            yield snapshot_read_fd
+        finally:
+            if snapshot_read_fd >= 0:
+                os.close(snapshot_read_fd)
 
 
 def _descriptor_sha256(descriptor: int) -> str:
@@ -2779,6 +2814,7 @@ def _publish_verified_staging(
         tuple[str, int, str, tuple[int, int, int, int]]
     ] = []
     published = False
+    published_directory_identity: tuple[int, int] | None = None
     try:
         for name in sorted(expected):
             expected_sha256, expected_identity = expected[name]
@@ -2819,8 +2855,34 @@ def _publish_verified_staging(
                     f"scanner output changed during publication: {name}"
                 )
 
+        try:
+            staging_stat = staging.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                "scanner export staging directory changed before publication"
+            ) from exc
+        if not stat.S_ISDIR(staging_stat.st_mode):
+            raise ScannerWorkflowError(
+                "scanner export staging directory changed before publication"
+            )
+        published_directory_identity = (staging_stat.st_dev, staging_stat.st_ino)
+
         _rename_noreplace(staging, final_dir)
         published = True
+        try:
+            published_stat = final_dir.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                "published scanner export directory changed during publication"
+            ) from exc
+        if (
+            not stat.S_ISDIR(published_stat.st_mode)
+            or (published_stat.st_dev, published_stat.st_ino)
+            != published_directory_identity
+        ):
+            raise ScannerWorkflowError(
+                "published scanner export directory changed during publication"
+            )
 
         for name, descriptor, expected_sha256, expected_identity in opened:
             final_path = final_dir / name
@@ -2848,11 +2910,34 @@ def _publish_verified_staging(
     except Exception as exc:
         if published:
             try:
-                if staging.exists() or not final_dir.is_dir():
+                if staging.exists() or published_directory_identity is None:
                     raise ScannerWorkflowError(
                         "published scanner export cannot be rolled back safely"
                     )
+                current_final = final_dir.lstat()
+                if (
+                    not stat.S_ISDIR(current_final.st_mode)
+                    or (current_final.st_dev, current_final.st_ino)
+                    != published_directory_identity
+                ):
+                    raise ScannerWorkflowError(
+                        "published scanner export directory changed before rollback"
+                    )
                 os.rename(final_dir, staging)
+                rolled_back = staging.lstat()
+                if (
+                    not stat.S_ISDIR(rolled_back.st_mode)
+                    or (rolled_back.st_dev, rolled_back.st_ino)
+                    != published_directory_identity
+                ):
+                    try:
+                        _rename_noreplace(staging, final_dir)
+                        _fsync_directory(staging.parent)
+                    except Exception:
+                        pass
+                    raise ScannerWorkflowError(
+                        "published scanner export directory changed during rollback"
+                    )
                 _fsync_directory(staging.parent)
             except Exception as rollback_exc:
                 raise ScannerWorkflowError(
@@ -2912,6 +2997,8 @@ def finalize_scan_session(
         raise ScannerWorkflowError(f"scan export already exists: {final_dir}")
     staging = paths.exports / f".{export_id}.staging-{secrets.token_hex(8)}"
     staging.mkdir(mode=0o700)
+    staging_stat = staging.lstat()
+    staging_directory_identity = (staging_stat.st_dev, staging_stat.st_ino)
     try:
         master = staging / "master.pdf"
         searchable = staging / "searchable.pdf"
@@ -3069,6 +3156,16 @@ def finalize_scan_session(
             },
         )
     except Exception:
-        if staging != Path() and staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        if staging != Path() and os.path.lexists(staging):
+            try:
+                current_staging = staging.lstat()
+            except OSError:
+                pass
+            else:
+                if (
+                    stat.S_ISDIR(current_staging.st_mode)
+                    and (current_staging.st_dev, current_staging.st_ino)
+                    == staging_directory_identity
+                ):
+                    shutil.rmtree(staging, ignore_errors=True)
         raise
