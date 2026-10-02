@@ -1210,14 +1210,35 @@ def _prepare_thumbnail_repair(
             "identity": list(preimage_identity),
         }
 
+    intent_text = _json_text(intent_payload)
+    expected_intent_sha256 = hashlib.sha256(intent_text.encode("utf-8")).hexdigest()
     try:
-        _atomic_write_text(intent_path, _json_text(intent_payload))
+        _atomic_write_text(intent_path, intent_text)
         intent_sha256, intent_identity = _regular_file_snapshot(
             intent_path,
             purpose="thumbnail repair intent",
         )
     except Exception:
-        _remove_created_artifact(replacement)
+        # _atomic_write_text() may have replaced the intent successfully and
+        # only then failed while syncing its parent directory. Preserve the
+        # exact staged replacement only when the visible intent is our exact
+        # payload (or cannot be safely classified because it is racing).
+        preserve_replacement = False
+        if os.path.lexists(intent_path):
+            try:
+                current_intent_sha256, _ = _regular_file_snapshot(
+                    intent_path,
+                    purpose="thumbnail repair intent",
+                )
+            except ScannerWorkflowError:
+                preserve_replacement = True
+            else:
+                preserve_replacement = secrets.compare_digest(
+                    current_intent_sha256,
+                    expected_intent_sha256,
+                )
+        if not preserve_replacement:
+            _remove_created_artifact(replacement)
         raise
 
     preimage_claim: Path | None = None

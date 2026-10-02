@@ -3019,6 +3019,135 @@ def test_thumbnail_repair_crash_recovers_before_review_load(
     assert not list(paths.thumbnails.glob(".*.rollback-preimage"))
 
 
+
+def test_thumbnail_repair_intent_publish_failure_preserves_replacement_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-repair-intent-publish-failure"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-repair-intent-publish-failure",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    record_before = next(
+        item for item in session_before["assets"] if item["asset_id"] == asset_id
+    )
+    recorded_thumbnail_sha = record_before["thumbnail_sha256"]
+    thumbnail = paths.root / record_before["thumbnail_path"]
+    thumbnail.write_bytes(b"force-repair-before-intent-publication-failure")
+
+    original_atomic_write = scanner_module._atomic_write_text
+    injected = False
+
+    def fail_after_intent_publication(path: Path, content: str) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and path.parent == paths.thumbnails
+            and path.name.endswith(".repair-intent.json")
+        ):
+            original_atomic_write(path, content)
+            injected = True
+            raise OSError(
+                "synthetic thumbnail repair intent fsync failure after publication"
+            )
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        fail_after_intent_publication,
+    )
+
+    with pytest.raises(
+        OSError,
+        match="synthetic thumbnail repair intent fsync failure after publication",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert injected is True
+    intents = list(paths.thumbnails.glob(".*.repair-intent.json"))
+    assert len(intents) == 1
+    intent = json.loads(intents[0].read_text(encoding="utf-8"))
+    replacement = paths.thumbnails / intent["replacement"]["path_name"]
+    assert replacement.is_file()
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        original_atomic_write,
+    )
+    session, _review, _findings, _processing = scanner_module.load_review_state(paths)
+    repaired = next(item for item in session["assets"] if item["asset_id"] == asset_id)
+    current_thumbnail_sha = hashlib.sha256(thumbnail.read_bytes()).hexdigest()
+    assert repaired["thumbnail_sha256"] == current_thumbnail_sha
+    assert current_thumbnail_sha == recorded_thumbnail_sha
+    assert not list(paths.thumbnails.glob(".*.repair-intent.json"))
+    assert not list(paths.thumbnails.glob(".*.repair-replacement"))
+    assert not list(paths.thumbnails.glob(".*.rollback-preimage"))
+
+
+
+def test_thumbnail_repair_intent_failure_does_not_trust_foreign_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-repair-foreign-intent"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-repair-foreign-intent",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    thumbnail = paths.root / session_before["assets"][0]["thumbnail_path"]
+    thumbnail.write_bytes(b"force-repair-before-foreign-intent")
+
+    original_atomic_write = scanner_module._atomic_write_text
+    foreign = b'{"foreign":true}\n'
+    injected = False
+
+    def fail_with_foreign_intent(path: Path, content: str) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and path.parent == paths.thumbnails
+            and path.name.endswith(".repair-intent.json")
+        ):
+            path.write_bytes(foreign)
+            injected = True
+            raise OSError("synthetic foreign thumbnail repair intent")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_atomic_write_text",
+        fail_with_foreign_intent,
+    )
+
+    with pytest.raises(
+        OSError,
+        match="synthetic foreign thumbnail repair intent",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert injected is True
+    intents = list(paths.thumbnails.glob(".*.repair-intent.json"))
+    assert len(intents) == 1
+    assert intents[0].read_bytes() == foreign
+    assert not list(paths.thumbnails.glob(".*.repair-replacement"))
+
+
 def test_thumbnail_rollback_refuses_replaced_preimage_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
