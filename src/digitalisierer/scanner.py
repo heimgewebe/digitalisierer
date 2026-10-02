@@ -2111,24 +2111,11 @@ def _observe_scan_folder_unlocked(
         _atomic_write_text(paths.session_file, next_session_text)
     except Exception:
         rollback_error: Exception | None = None
-        for rollback_state in reversed(thumbnail_rollbacks):
-            try:
-                if not _rollback_thumbnail_repair(rollback_state):
-                    raise ScannerWorkflowError(
-                        "scan thumbnail changed while rolling back repair"
-                    )
-            except Exception as exc:
-                if rollback_error is None:
-                    rollback_error = exc
-        for created_state in reversed(created_artifacts):
-            try:
-                if not _remove_created_artifact(created_state):
-                    raise ScannerWorkflowError(
-                        "new scanner artifact changed before rollback"
-                    )
-            except Exception as exc:
-                if rollback_error is None:
-                    rollback_error = exc
+
+        # Keep every artifact compatible with the forward recovery marker until
+        # metadata has converged back to the verified preimage and that marker
+        # is durably gone. A crash after artifact rollback begins can therefore
+        # never select the forward metadata state on resume.
         if metadata_mutated:
             for metadata_path, previous_text in (
                 (paths.session_file, previous_session_text),
@@ -2148,6 +2135,27 @@ def _observe_scan_folder_unlocked(
                 )
             except Exception as exc:
                 rollback_error = exc
+
+        if rollback_error is None:
+            for rollback_state in reversed(thumbnail_rollbacks):
+                try:
+                    if not _rollback_thumbnail_repair(rollback_state):
+                        raise ScannerWorkflowError(
+                            "scan thumbnail changed while rolling back repair"
+                        )
+                except Exception as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+            for created_state in reversed(created_artifacts):
+                try:
+                    if not _remove_created_artifact(created_state):
+                        raise ScannerWorkflowError(
+                            "new scanner artifact changed before rollback"
+                        )
+                except Exception as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+
         if rollback_error is not None:
             raise ScannerWorkflowError(
                 "failed to restore scanner observation after failure"
@@ -2907,6 +2915,10 @@ def _publish_verified_staging(
                 raise ScannerWorkflowError(
                     f"scanner output changed during publication: {name}"
                 )
+
+        # The directory-entry publication is not durable until its parent has
+        # been synced. Keep that durability step inside this rollback boundary.
+        _fsync_directory(final_dir.parent)
     except Exception as exc:
         if published:
             try:
@@ -3145,7 +3157,6 @@ def finalize_scan_session(
                 final_dir,
                 artifact_states,
             )
-            _fsync_directory(paths.exports)
         staging = Path()
         return ScanExport(
             session_root=paths.root,

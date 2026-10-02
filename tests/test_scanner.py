@@ -3638,3 +3638,107 @@ def test_finalize_rollback_preserves_replacement_raced_after_identity_check(
     assert final_path is not None
     assert (final_path / "foreign.txt").read_bytes() == foreign
     assert displaced.is_dir()
+
+
+def test_observe_rollback_crash_cannot_recover_forward_after_source_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "rollback-crash-source"
+    capture.mkdir()
+    _image(capture / "page.jpg", 120)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "rollback-crash-source",
+        library,
+    )
+    original_write = scanner_module._atomic_write_text
+    original_remove = scanner_module._remove_created_artifact
+    commit_failed = False
+    source_removed = False
+
+    def fail_after_session_write(path: Path, text: str) -> None:
+        nonlocal commit_failed
+        original_write(path, text)
+        if path == paths.session_file and not commit_failed:
+            commit_failed = True
+            raise OSError("synthetic observation commit failure")
+
+    def crash_after_source_remove(
+        state: scanner_module._CreatedArtifactState,
+    ) -> bool:
+        nonlocal source_removed
+        removed = original_remove(state)
+        if state.path.parent == paths.sources and not source_removed:
+            source_removed = True
+            assert removed is True
+            raise SystemExit("synthetic crash during observation rollback")
+        return removed
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_after_session_write)
+    monkeypatch.setattr(scanner_module, "_remove_created_artifact", crash_after_source_remove)
+
+    with pytest.raises(SystemExit, match="synthetic crash during observation rollback"):
+        observe_scan_folder(paths, capture)
+
+    assert commit_failed is True
+    assert source_removed is True
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    monkeypatch.setattr(scanner_module, "_remove_created_artifact", original_remove)
+
+    resumed = create_or_resume_scan_session(
+        "book",
+        "rollback-crash-source",
+        library,
+    )
+    session, review, findings, processing = scanner_module.load_review_state(resumed)
+    assert session["assets"] == []
+    assert review["items"] == {}
+    assert findings["findings"] == []
+    assert processing.items == []
+
+    retried = observe_scan_folder(resumed, capture)
+    assert len(retried.imported_asset_ids) == 1
+    assert retried.skipped_asset_ids == ()
+
+
+def test_finalize_rolls_back_publication_when_exports_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-parent-fsync"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-parent-fsync",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_fsync_directory = scanner_module._fsync_directory
+    failed = False
+
+    def fail_first_exports_fsync(path: Path) -> None:
+        nonlocal failed
+        if path == paths.exports and not failed:
+            failed = True
+            raise OSError("synthetic exports directory fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_fsync_directory",
+        fail_first_exports_fsync,
+    )
+
+    with pytest.raises(OSError, match="synthetic exports directory fsync failure"):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert failed is True
+    assert list(paths.exports.iterdir()) == []
+
+    monkeypatch.setattr(scanner_module, "_fsync_directory", original_fsync_directory)
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+    assert exported.export_dir.is_dir()
