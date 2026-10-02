@@ -309,20 +309,16 @@ class CzurCaptureBackend:
             except FileExistsError:
                 return None
 
-            backup_content, backup_identity = self._snapshot_regular_file(backup)
-            staged_after_content, staged_after_identity = self._snapshot_regular_file(
+            staged_after_content, backup_identity = self._snapshot_regular_file(
                 staged_backup
             )
             if (
-                backup_content != config_before
-                or staged_after_content != config_before
-                or backup_identity[0] != staged_after_identity[0]
-                or backup_identity[1] != staged_after_identity[1]
-                or staged_after_identity[0] != staged_identity[0]
-                or staged_after_identity[1] != staged_identity[1]
+                staged_after_content != config_before
+                or backup_identity[0] != staged_identity[0]
+                or backup_identity[1] != staged_identity[1]
             ):
                 raise CzurAdapterError(
-                    "CZUR backup changed while Curved Books preset was being prepared"
+                    "CZUR backup staging changed during publication"
                 )
 
             staged_backup.unlink()
@@ -330,7 +326,6 @@ class CzurCaptureBackend:
                 staging_dir.rmdir()
             except OSError:
                 pass
-            self._fsync_directory(backup.parent)
             return backup_identity
         finally:
             if descriptor >= 0:
@@ -373,14 +368,20 @@ class CzurCaptureBackend:
         backup: Path,
         config_before: bytes,
         backup_identity: tuple[int, int, int, int, int, int],
+        *,
+        cleanup_dir: Path | None = None,
     ) -> bool:
-        cleanup_dir = Path(
-            tempfile.mkdtemp(
-                prefix=".config.json.digitalisierer.backup-claim.",
-                dir=str(backup.parent),
+        owns_cleanup_dir = cleanup_dir is None
+        if cleanup_dir is None:
+            cleanup_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=".config.json.digitalisierer.backup-claim.",
+                    dir=str(backup.parent),
+                )
             )
-        )
         claimed_backup = cleanup_dir / "backup"
+        if os.path.lexists(claimed_backup):
+            return False
         try:
             try:
                 os.rename(backup, claimed_backup)
@@ -405,10 +406,11 @@ class CzurCaptureBackend:
             self._fsync_directory(backup.parent)
             return True
         finally:
-            try:
-                cleanup_dir.rmdir()
-            except OSError:
-                pass
+            if owns_cleanup_dir:
+                try:
+                    cleanup_dir.rmdir()
+                except OSError:
+                    pass
 
     def _restore_claimed_config(self, claimed: Path) -> bool:
         return self._restore_claimed_path(claimed, self.config_path)
@@ -569,6 +571,20 @@ class CzurCaptureBackend:
                 backup,
                 config_before,
             )
+            if backup_identity is not None:
+                backup_content, current_backup_identity = (
+                    self._snapshot_regular_file(backup)
+                )
+                if not self._same_claimed_preimage(
+                    config_before,
+                    backup_identity,
+                    backup_content,
+                    current_backup_identity,
+                ):
+                    raise CzurAdapterError(
+                        "CZUR backup changed while Curved Books preset was being prepared"
+                    )
+                self._fsync_directory(backup.parent)
 
             try:
                 os.link(
@@ -654,6 +670,7 @@ class CzurCaptureBackend:
                     backup,
                     config_before,
                     backup_identity,
+                    cleanup_dir=guard_dir,
                 )
             if backup_cleanup_failed:
                 raise CzurAdapterError(

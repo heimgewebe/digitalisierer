@@ -1204,9 +1204,6 @@ def test_failed_preset_cleanup_preserves_foreign_backup_replacement(
             not cleanup_raced
             and source == backup
             and destination.name == "backup"
-            and destination.parent.name.startswith(
-                ".config.json.digitalisierer.backup-claim."
-            )
         ):
             cleanup_raced = True
             replacement = tmp_path / "foreign-backup"
@@ -1782,6 +1779,88 @@ def test_backup_publication_enospc_leaves_no_canonical_backup(
         backend._create_backup_if_absent(backup, before)
 
     assert publication_attempted is True
+    assert not os.path.lexists(backup)
+    assert not list(
+        tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
+    )
+
+
+@pytest.mark.parametrize("failure_point", ["snapshot", "directory-fsync"])
+def test_backup_post_publication_failure_rolls_back_without_new_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    import tempfile
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_snapshot = backend._snapshot_regular_file
+    original_fsync_directory = backend._fsync_directory
+    original_mkdtemp = tempfile.mkdtemp
+    failed = False
+
+    def forbid_allocation_after_backup_publication(
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        if os.path.lexists(backup):
+            raise OSError(28, "No space left on device")
+        return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
+
+    def fail_post_publication_snapshot(
+        path: Path,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal failed
+        if (
+            failure_point == "snapshot"
+            and not failed
+            and path == backup
+            and os.path.lexists(backup)
+        ):
+            failed = True
+            raise OSError("synthetic post-publication backup snapshot failure")
+        return original_snapshot(path)
+
+    def fail_post_publication_directory_fsync(directory: Path) -> None:
+        nonlocal failed
+        if (
+            failure_point == "directory-fsync"
+            and not failed
+            and directory == backup.parent
+            and os.path.lexists(backup)
+        ):
+            failed = True
+            raise OSError("synthetic post-publication backup directory fsync failure")
+        original_fsync_directory(directory)
+
+    monkeypatch.setattr(
+        "digitalisierer.czur.tempfile.mkdtemp",
+        forbid_allocation_after_backup_publication,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_snapshot_regular_file",
+        fail_post_publication_snapshot,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_fsync_directory",
+        fail_post_publication_directory_fsync,
+    )
+
+    with pytest.raises(OSError, match="synthetic post-publication backup"):
+        backend.apply_curved_books_preset()
+
+    assert failed is True
+    assert config.read_bytes() == before
     assert not os.path.lexists(backup)
     assert not list(
         tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
