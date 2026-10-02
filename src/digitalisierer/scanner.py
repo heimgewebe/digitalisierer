@@ -1163,7 +1163,10 @@ def _prepare_thumbnail_repair(
             thumbnail,
             purpose="repaired scan thumbnail",
         )
-        if published_identity[:2] != published.identity[:2]:
+        if (
+            published_identity != published.identity
+            or not secrets.compare_digest(published_sha256, published.sha256)
+        ):
             raise ScannerWorkflowError(
                 f"scan thumbnail changed while preparing repair: {thumbnail.name}"
             )

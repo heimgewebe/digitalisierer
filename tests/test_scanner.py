@@ -2666,14 +2666,8 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
         paths.findings_file: paths.findings_file.read_bytes(),
     }
 
-    original_thumbnail_writer = scanner_module._write_thumbnail
     original_atomic_write = scanner_module._atomic_write_text
     failed = False
-
-    def renderer_with_changed_bytes(source_path: Path, target: Path) -> object:
-        published = original_thumbnail_writer(source_path, target)
-        target.write_bytes(target.read_bytes() + b"-renderer-drift")
-        return published
 
     def fail_session_once(path: Path, content: str) -> None:
         nonlocal failed
@@ -2682,11 +2676,6 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
             raise OSError("synthetic session write failure after thumbnail repair")
         original_atomic_write(path, content)
 
-    monkeypatch.setattr(
-        scanner_module,
-        "_write_thumbnail",
-        renderer_with_changed_bytes,
-    )
     monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_session_once)
 
     with pytest.raises(
@@ -2713,7 +2702,7 @@ def test_observe_failure_restores_repaired_thumbnail_preimage(
     assert resumed.imported_asset_ids == ()
     assert resumed.skipped_asset_ids == (asset_id,)
     repaired = json.loads(paths.session_file.read_text(encoding="utf-8"))["assets"][0]
-    assert repaired["thumbnail_sha256"] != recorded_thumbnail_sha
+    assert repaired["thumbnail_sha256"] == recorded_thumbnail_sha
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
     assert not any(
         path.name.endswith(".rollback") for path in paths.thumbnails.iterdir()
@@ -2811,6 +2800,77 @@ def test_thumbnail_prepare_verification_failure_preserves_foreign_replacement(
 
     assert injected is True
     assert thumbnail.read_bytes() == foreign
+    claims = list(tmp_path.glob(".*.rollback-preimage"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == preimage
+    assert not list(tmp_path.glob(".*.rollback-published"))
+    assert not list(tmp_path.glob(".*.restore-claim"))
+
+
+@pytest.mark.parametrize("mutation_kind", ["digest-only", "identity-only"])
+def test_thumbnail_prepare_rejects_same_inode_state_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_kind: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 110)
+    thumbnail = tmp_path / "thumbnail.jpg"
+    preimage = b"preexisting-thumbnail"
+    thumbnail.write_bytes(preimage)
+    original_snapshot = scanner_module._regular_file_snapshot
+    injected = False
+
+    def mutate_before_repaired_snapshot(
+        path: Path,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal injected
+        if path == thumbnail and purpose == "repaired scan thumbnail" and not injected:
+            before = path.stat()
+            before_identity = scanner_module._stat_identity(before)
+            before_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if mutation_kind == "digest-only":
+                mutated = bytearray(path.read_bytes())
+                mutated[0] ^= 1
+                with path.open("r+b") as handle:
+                    handle.seek(0)
+                    handle.write(mutated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.utime(
+                    path,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                    follow_symlinks=False,
+                )
+                assert scanner_module._stat_identity(path.stat()) == before_identity
+                assert hashlib.sha256(path.read_bytes()).hexdigest() != before_digest
+            else:
+                os.utime(
+                    path,
+                    ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+                    follow_symlinks=False,
+                )
+                assert scanner_module._stat_identity(path.stat()) != before_identity
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == before_digest
+            injected = True
+        return original_snapshot(path, purpose=purpose)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_regular_file_snapshot",
+        mutate_before_repaired_snapshot,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="failed to roll back published scan thumbnail after repair preparation",
+    ):
+        scanner_module._prepare_thumbnail_repair(source, thumbnail)
+
+    assert injected is True
+    assert thumbnail.read_bytes() != preimage
     claims = list(tmp_path.glob(".*.rollback-preimage"))
     assert len(claims) == 1
     assert claims[0].read_bytes() == preimage
