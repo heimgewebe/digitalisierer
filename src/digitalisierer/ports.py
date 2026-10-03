@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -39,6 +40,16 @@ class OCRBackend(Protocol):
     def searchable_pdf(
         self,
         master_pdf: Path,
+        output_pdf: Path,
+        sidecar_txt: Path,
+        *,
+        language: str,
+    ) -> None:
+        ...
+
+    def searchable_pdf_stream(
+        self,
+        master_chunks: Iterable[bytes],
         output_pdf: Path,
         sidecar_txt: Path,
         *,

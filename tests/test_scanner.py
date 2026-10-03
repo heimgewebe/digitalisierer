@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 import hashlib
 import json
 import os
@@ -385,6 +386,30 @@ class _FakeOcr:
         assert language == "deu"
         output_pdf.write_bytes(master_pdf.read_bytes() + b"-ocr")
         sidecar_txt.write_text("recognized", encoding="utf-8")
+
+    def searchable_pdf_stream(
+        self,
+        master_chunks: Iterable[bytes],
+        output_pdf: Path,
+        sidecar_txt: Path,
+        *,
+        language: str,
+    ) -> None:
+        temporary = output_pdf.with_name(".fake-ocr-stream-master.pdf")
+        try:
+            with temporary.open("xb") as handle:
+                for chunk in master_chunks:
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.searchable_pdf(
+                temporary,
+                output_pdf,
+                sidecar_txt,
+                language=language,
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def version(self) -> str:
         return "test"
@@ -2294,6 +2319,16 @@ def test_finalize_binds_verified_master_pdf_through_ocr(
             *,
             language: str,
         ) -> None:
+            raise AssertionError("finalize must use verified OCR streaming")
+
+        def searchable_pdf_stream(
+            self,
+            master_chunks: Iterable[bytes],
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
             nonlocal rebound
             assert language == "deu"
             visible_master = output_pdf.parent / "master.pdf"
@@ -2303,7 +2338,7 @@ def test_finalize_binds_verified_master_pdf_through_ocr(
             visible_master.write_bytes(b"foreign-master-during-ocr")
             rebound = True
             try:
-                bound_bytes = master_pdf.read_bytes()
+                bound_bytes = b"".join(master_chunks)
             finally:
                 visible_master.unlink()
                 os.replace(held_master, visible_master)
@@ -2324,7 +2359,7 @@ def test_finalize_binds_verified_master_pdf_through_ocr(
     )
 
 
-def test_finalize_master_bytes_are_immutable_during_ocr(
+def test_finalize_detects_transient_master_change_during_ocr_stream(
     tmp_path: Path,
 ) -> None:
     capture = tmp_path / "capture-master-ocr-inplace"
@@ -2337,6 +2372,16 @@ def test_finalize_master_bytes_are_immutable_during_ocr(
     )
     observe_scan_folder(paths, capture)
     mutation_succeeded = False
+
+    class _LargePdf:
+        name = "large-fake-pdf"
+
+        def version(self) -> str:
+            return "test"
+
+        def __call__(self, images: list[Path], output: Path) -> None:
+            assert images
+            output.write_bytes(b"%PDF-1.4\n" + b"A" * (2 * 1024 * 1024 + 4096))
 
     class _MasterInPlaceOcr:
         name = "master-inplace-ocr"
@@ -2352,50 +2397,58 @@ def test_finalize_master_bytes_are_immutable_during_ocr(
             *,
             language: str,
         ) -> None:
+            raise AssertionError("finalize must use verified OCR streaming")
+
+        def searchable_pdf_stream(
+            self,
+            master_chunks: Iterable[bytes],
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
             nonlocal mutation_succeeded
             assert language == "deu"
-            original = master_pdf.read_bytes()
-            original_stat = master_pdf.stat()
-            foreign = bytes((byte ^ 0xA5) for byte in original)
-            observed = original
-            os.chmod(master_pdf, 0o600)
+            chunks = iter(master_chunks)
+            first = next(chunks)
+            assert len(first) == 1024 * 1024
+            visible_master = output_pdf.parent / "master.pdf"
+            original_stat = visible_master.stat()
+            offset = 1024 * 1024 + 123
+            with visible_master.open("r+b", buffering=0) as handle:
+                handle.seek(offset)
+                original_byte = handle.read(1)
+                assert len(original_byte) == 1
+                handle.seek(offset)
+                handle.write(bytes((original_byte[0] ^ 0xA5,)))
+                handle.flush()
+                os.fsync(handle.fileno())
+            mutation_succeeded = True
             try:
-                try:
-                    with master_pdf.open("r+b", buffering=0) as handle:
-                        handle.seek(0)
-                        handle.write(foreign)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    mutation_succeeded = True
-                    observed = master_pdf.read_bytes()
-                except OSError:
-                    observed = master_pdf.read_bytes()
+                b"".join(chunks)
             finally:
-                if mutation_succeeded:
-                    with master_pdf.open("r+b", buffering=0) as handle:
-                        handle.seek(0)
-                        handle.write(original)
-                        handle.truncate(len(original))
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.utime(
-                        master_pdf,
-                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-                    )
-                os.chmod(master_pdf, original_stat.st_mode & 0o777)
-            output_pdf.write_bytes(observed + b"-ocr")
-            sidecar_txt.write_text("recognized", encoding="utf-8")
+                with visible_master.open("r+b", buffering=0) as handle:
+                    handle.seek(offset)
+                    handle.write(original_byte)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.utime(
+                    visible_master,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
 
-    exported = finalize_scan_session(
-        paths,
-        _MasterInPlaceOcr(),
-        pdf_builder=_fake_pdf,
-    )
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="master PDF changed while streaming",
+    ):
+        finalize_scan_session(
+            paths,
+            _MasterInPlaceOcr(),
+            pdf_builder=_LargePdf(),
+        )
 
-    master_bytes = (exported.export_dir / "master.pdf").read_bytes()
-    assert (exported.export_dir / "searchable.pdf").read_bytes() == (
-        master_bytes + b"-ocr"
-    )
+    assert mutation_succeeded is True
+    _assert_failed_finalize_cleanup_is_safe(paths.exports)
 
 
 def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> None:
@@ -4591,21 +4644,21 @@ def test_finalize_cleanup_keeps_foreign_staging_path_replacement(
     attacked = False
 
     class FailingOcr(_FakeOcr):
-        def searchable_pdf(
+        def searchable_pdf_stream(
             self,
-            master_pdf: Path,
+            master_chunks: Iterable[bytes],
             output_pdf: Path,
             sidecar_txt: Path,
             *,
             language: str,
         ) -> None:
             nonlocal attacked
-            super().searchable_pdf(
-                master_pdf,
-                output_pdf,
-                sidecar_txt,
-                language=language,
-            )
+            assert language == "deu"
+            with output_pdf.open("wb") as handle:
+                for chunk in master_chunks:
+                    handle.write(chunk)
+                handle.write(b"-ocr")
+            sidecar_txt.write_text("recognized", encoding="utf-8")
             staging = output_pdf.parent
             os.rename(staging, displaced)
             staging.mkdir()
@@ -5515,3 +5568,78 @@ def test_finalize_report_escapes_surrogateescaped_session_path(
     report = (exported.export_dir / "report.txt").read_text(encoding="utf-8")
     assert "Session: " in report
     assert "\\udcff" in report
+
+
+
+def test_finalize_streams_verified_master_without_master_memfd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "master-stream-no-memfd"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "master-stream-no-memfd",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    class _StreamingOcr(_FakeOcr):
+        def searchable_pdf_stream(
+            self,
+            master_chunks: object,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            assert language == "deu"
+            payload = b"".join(master_chunks)  # type: ignore[arg-type]
+            output_pdf.write_bytes(payload + b"-ocr")
+            sidecar_txt.write_text("recognized", encoding="utf-8")
+
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            raise AssertionError("finalize must use verified OCR streaming")
+
+    original_seal = scanner_module._sealed_memfd_snapshot
+
+    def reject_master_memfd(
+        source_descriptor: int,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        name: str,
+        purpose: str,
+    ) -> int:
+        if purpose == "master PDF":
+            raise AssertionError("master PDF must not be copied into a memfd")
+        return original_seal(
+            source_descriptor,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            name=name,
+            purpose=purpose,
+        )
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_sealed_memfd_snapshot",
+        reject_master_memfd,
+    )
+
+    exported = finalize_scan_session(
+        paths,
+        _StreamingOcr(),
+        pdf_builder=_fake_pdf,
+    )
+
+    master = (exported.export_dir / "master.pdf").read_bytes()
+    assert (exported.export_dir / "searchable.pdf").read_bytes() == master + b"-ocr"

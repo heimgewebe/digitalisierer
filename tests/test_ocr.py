@@ -88,3 +88,50 @@ def test_ocr_backend_version_rejects_missing_provenance(
 
     with pytest.raises(OcrAdapterError, match=message):
         backend.version()
+
+
+
+def test_ocr_backend_streams_master_chunks_via_stdin(tmp_path: Path) -> None:
+    output = tmp_path / "searchable.pdf"
+    sidecar = tmp_path / "text.txt"
+    calls: list[list[str]] = []
+    consumed: list[bytes] = []
+
+    def stream_runner(
+        argv: list[str],
+        chunks: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        consumed.extend(chunks)  # type: ignore[arg-type]
+        output.write_bytes(b"searchable")
+        sidecar.write_text("text", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, stdout="ok")
+
+    backend = OcrmypdfBackend(
+        executable="/usr/bin/ocrmypdf",
+        jobs=2,
+        stream_runner=stream_runner,
+    )
+    backend.searchable_pdf_stream(
+        iter((b"%PDF-part-1", b"-part-2")),
+        output,
+        sidecar,
+        language="deu",
+    )
+
+    assert consumed == [b"%PDF-part-1", b"-part-2"]
+    assert calls == [[
+        "/usr/bin/ocrmypdf",
+        "--language",
+        "deu",
+        "--output-type",
+        "pdf",
+        "--optimize",
+        "0",
+        "--jobs",
+        "2",
+        "--sidecar",
+        str(sidecar),
+        "-",
+        str(output),
+    ]]

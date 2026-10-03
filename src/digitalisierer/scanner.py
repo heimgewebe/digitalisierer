@@ -1193,6 +1193,35 @@ def _verified_preview_source_snapshot(
                 os.close(snapshot_read_fd)
 
 
+@dataclass(slots=True)
+class _StreamVerification:
+    complete: bool = False
+
+
+def _verified_descriptor_chunks(
+    descriptor: int,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    purpose: str,
+    verification: _StreamVerification,
+) -> Iterator[bytes]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            total += len(chunk)
+            yield chunk
+    if (
+        total != expected_size
+        or not secrets.compare_digest(digest.hexdigest(), expected_sha256)
+    ):
+        raise ScannerWorkflowError(f"{purpose} changed while streaming")
+    verification.complete = True
+
+
 def _descriptor_sha256(descriptor: int) -> str:
     os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
@@ -4156,7 +4185,6 @@ def finalize_scan_session(
             raise ScannerWorkflowError(
                 "master PDF cannot be bound safely for OCR"
             ) from exc
-        sealed_master_descriptor = -1
         try:
             master_before = os.fstat(master_descriptor)
             if (
@@ -4164,36 +4192,46 @@ def finalize_scan_session(
                 or _stat_identity(master_before) != master_identity
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR snapshot"
+                    "master PDF changed before OCR streaming"
                 )
             try:
                 master_current = master.lstat()
             except OSError as exc:
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR snapshot"
+                    "master PDF changed before OCR streaming"
                 ) from exc
             if (
                 not stat.S_ISREG(master_current.st_mode)
                 or _stat_identity(master_current) != master_identity
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR snapshot"
+                    "master PDF changed before OCR streaming"
                 )
 
-            sealed_master_descriptor = _sealed_memfd_snapshot(
-                master_descriptor,
-                expected_sha256=master_sha256,
-                expected_size=master_before.st_size,
-                name="digitalisierer-master-pdf",
-                purpose="master PDF",
+            verification = _StreamVerification()
+            ocr_backend.searchable_pdf_stream(
+                _verified_descriptor_chunks(
+                    master_descriptor,
+                    expected_sha256=master_sha256,
+                    expected_size=master_before.st_size,
+                    purpose="master PDF",
+                    verification=verification,
+                ),
+                searchable,
+                text_file,
+                language=language,
             )
+            if not verification.complete:
+                raise ScannerWorkflowError(
+                    "OCR backend did not consume the complete master PDF"
+                )
 
             master_after = os.fstat(master_descriptor)
             try:
                 master_current = master.lstat()
             except OSError as exc:
                 raise ScannerWorkflowError(
-                    "master PDF changed while creating OCR snapshot"
+                    "master PDF changed while streaming to OCR"
                 ) from exc
             if (
                 _stat_identity(master_after) != master_identity
@@ -4201,24 +4239,10 @@ def finalize_scan_session(
                 or _stat_identity(master_current) != master_identity
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed while creating OCR snapshot"
+                    "master PDF changed while streaming to OCR"
                 )
         finally:
             os.close(master_descriptor)
-
-        try:
-            bound_master = Path(
-                f"/proc/{os.getpid()}/fd/{sealed_master_descriptor}"
-            )
-            ocr_backend.searchable_pdf(
-                bound_master,
-                searchable,
-                text_file,
-                language=language,
-            )
-        finally:
-            if sealed_master_descriptor >= 0:
-                os.close(sealed_master_descriptor)
         searchable_sha256, searchable_identity = _regular_file_snapshot(
             searchable,
             purpose="searchable PDF output",
