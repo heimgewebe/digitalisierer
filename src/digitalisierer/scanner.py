@@ -30,6 +30,7 @@ REVIEW_FILE = "review.json"
 REVIEW_LOCK_FILE = ".review.lock"
 FINDINGS_FILE = "findings.json"
 OBSERVATION_COMMIT_FILE = ".observation-metadata-commit.json"
+OBSERVATION_ROLLBACK_FILE = ".observation-artifact-rollback.json"
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 MAX_SOURCE_IMAGE_BYTES = 512 * 1024 * 1024
 
@@ -347,7 +348,9 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
         try:
             os.fchmod(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            if os.path.lexists(root / OBSERVATION_COMMIT_FILE):
+            if _observation_rollback_holder(paths) is not None:
+                _recover_observation_artifact_rollback(paths)
+            if _observation_commit_holder(paths) is not None:
                 _recover_observation_metadata_commit(paths)
             _recover_interrupted_preserved_repairs(paths)
             _recover_interrupted_thumbnail_repairs(paths)
@@ -662,7 +665,10 @@ def create_or_resume_scan_session(
     # A resumed session is ready only when its individually valid metadata also
     # forms one coherent scanner state. Only an actual crash marker needs the
     # session lock; ordinary resume remains side-effect free here.
-    if os.path.lexists(_observation_commit_path(paths)):
+    if (
+        _observation_rollback_holder(paths) is not None
+        or _observation_commit_holder(paths) is not None
+    ):
         with _review_update_lock(paths):
             pass
 
@@ -2339,6 +2345,51 @@ def _observation_commit_path(paths: ScanSessionPaths) -> Path:
     return paths.root / OBSERVATION_COMMIT_FILE
 
 
+def _observation_rollback_path(paths: ScanSessionPaths) -> Path:
+    return paths.root / OBSERVATION_ROLLBACK_FILE
+
+
+def _internal_marker_holder(
+    canonical: Path,
+    *,
+    claim_suffixes: tuple[str, ...],
+) -> Path | None:
+    holders: list[Path] = []
+    if os.path.lexists(canonical):
+        holders.append(canonical)
+    normalized_prefix = canonical.name.lstrip(".") + "."
+    for candidate in canonical.parent.iterdir():
+        if candidate == canonical:
+            continue
+        if not candidate.name.lstrip(".").startswith(normalized_prefix):
+            continue
+        if not any(
+            candidate.name.endswith(f".{suffix}")
+            for suffix in claim_suffixes
+        ):
+            continue
+        holders.append(candidate)
+    if len(holders) > 1:
+        raise ScannerWorkflowError(
+            f"scanner marker state is ambiguous: {canonical.name}"
+        )
+    return holders[0] if holders else None
+
+
+def _observation_commit_holder(paths: ScanSessionPaths) -> Path | None:
+    return _internal_marker_holder(
+        _observation_commit_path(paths),
+        claim_suffixes=("commit-cleanup", "cleanup-claim", "restore-claim"),
+    )
+
+
+def _observation_rollback_holder(paths: ScanSessionPaths) -> Path | None:
+    return _internal_marker_holder(
+        _observation_rollback_path(paths),
+        claim_suffixes=("cleanup-claim", "restore-claim"),
+    )
+
+
 def _metadata_text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -2384,7 +2435,10 @@ def _clear_observation_commit_marker(
     *,
     expected_sha256: str,
 ) -> None:
-    marker = _observation_commit_path(paths)
+    canonical = _observation_commit_path(paths)
+    marker = _observation_commit_holder(paths)
+    if marker is None:
+        return
     current_sha256, current_identity = _regular_file_snapshot(
         marker,
         purpose="observation metadata commit marker",
@@ -2393,6 +2447,18 @@ def _clear_observation_commit_marker(
         raise ScannerWorkflowError(
             "observation metadata commit marker changed before cleanup"
         )
+
+    if marker != canonical:
+        if not _remove_owned_claim(
+            marker,
+            current_sha256,
+            current_identity,
+        ):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker changed before cleanup"
+            )
+        return
+
     claimed = _claim_owned_regular_file(
         marker,
         current_sha256,
@@ -2418,13 +2484,15 @@ def _clear_observation_commit_marker(
         claimed.unlink()
         _fsync_directory(paths.root)
     except Exception:
-        if not os.path.lexists(marker):
-            _restore_claimed_file(claimed, marker)
+        if not os.path.lexists(canonical):
+            _restore_claimed_file(claimed, canonical)
         raise
 
 
 def _recover_observation_metadata_commit(paths: ScanSessionPaths) -> None:
-    marker = _observation_commit_path(paths)
+    marker = _observation_commit_holder(paths)
+    if marker is None:
+        return
     raw_marker = _stable_file_bytes(marker)
     marker_sha256 = hashlib.sha256(raw_marker).hexdigest()
     try:
@@ -2537,6 +2605,349 @@ def _recover_observation_metadata_commit(paths: ScanSessionPaths) -> None:
             )
 
     _clear_observation_commit_marker(
+        paths,
+        expected_sha256=marker_sha256,
+    )
+
+
+def _observation_rollback_payload(
+    paths: ScanSessionPaths,
+    *,
+    previous_session_text: str,
+    previous_review_text: str,
+    previous_findings_text: str,
+    commit_marker_sha256: str | None,
+    created_artifacts: list[_CreatedArtifactState],
+) -> dict[str, Any]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for state in created_artifacts:
+        if state.path.parent == paths.sources:
+            directory = "sources"
+        elif state.path.parent == paths.thumbnails:
+            directory = "thumbnails"
+        else:
+            raise ScannerWorkflowError(
+                "observation rollback artifact is outside scanner storage"
+            )
+        name = state.path.name
+        if Path(name).name != name or not name:
+            raise ScannerWorkflowError(
+                "observation rollback artifact name is invalid"
+            )
+        key = (directory, name)
+        if key in seen:
+            raise ScannerWorkflowError(
+                "observation rollback artifact is duplicated"
+            )
+        seen.add(key)
+        artifacts.append(
+            {
+                "directory": directory,
+                "name": name,
+                "sha256": state.sha256,
+                "identity": list(state.identity),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "kind": "digitalisierer.observation-artifact-rollback",
+        "previous": {
+            "session": _metadata_text_sha256(previous_session_text),
+            "review": _metadata_text_sha256(previous_review_text),
+            "findings": _metadata_text_sha256(previous_findings_text),
+        },
+        "commit_marker_sha256": commit_marker_sha256,
+        "created_artifacts": artifacts,
+    }
+
+
+def _write_observation_rollback_marker(
+    paths: ScanSessionPaths,
+    *,
+    previous_session_text: str,
+    previous_review_text: str,
+    previous_findings_text: str,
+    commit_marker_sha256: str | None,
+    created_artifacts: list[_CreatedArtifactState],
+) -> str:
+    if _observation_rollback_holder(paths) is not None:
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker already exists"
+        )
+    payload = _observation_rollback_payload(
+        paths,
+        previous_session_text=previous_session_text,
+        previous_review_text=previous_review_text,
+        previous_findings_text=previous_findings_text,
+        commit_marker_sha256=commit_marker_sha256,
+        created_artifacts=created_artifacts,
+    )
+    text = _json_text(payload)
+    expected_sha256 = _metadata_text_sha256(text)
+    marker = _observation_rollback_path(paths)
+    _atomic_write_text(marker, text)
+    current_sha256, _ = _regular_file_snapshot(
+        marker,
+        purpose="observation artifact rollback marker",
+    )
+    if not secrets.compare_digest(current_sha256, expected_sha256):
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker changed while being prepared"
+        )
+    return expected_sha256
+
+
+def _bound_artifact_holder(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int],
+) -> Path | None:
+    holders: list[Path] = []
+    if os.path.lexists(path):
+        current_sha256, current_identity = _regular_file_snapshot(
+            path,
+            purpose="observation rollback artifact",
+        )
+        if (
+            current_identity != expected_identity
+            or not secrets.compare_digest(current_sha256, expected_sha256)
+        ):
+            raise ScannerWorkflowError(
+                f"observation rollback artifact changed: {path.name}"
+            )
+        holders.append(path)
+
+    normalized_prefix = path.name.lstrip(".") + "."
+    for candidate in path.parent.iterdir():
+        if candidate == path:
+            continue
+        if not candidate.name.lstrip(".").startswith(normalized_prefix):
+            continue
+        if not (
+            candidate.name.endswith(".cleanup-claim")
+            or candidate.name.endswith(".restore-claim")
+        ):
+            continue
+        current_sha256, current_identity = _regular_file_snapshot(
+            candidate,
+            purpose="claimed observation rollback artifact",
+        )
+        if (
+            current_identity != expected_identity
+            or not secrets.compare_digest(current_sha256, expected_sha256)
+        ):
+            raise ScannerWorkflowError(
+                f"observation rollback artifact claim changed: {path.name}"
+            )
+        holders.append(candidate)
+
+    if len(holders) > 1:
+        raise ScannerWorkflowError(
+            f"observation rollback artifact state is ambiguous: {path.name}"
+        )
+    return holders[0] if holders else None
+
+
+def _clear_observation_rollback_marker(
+    paths: ScanSessionPaths,
+    *,
+    expected_sha256: str,
+) -> None:
+    marker = _observation_rollback_holder(paths)
+    if marker is None:
+        return
+    current_sha256, current_identity = _regular_file_snapshot(
+        marker,
+        purpose="observation artifact rollback marker",
+    )
+    if not secrets.compare_digest(current_sha256, expected_sha256):
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker changed before cleanup"
+        )
+    if not _remove_owned_claim(
+        marker,
+        current_sha256,
+        current_identity,
+    ):
+        raise ScannerWorkflowError(
+            "failed to clear observation artifact rollback marker"
+        )
+
+
+def _recover_observation_artifact_rollback(paths: ScanSessionPaths) -> None:
+    marker = _observation_rollback_holder(paths)
+    if marker is None:
+        return
+    raw_marker = _stable_file_bytes(marker)
+    marker_sha256, _ = _regular_file_snapshot(
+        marker,
+        purpose="observation artifact rollback marker",
+    )
+    if not secrets.compare_digest(
+        hashlib.sha256(raw_marker).hexdigest(),
+        marker_sha256,
+    ):
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker changed while reading"
+        )
+    try:
+        payload = json.loads(raw_marker.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind")
+        != "digitalisierer.observation-artifact-rollback"
+        or set(payload)
+        != {
+            "schema_version",
+            "kind",
+            "previous",
+            "commit_marker_sha256",
+            "created_artifacts",
+        }
+    ):
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker is invalid"
+        )
+
+    previous = payload.get("previous")
+    commit_marker_sha256 = payload.get("commit_marker_sha256")
+    artifacts = payload.get("created_artifacts")
+    if (
+        not isinstance(previous, dict)
+        or set(previous) != {"session", "review", "findings"}
+        or any(not _is_sha256(previous.get(name)) for name in previous)
+        or (
+            commit_marker_sha256 is not None
+            and not _is_sha256(commit_marker_sha256)
+        )
+        or not isinstance(artifacts, list)
+    ):
+        raise ScannerWorkflowError(
+            "observation artifact rollback marker is invalid"
+        )
+
+    paths_by_name = {
+        "session": paths.session_file,
+        "review": paths.review_file,
+        "findings": paths.findings_file,
+    }
+    for name, metadata_path in paths_by_name.items():
+        current = hashlib.sha256(_stable_file_bytes(metadata_path)).hexdigest()
+        if not secrets.compare_digest(current, str(previous[name])):
+            raise ScannerWorkflowError(
+                f"scanner {name} metadata is not rolled back"
+            )
+
+    _validate_session_storage_directory(paths, paths.sources, "sources")
+    _validate_session_storage_directory(paths, paths.thumbnails, "thumbnails")
+
+    current_session, _ = _stable_json_snapshot(paths.session_file)
+    _validate_session_identity(paths, current_session)
+    current_assets = current_session.get("assets")
+    if not isinstance(current_assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+    referenced_artifacts = {
+        value
+        for item in current_assets
+        if isinstance(item, dict)
+        for value in (item.get("preserved_path"), item.get("thumbnail_path"))
+        if isinstance(value, str)
+    }
+
+    commit_holder = _observation_commit_holder(paths)
+    if commit_holder is not None:
+        if commit_marker_sha256 is None:
+            raise ScannerWorkflowError(
+                "unexpected observation commit marker during rollback recovery"
+            )
+        current_sha256, _ = _regular_file_snapshot(
+            commit_holder,
+            purpose="observation metadata commit marker",
+        )
+        if not secrets.compare_digest(
+            current_sha256,
+            str(commit_marker_sha256),
+        ):
+            raise ScannerWorkflowError(
+                "observation metadata commit marker diverged during rollback"
+            )
+
+    seen: set[tuple[str, str]] = set()
+    for entry in reversed(artifacts):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"directory", "name", "sha256", "identity"}
+        ):
+            raise ScannerWorkflowError(
+                "observation artifact rollback marker is invalid"
+            )
+        directory = entry.get("directory")
+        artifact_name = entry.get("name")
+        sha256 = entry.get("sha256")
+        identity = entry.get("identity")
+        if (
+            directory not in {"sources", "thumbnails"}
+            or not isinstance(artifact_name, str)
+            or not artifact_name
+            or Path(artifact_name).name != artifact_name
+            or not _is_sha256(sha256)
+            or not isinstance(identity, list)
+            or len(identity) != 4
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in identity
+            )
+        ):
+            raise ScannerWorkflowError(
+                "observation artifact rollback marker is invalid"
+            )
+        key = (str(directory), artifact_name)
+        if key in seen:
+            raise ScannerWorkflowError(
+                "observation artifact rollback marker contains duplicates"
+            )
+        seen.add(key)
+        relative_artifact = f"{directory}/{artifact_name}"
+        if relative_artifact in referenced_artifacts:
+            raise ScannerWorkflowError(
+                "observation rollback would remove a referenced scanner artifact"
+            )
+        parent = paths.sources if directory == "sources" else paths.thumbnails
+        artifact = parent / artifact_name
+        artifact_identity = (
+            identity[0],
+            identity[1],
+            identity[2],
+            identity[3],
+        )
+        holder = _bound_artifact_holder(
+            artifact,
+            expected_sha256=str(sha256),
+            expected_identity=artifact_identity,
+        )
+        if holder is not None and not _remove_owned_claim(
+            holder,
+            str(sha256),
+            artifact_identity,
+        ):
+            raise ScannerWorkflowError(
+                f"failed to finish observation artifact rollback: {artifact_name}"
+            )
+
+    if commit_holder is not None:
+        _clear_observation_commit_marker(
+            paths,
+            expected_sha256=str(commit_marker_sha256),
+        )
+
+    _clear_observation_rollback_marker(
         paths,
         expected_sha256=marker_sha256,
     )
@@ -3414,11 +3825,13 @@ def _observe_scan_folder_unlocked(
         _atomic_write_text(paths.session_file, next_session_text)
     except (Exception, KeyboardInterrupt):
         rollback_error: Exception | None = None
+        rollback_marker_sha256: str | None = None
 
-        # Keep every artifact compatible with the forward recovery marker until
-        # metadata has converged back to the verified preimage and that marker
-        # is durably gone. A crash after artifact rollback begins can therefore
-        # never select the forward metadata state on resume.
+        # First converge metadata back to the verified preimage. Before any
+        # artifact cleanup begins, publish a separate durable rollback marker
+        # that binds every newly created artifact. That marker remains
+        # discoverable even if clearing the forward commit marker or deleting an
+        # artifact is interrupted by process/power loss.
         if metadata_mutated:
             for metadata_path, previous_text in (
                 (paths.session_file, previous_session_text),
@@ -3430,10 +3843,49 @@ def _observe_scan_folder_unlocked(
                 except Exception as exc:
                     if rollback_error is None:
                         rollback_error = exc
+
+        if rollback_error is None:
+            for metadata_path, previous_text in (
+                (paths.session_file, previous_session_text),
+                (paths.review_file, previous_review_text),
+                (paths.findings_file, previous_findings_text),
+            ):
+                try:
+                    current = hashlib.sha256(
+                        _stable_file_bytes(metadata_path)
+                    ).hexdigest()
+                    if not secrets.compare_digest(
+                        current,
+                        _metadata_text_sha256(previous_text),
+                    ):
+                        raise ScannerWorkflowError(
+                            "scanner metadata rollback did not converge"
+                        )
+                except Exception as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+
+        if rollback_error is None:
+            try:
+                rollback_marker_sha256 = _write_observation_rollback_marker(
+                    paths,
+                    previous_session_text=previous_session_text,
+                    previous_review_text=previous_review_text,
+                    previous_findings_text=previous_findings_text,
+                    commit_marker_sha256=(
+                        commit_marker_sha256
+                        if _observation_commit_holder(paths) is not None
+                        else None
+                    ),
+                    created_artifacts=created_artifacts,
+                )
+            except Exception as exc:
+                rollback_error = exc
+
         if (
             rollback_error is None
             and commit_marker_sha256 is not None
-            and os.path.lexists(commit_path)
+            and _observation_commit_holder(paths) is not None
         ):
             try:
                 _clear_observation_commit_marker(
@@ -3462,6 +3914,18 @@ def _observe_scan_folder_unlocked(
                 except Exception as exc:
                     if rollback_error is None:
                         rollback_error = exc
+
+        if (
+            rollback_error is None
+            and rollback_marker_sha256 is not None
+        ):
+            try:
+                _clear_observation_rollback_marker(
+                    paths,
+                    expected_sha256=rollback_marker_sha256,
+                )
+            except Exception as exc:
+                rollback_error = exc
 
         if rollback_error is not None:
             raise ScannerWorkflowError(

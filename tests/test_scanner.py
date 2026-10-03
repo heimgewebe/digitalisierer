@@ -4940,6 +4940,201 @@ def test_finalize_rollback_preserves_replacement_raced_after_identity_check(
     assert displaced.is_dir()
 
 
+
+def test_observe_rollback_marker_claim_crash_resumes_artifact_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "rollback-marker-claim-crash"
+    capture.mkdir()
+    _image(capture / "page.jpg", 120)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "rollback-marker-claim-crash",
+        library,
+    )
+    original_write = scanner_module._atomic_write_text
+    original_claim = scanner_module._claim_owned_regular_file
+    commit_path = paths.root / scanner_module.OBSERVATION_COMMIT_FILE
+    commit_failed = False
+    cleanup_claimed = False
+
+    def fail_after_session_write(path: Path, text: str) -> None:
+        nonlocal commit_failed
+        original_write(path, text)
+        if path == paths.session_file and not commit_failed:
+            commit_failed = True
+            raise OSError("synthetic observation commit failure")
+
+    def crash_after_marker_cleanup_claim(
+        path: Path,
+        expected_sha256: str,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        marker: str,
+        claimed_path: Path | None = None,
+    ) -> Path | None:
+        nonlocal cleanup_claimed
+        claimed = original_claim(
+            path,
+            expected_sha256,
+            expected_identity,
+            marker=marker,
+            claimed_path=claimed_path,
+        )
+        if (
+            not cleanup_claimed
+            and path == commit_path
+            and marker == "commit-cleanup"
+            and claimed is not None
+        ):
+            cleanup_claimed = True
+            raise SystemExit("synthetic crash after observation marker cleanup claim")
+        return claimed
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_after_session_write)
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        crash_after_marker_cleanup_claim,
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash after observation marker cleanup claim",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert commit_failed is True
+    assert cleanup_claimed is True
+    assert not os.path.lexists(commit_path)
+    assert list(paths.root.glob(".*.commit-cleanup"))
+    assert list(paths.sources.iterdir())
+    assert list(paths.thumbnails.iterdir())
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        original_claim,
+    )
+
+    resumed = create_or_resume_scan_session(
+        "book",
+        "rollback-marker-claim-crash",
+        library,
+    )
+    session, review, findings, processing = scanner_module.load_review_state(resumed)
+
+    assert session["assets"] == []
+    assert review["items"] == {}
+    assert findings["findings"] == []
+    assert processing.items == []
+    assert not list(resumed.sources.iterdir())
+    assert not list(resumed.thumbnails.iterdir())
+    assert not list(resumed.root.glob(".*.commit-cleanup"))
+
+
+
+
+def test_observe_rollback_artifact_claim_crash_resumes_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "rollback-artifact-claim-crash"
+    capture.mkdir()
+    _image(capture / "page.jpg", 120)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "rollback-artifact-claim-crash",
+        library,
+    )
+    original_write = scanner_module._atomic_write_text
+    original_claim = scanner_module._claim_owned_regular_file
+    commit_failed = False
+    artifact_claimed = False
+
+    def fail_after_session_write(path: Path, text: str) -> None:
+        nonlocal commit_failed
+        original_write(path, text)
+        if path == paths.session_file and not commit_failed:
+            commit_failed = True
+            raise OSError("synthetic observation commit failure")
+
+    def crash_after_artifact_cleanup_claim(
+        path: Path,
+        expected_sha256: str,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        marker: str,
+        claimed_path: Path | None = None,
+    ) -> Path | None:
+        nonlocal artifact_claimed
+        claimed = original_claim(
+            path,
+            expected_sha256,
+            expected_identity,
+            marker=marker,
+            claimed_path=claimed_path,
+        )
+        if (
+            not artifact_claimed
+            and marker == "cleanup-claim"
+            and path.parent in {paths.sources, paths.thumbnails}
+            and claimed is not None
+        ):
+            artifact_claimed = True
+            raise SystemExit("synthetic crash after observation artifact cleanup claim")
+        return claimed
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", fail_after_session_write)
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        crash_after_artifact_cleanup_claim,
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash after observation artifact cleanup claim",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert commit_failed is True
+    assert artifact_claimed is True
+    assert os.path.lexists(
+        paths.root / scanner_module.OBSERVATION_ROLLBACK_FILE
+    )
+    assert list(paths.sources.iterdir()) or list(paths.thumbnails.iterdir())
+
+    monkeypatch.setattr(scanner_module, "_atomic_write_text", original_write)
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        original_claim,
+    )
+
+    resumed = create_or_resume_scan_session(
+        "book",
+        "rollback-artifact-claim-crash",
+        library,
+    )
+    session, review, findings, processing = scanner_module.load_review_state(resumed)
+
+    assert session["assets"] == []
+    assert review["items"] == {}
+    assert findings["findings"] == []
+    assert processing.items == []
+    assert not list(resumed.sources.iterdir())
+    assert not list(resumed.thumbnails.iterdir())
+    assert not os.path.lexists(
+        resumed.root / scanner_module.OBSERVATION_ROLLBACK_FILE
+    )
+
+
+
 def test_observe_rollback_crash_cannot_recover_forward_after_source_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
