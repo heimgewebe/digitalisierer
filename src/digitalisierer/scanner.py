@@ -681,14 +681,14 @@ def create_or_resume_scan_session(
     return paths
 
 
-def _pillow_modules() -> tuple[Any, Any]:
+def _pillow_modules() -> tuple[Any, Any, Any]:
     try:
-        from PIL import Image, ImageStat
+        from PIL import Image, ImageOps, ImageStat
     except ImportError as exc:
         raise ImageDependencyError(
             "scanner image support requires Pillow; install Digitalisierer scanner dependencies"
         ) from exc
-    return Image, ImageStat
+    return Image, ImageOps, ImageStat
 
 
 def _pixel_values(image: Any) -> list[int]:
@@ -717,18 +717,23 @@ def _pillow_image_source(source: Path | int) -> Iterator[Any]:
 
 
 def _inspect_image(path: Path | int) -> dict[str, object]:
-    Image, ImageStat = _pillow_modules()
+    Image, ImageOps, ImageStat = _pillow_modules()
     with _pillow_image_source(path) as image_source:
         with Image.open(image_source) as image:
             image.load()
-            width, height = image.size
             dpi_raw = image.info.get("dpi") or (0.0, 0.0)
-            work = image.convert("L")
-            work.thumbnail((256, 256))
-            stat = ImageStat.Stat(work)
-            values = _pixel_values(work)
-            dark_ratio = sum(value < 210 for value in values) / max(1, len(values))
-            average_hash = _average_hash(image)
+            oriented = ImageOps.exif_transpose(image)
+            try:
+                width, height = oriented.size
+                work = oriented.convert("L")
+                work.thumbnail((256, 256))
+                stat = ImageStat.Stat(work)
+                values = _pixel_values(work)
+                dark_ratio = sum(value < 210 for value in values) / max(1, len(values))
+                average_hash = _average_hash(oriented)
+            finally:
+                if oriented is not image:
+                    oriented.close()
     dpi_x = float(dpi_raw[0]) if len(dpi_raw) >= 1 else 0.0
     dpi_y = float(dpi_raw[1]) if len(dpi_raw) >= 2 else 0.0
     return {
@@ -746,7 +751,7 @@ def _write_thumbnail(
     source: Path | int,
     target: Path,
 ) -> _CreatedArtifactState | None:
-    Image, _ = _pillow_modules()
+    Image, ImageOps, _ = _pillow_modules()
     target.parent.mkdir(parents=True, exist_ok=True)
     generated = _open_generated_file(target.parent, name_hint=target.name)
     expected_sha256: str | None = None
@@ -755,12 +760,17 @@ def _write_thumbnail(
         with _pillow_image_source(source) as image_source:
             with Image.open(image_source) as image:
                 image.load()
-                thumbnail = image.convert("RGB")
-                thumbnail.thumbnail((720, 960))
-                with os.fdopen(os.dup(generated.descriptor), "wb") as handle:
-                    thumbnail.save(handle, format="JPEG", quality=82, optimize=True)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                oriented = ImageOps.exif_transpose(image)
+                try:
+                    thumbnail = oriented.convert("RGB")
+                    thumbnail.thumbnail((720, 960))
+                    with os.fdopen(os.dup(generated.descriptor), "wb") as handle:
+                        thumbnail.save(handle, format="JPEG", quality=82, optimize=True)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                finally:
+                    if oriented is not image:
+                        oriented.close()
         expected_sha256, expected_identity = _generated_file_state(
             generated.descriptor,
             purpose="generated scan thumbnail",

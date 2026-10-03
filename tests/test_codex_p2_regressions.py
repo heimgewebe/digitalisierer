@@ -122,3 +122,40 @@ def test_start_rolls_back_launched_process_on_keyboard_interrupt(
     assert not output_dir.exists()
     assert not capture_root.exists()
     assert backend._session_output is None
+
+
+def test_observe_applies_exif_orientation_to_review_derivatives(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-exif-orientation"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    image = Image.new("RGB", (80, 40), color="white")
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(source, format="JPEG", exif=exif)
+    source_before = source.read_bytes()
+
+    paths = create_or_resume_scan_session(
+        "book",
+        "exif-orientation",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+
+    assert len(observed.imported_asset_ids) == 1
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    assert asset["image"]["width"] == 40
+    assert asset["image"]["height"] == 80
+
+    preserved = paths.root / asset["preserved_path"]
+    thumbnail = paths.root / asset["thumbnail_path"]
+    assert preserved.read_bytes() == source_before
+
+    with Image.open(preserved) as preserved_image:
+        assert preserved_image.size == (80, 40)
+        assert preserved_image.getexif().get(274) == 6
+    with Image.open(thumbnail) as thumbnail_image:
+        assert thumbnail_image.size == (40, 80)
+        assert thumbnail_image.getexif().get(274) is None
