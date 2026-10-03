@@ -517,6 +517,8 @@ class CzurCaptureBackend:
             )
         )
         claimed_preimage = guard_dir / "preimage"
+        recovery_preimage = guard_dir / "recovery"
+        recovery_created = False
         claimed = False
         published = False
         published_identity: tuple[int, int, int, int, int, int] | None = None
@@ -537,6 +539,42 @@ class CzurCaptureBackend:
                 raise CzurAdapterError(
                     "CZUR config changed before Curved Books preset could be applied"
                 )
+
+            # Keep an exact transaction-specific recovery copy even when the
+            # long-lived pre-Digitalisierer backup already exists and contains
+            # older settings. The copy is fsynced before the canonical config
+            # pathname can be claimed, so a crash cannot leave only a stale
+            # backup behind.
+            recovery_descriptor = -1
+            try:
+                recovery_descriptor = os.open(
+                    recovery_preimage,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                )
+                recovery_created = True
+                with os.fdopen(recovery_descriptor, "wb") as handle:
+                    recovery_descriptor = -1
+                    handle.write(config_before)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                recovery_content, _ = self._snapshot_regular_file(
+                    recovery_preimage
+                )
+                if recovery_content != config_before:
+                    raise CzurAdapterError(
+                        "CZUR transaction recovery changed while Curved Books preset "
+                        "was being prepared"
+                    )
+                self._fsync_directory(guard_dir)
+                self._fsync_directory(self.config_path.parent)
+            finally:
+                if recovery_descriptor >= 0:
+                    os.close(recovery_descriptor)
 
             # Make the recovery copy durable before removing the canonical
             # config pathname. A process or power loss after the following
@@ -627,6 +665,11 @@ class CzurCaptureBackend:
             claimed_preimage.unlink()
             claimed = False
             try:
+                recovery_preimage.unlink()
+                recovery_created = False
+            except OSError:
+                pass
+            try:
                 guard_dir.rmdir()
             except OSError:
                 pass
@@ -652,6 +695,16 @@ class CzurCaptureBackend:
                 rollback_complete = self._restore_claimed_config(claimed_preimage)
                 if rollback_complete:
                     claimed = False
+
+            recovery_cleanup_safe = rollback_complete or (
+                not claimed and not published
+            )
+            if recovery_cleanup_safe and recovery_created:
+                try:
+                    recovery_preimage.unlink()
+                    recovery_created = False
+                except OSError:
+                    pass
 
             backup_cleanup_failed = False
             backup_cleanup_safe = rollback_complete or (

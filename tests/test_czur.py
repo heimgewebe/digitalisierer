@@ -1156,15 +1156,20 @@ def test_start_keeps_preimage_backup_when_foreign_write_follows_publication(
     )
     monkeypatch.setattr(backend, "_visible_windows", lambda: [])
     original_fsync_directory = backend._fsync_directory
-    calls = 0
+    foreign_written = False
     before = config.read_bytes()
     foreign = b'{"setting":{"unrelated":"foreign-after-publication"}}\n'
 
     def fsync_then_foreign_write(directory: Path) -> None:
-        nonlocal calls
+        nonlocal foreign_written
         original_fsync_directory(directory)
-        calls += 1
-        if calls == 2:
+        if (
+            not foreign_written
+            and directory == config.parent
+            and config.is_file()
+            and config.read_bytes() != before
+        ):
+            foreign_written = True
             config.write_bytes(foreign)
 
     monkeypatch.setattr(backend, "_fsync_directory", fsync_then_foreign_write)
@@ -1176,6 +1181,7 @@ def test_start_keeps_preimage_backup_when_foreign_write_follows_publication(
         backend.start(output_dir)
 
     backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    assert foreign_written is True
     assert config.read_bytes() == foreign
     assert backup.read_bytes() == before
     assert not output_dir.exists()
@@ -2089,3 +2095,56 @@ def test_backup_helper_does_not_validate_staging_after_publication(
     assert not list(
         tmp_path.glob(".config.json.digitalisierer.backup-stage.*")
     )
+
+
+def test_preexisting_stale_backup_gets_durable_transaction_recovery_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"setting": {"scan_preview_capture_type": "single"}}) + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    before = config.read_bytes()
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    stale_backup = b'{"setting": {"stale": true}}\n'
+    backup.write_bytes(stale_backup)
+    backend = CzurCaptureBackend(config_path=config)
+    original_rename = os.rename
+    crashed = False
+
+    def crash_after_claim(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal crashed
+        destination = Path(dst)
+        if (
+            not crashed
+            and Path(src) == config
+            and destination.name == "preimage"
+            and destination.parent.name.startswith(
+                ".config.json.digitalisierer.claim."
+            )
+        ):
+            original_rename(src, dst)
+            crashed = True
+            raise SystemExit("synthetic crash after config claim")
+        original_rename(src, dst)
+
+    monkeypatch.setattr("digitalisierer.czur.os.rename", crash_after_claim)
+
+    with pytest.raises(SystemExit, match="synthetic crash after config claim"):
+        backend.apply_curved_books_preset()
+
+    assert crashed is True
+    assert backup.read_bytes() == stale_backup
+    claims = list(tmp_path.glob(".config.json.digitalisierer.claim.*/preimage"))
+    recoveries = list(tmp_path.glob(".config.json.digitalisierer.claim.*/recovery"))
+    assert len(claims) == 1
+    assert claims[0].read_bytes() == before
+    assert len(recoveries) == 1
+    assert recoveries[0].read_bytes() == before
+    assert not config.exists()

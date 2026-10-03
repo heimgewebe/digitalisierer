@@ -635,12 +635,16 @@ def build_review_server(
                         return
                     with verified_source:
                         digest = hashlib.sha256()
+                        snapshot_chunk_digests: list[bytes] = []
                         try:
                             for chunk in iter(
                                 lambda: source.read(1024 * 1024),
                                 b"",
                             ):
                                 digest.update(chunk)
+                                snapshot_chunk_digests.append(
+                                    hashlib.sha256(chunk).digest()
+                                )
                                 verified_source.write(chunk)
                             verified_source.flush()
                         except OSError:
@@ -710,11 +714,33 @@ def build_review_server(
                                 os.dup(response_descriptor),
                                 "rb",
                             ) as response_source:
+                                streamed_chunks = 0
                                 for chunk in iter(
                                     lambda: response_source.read(1024 * 1024),
                                     b"",
                                 ):
+                                    if sealed_source_fd is None:
+                                        if (
+                                            streamed_chunks
+                                            >= len(snapshot_chunk_digests)
+                                            or not secrets.compare_digest(
+                                                hashlib.sha256(chunk).digest(),
+                                                snapshot_chunk_digests[
+                                                    streamed_chunks
+                                                ],
+                                            )
+                                        ):
+                                            self.close_connection = True
+                                            return
                                     self.wfile.write(chunk)
+                                    streamed_chunks += 1
+                                if (
+                                    sealed_source_fd is None
+                                    and streamed_chunks
+                                    != len(snapshot_chunk_digests)
+                                ):
+                                    self.close_connection = True
+                                    return
                         finally:
                             if sealed_source_fd is not None:
                                 os.close(sealed_source_fd)

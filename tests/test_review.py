@@ -1220,6 +1220,71 @@ def test_review_server_streams_source_above_sealed_snapshot_budget(
     assert body == original_bytes
 
 
+def test_review_server_never_serves_mutated_large_disk_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-large-snapshot-proc-race"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "large-snapshot-proc-race",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    assert original_bytes
+    monkeypatch.setattr(
+        review_module,
+        "MAX_REVIEW_SOURCE_SNAPSHOT_BYTES",
+        1,
+        raising=False,
+    )
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    original_dup = os.dup
+    mutated = False
+    mutated_payload = b"X" * len(original_bytes)
+
+    def mutate_snapshot_before_stream(descriptor: int) -> int:
+        nonlocal mutated
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if (
+            not mutated
+            and target.startswith(str(paths.root))
+            and target.endswith(" (deleted)")
+        ):
+            mutated = True
+            with open(
+                f"/proc/self/fd/{descriptor}",
+                "r+b",
+                buffering=0,
+            ) as handle:
+                handle.seek(0)
+                handle.write(mutated_payload)
+                handle.flush()
+        return original_dup(descriptor)
+
+    monkeypatch.setattr("digitalisierer.review.os.dup", mutate_snapshot_before_stream)
+    try:
+        response = _get_review_path(review_server, f"/source/{asset_id}")
+    finally:
+        review_server.server.server_close()
+
+    assert mutated is True
+    assert b" 200 " in response.splitlines()[0]
+    _, body = response.split(b"\r\n\r\n", 1)
+    assert body == original_bytes or len(body) < len(original_bytes)
+
+
 def test_review_server_serializes_sealed_source_snapshots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
