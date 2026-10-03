@@ -2196,6 +2196,64 @@ def test_finalize_rejects_pdf_builder_without_provenance(tmp_path: Path) -> None
     assert list(paths.exports.iterdir()) == []
 
 
+def test_finalize_binds_verified_master_pdf_through_ocr(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-master-ocr-rebind"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "master-ocr-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    rebound = False
+
+    class _MasterRebindingOcr:
+        name = "master-rebinding-ocr"
+
+        def version(self) -> str:
+            return "test"
+
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            nonlocal rebound
+            assert language == "deu"
+            visible_master = output_pdf.parent / "master.pdf"
+            held_master = output_pdf.parent / ".master-ocr-held.pdf"
+            original_bytes = visible_master.read_bytes()
+            os.replace(visible_master, held_master)
+            visible_master.write_bytes(b"foreign-master-during-ocr")
+            rebound = True
+            try:
+                bound_bytes = master_pdf.read_bytes()
+            finally:
+                visible_master.unlink()
+                os.replace(held_master, visible_master)
+            assert visible_master.read_bytes() == original_bytes
+            output_pdf.write_bytes(bound_bytes + b"-ocr")
+            sidecar_txt.write_text("recognized", encoding="utf-8")
+
+    exported = finalize_scan_session(
+        paths,
+        _MasterRebindingOcr(),
+        pdf_builder=_fake_pdf,
+    )
+
+    assert rebound is True
+    master_bytes = (exported.export_dir / "master.pdf").read_bytes()
+    assert (exported.export_dir / "searchable.pdf").read_bytes() == (
+        master_bytes + b"-ocr"
+    )
+
+
 def test_finalize_export_identity_includes_ocr_provenance(tmp_path: Path) -> None:
     capture = tmp_path / "capture-ocr-identity"
     capture.mkdir()

@@ -4079,12 +4079,73 @@ def finalize_scan_session(
             master,
             purpose="master PDF output",
         )
-        ocr_backend.searchable_pdf(
-            master,
-            searchable,
-            text_file,
-            language=language,
-        )
+        try:
+            master_descriptor = os.open(
+                master,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                "master PDF cannot be bound safely for OCR"
+            ) from exc
+        try:
+            master_before = os.fstat(master_descriptor)
+            if (
+                not stat.S_ISREG(master_before.st_mode)
+                or _stat_identity(master_before) != master_identity
+                or not secrets.compare_digest(
+                    _descriptor_sha256(master_descriptor),
+                    master_sha256,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "master PDF changed before OCR"
+                )
+            try:
+                master_current = master.lstat()
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    "master PDF changed before OCR"
+                ) from exc
+            if (
+                not stat.S_ISREG(master_current.st_mode)
+                or _stat_identity(master_current) != master_identity
+            ):
+                raise ScannerWorkflowError(
+                    "master PDF changed before OCR"
+                )
+
+            bound_master = Path(
+                f"/proc/{os.getpid()}/fd/{master_descriptor}"
+            )
+            ocr_backend.searchable_pdf(
+                bound_master,
+                searchable,
+                text_file,
+                language=language,
+            )
+
+            master_after = os.fstat(master_descriptor)
+            try:
+                master_current = master.lstat()
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    "master PDF changed during OCR"
+                ) from exc
+            if (
+                _stat_identity(master_after) != master_identity
+                or not stat.S_ISREG(master_current.st_mode)
+                or _stat_identity(master_current) != master_identity
+                or not secrets.compare_digest(
+                    _descriptor_sha256(master_descriptor),
+                    master_sha256,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "master PDF changed during OCR"
+                )
+        finally:
+            os.close(master_descriptor)
         searchable_sha256, searchable_identity = _regular_file_snapshot(
             searchable,
             purpose="searchable PDF output",
