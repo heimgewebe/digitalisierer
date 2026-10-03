@@ -1451,6 +1451,76 @@ def test_observe_findings_failure_does_not_publish_session(
         review_after_retry["items"]
     )
 
+def test_observe_rejects_transient_session_rewrite_with_restored_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-transient-session-rewrite"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "transient-session-rewrite",
+        tmp_path / "library",
+    )
+    original_bytes = paths.session_file.read_bytes()
+    original_stat = paths.session_file.stat()
+    transient = json.loads(original_bytes.decode("utf-8"))
+    transient["capture_observations"] = [
+        {
+            "source_folder": "transient",
+            "selected_start": 1,
+            "selected_count": 0,
+            "selected_names": [],
+            "imported_asset_ids": [],
+            "skipped_asset_ids": [],
+        }
+    ]
+    transient_bytes = scanner_module._json_text(transient).encode("utf-8")
+    original_load_json = scanner_module._load_json
+    injected = False
+    ctime_changed = False
+
+    def load_transient_once(path: Path) -> dict[str, object]:
+        nonlocal injected, ctime_changed
+        if path == paths.session_file and not injected:
+            path.write_bytes(transient_bytes)
+            os.utime(
+                path,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            loaded = original_load_json(path)
+            path.write_bytes(original_bytes)
+            os.utime(
+                path,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            current_stat = path.stat()
+            ctime_changed = current_stat.st_ctime_ns != original_stat.st_ctime_ns
+            injected = True
+            return loaded
+        return original_load_json(path)
+
+    monkeypatch.setattr(scanner_module, "_load_json", load_transient_once)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scan session changed while being snapshotted",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert injected is True
+    assert ctime_changed is True
+    assert paths.session_file.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert paths.session_file.read_bytes() == original_bytes
+    assert list(paths.sources.iterdir()) == []
+    assert list(paths.thumbnails.iterdir()) == []
+
+    monkeypatch.setattr(scanner_module, "_load_json", original_load_json)
+    resumed = observe_scan_folder(paths, capture)
+    assert len(resumed.imported_asset_ids) == 1
+
+
 def test_observe_session_commit_failure_restores_previous_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -3579,6 +3579,16 @@ def _observe_scan_folder_unlocked(
         raise ScannerWorkflowError(
             "scan metadata cannot be snapshotted before observation"
         ) from exc
+    try:
+        snapshotted_session = json.loads(previous_session_text)
+    except json.JSONDecodeError as exc:
+        raise ScannerWorkflowError(
+            "scan metadata cannot be snapshotted before observation"
+        ) from exc
+    if not isinstance(snapshotted_session, dict) or snapshotted_session != session:
+        raise ScannerWorkflowError(
+            "scan session changed while being snapshotted"
+        )
     review_items = review.get("items")
     if not isinstance(review_items, dict):
         raise ScannerWorkflowError("scan review items must be an object")
