@@ -3178,6 +3178,89 @@ def test_observe_resume_recovers_interrupted_preserved_source_repair(
     assert not list(paths.sources.glob(".*.repair-intent.json"))
 
 
+
+def test_observe_resume_recovers_interrupted_preserved_source_cleanup_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-repair-cleanup-crash"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-cleanup-crash",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    source_bytes = source.read_bytes()
+    preserved.write_bytes(b"corrupted-preserved-source")
+
+    original_claim = scanner_module._claim_owned_regular_file
+    crashed = False
+
+    def crash_after_cleanup_claim(
+        path: Path,
+        expected_sha256: str,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        marker: str,
+        claimed_path: Path | None = None,
+    ) -> Path | None:
+        nonlocal crashed
+        owned = original_claim(
+            path,
+            expected_sha256,
+            expected_identity,
+            marker=marker,
+            claimed_path=claimed_path,
+        )
+        if (
+            not crashed
+            and marker == "cleanup-claim"
+            and path.name.endswith(".repair-preimage")
+            and owned is not None
+        ):
+            crashed = True
+            raise SystemExit("synthetic crash after preserved-source cleanup claim")
+        return owned
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        crash_after_cleanup_claim,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash after preserved-source cleanup claim",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    assert preserved.read_bytes() == source_bytes
+    assert list(paths.sources.glob("*.cleanup-claim"))
+    assert list(paths.sources.glob(".*.repair-intent.json"))
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_claim_owned_regular_file",
+        original_claim,
+    )
+    scanner_module.load_processing_session(paths)
+
+    assert preserved.read_bytes() == source_bytes
+    assert not list(paths.sources.glob("*.cleanup-claim"))
+    assert not list(paths.sources.glob(".*.repair-preimage"))
+    assert not list(paths.sources.glob(".*.repair-intent.json"))
+
+    resumed = observe_scan_folder(paths, capture)
+    assert resumed.imported_asset_ids == ()
+
+
+
 def test_observe_resume_repair_rejects_preserved_symlink_swap_before_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1587,35 +1587,49 @@ def _recover_interrupted_preserved_repairs(paths: ScanSessionPaths) -> None:
             preimage_identity,
             purpose="claimed preserved source repair preimage",
         )
+        descendant_claims = [
+            candidate
+            for candidate in paths.sources.iterdir()
+            if candidate != preimage_path
+            and preimage_path.name in candidate.name
+            and (
+                candidate.name.endswith(".cleanup-claim")
+                or candidate.name.endswith(".restore-claim")
+            )
+            and exact_state(
+                candidate,
+                preimage_sha256,
+                preimage_identity,
+                purpose="descendant preserved source repair claim",
+            )
+        ]
+        if claimed_preimage and descendant_claims:
+            raise ScannerWorkflowError(
+                "preserved source repair claim state is ambiguous"
+            )
+        if len(descendant_claims) > 1:
+            raise ScannerWorkflowError(
+                "multiple preserved source repair claims exist"
+            )
+        recovery_claim = descendant_claims[0] if descendant_claims else None
+        preimage_holder = preimage_path if claimed_preimage else recovery_claim
 
         if canonical_replacement:
-            if claimed_preimage:
-                if not _remove_created_artifact(
-                    _CreatedArtifactState(
-                        path=target,
-                        sha256=expected_sha256,
-                        identity=replacement_identity,
-                    )
-                ):
-                    raise ScannerWorkflowError(
-                        "failed to roll back interrupted preserved source replacement"
-                    )
-                if not _restore_owned_claim(
-                    preimage_path,
-                    preimage_sha256,
-                    preimage_identity,
-                    target,
-                ):
-                    raise ScannerWorkflowError(
-                        "failed to restore interrupted preserved source preimage"
-                    )
+            if preimage_holder is not None and not _remove_owned_claim(
+                preimage_holder,
+                preimage_sha256,
+                preimage_identity,
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean committed preserved source preimage"
+                )
             elif os.path.lexists(preimage_path):
                 raise ScannerWorkflowError(
                     "preserved source repair preimage changed during recovery"
                 )
         elif canonical_preimage:
-            if claimed_preimage and not _remove_owned_claim(
-                preimage_path,
+            if preimage_holder is not None and not _remove_owned_claim(
+                preimage_holder,
                 preimage_sha256,
                 preimage_identity,
             ):
@@ -1623,12 +1637,12 @@ def _recover_interrupted_preserved_repairs(paths: ScanSessionPaths) -> None:
                     "failed to clean duplicate preserved source preimage"
                 )
         elif not os.path.lexists(target):
-            if not claimed_preimage:
+            if preimage_holder is None:
                 raise ScannerWorkflowError(
                     "preserved source repair preimage is missing during recovery"
                 )
             if not _restore_owned_claim(
-                preimage_path,
+                preimage_holder,
                 preimage_sha256,
                 preimage_identity,
                 target,
