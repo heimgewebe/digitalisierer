@@ -973,12 +973,38 @@ def _cleanup_generated_file(generated: _GeneratedFile) -> None:
         return
     if _stat_identity(before) != _stat_identity(after):
         return
-    _remove_created_artifact(
-        _CreatedArtifactState(
-            path=generated.fallback_path,
-            sha256=digest,
-            identity=_stat_identity(after),
-        )
+    state = _CreatedArtifactState(
+        path=generated.fallback_path,
+        sha256=digest,
+        identity=_stat_identity(after),
+    )
+    if _remove_created_artifact(state):
+        return
+
+    # A failed claim/removal is safe to ignore only when the visible fallback
+    # name no longer refers to the inode that this still-open descriptor owns.
+    # Otherwise surface the cleanup failure instead of silently leaking a
+    # potentially source-sized partial file.
+    try:
+        current = generated.fallback_path.lstat()
+    except FileNotFoundError as exc:
+        raise ScannerWorkflowError(
+            f"failed to verify generated fallback cleanup: "
+            f"{generated.fallback_path.name}"
+        ) from exc
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"failed to inspect generated fallback after cleanup: "
+            f"{generated.fallback_path.name}"
+        ) from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != after.st_dev
+        or current.st_ino != after.st_ino
+    ):
+        return
+    raise ScannerWorkflowError(
+        f"failed to clean generated fallback: {generated.fallback_path.name}"
     )
 
 

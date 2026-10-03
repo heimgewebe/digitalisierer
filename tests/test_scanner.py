@@ -1677,6 +1677,87 @@ def test_generated_file_fallback_cleanup_before_state_is_available(
         assert not target.exists()
 
 
+@pytest.mark.parametrize("artifact_kind", ["source", "thumbnail", "replace"])
+def test_generated_file_fallback_cleanup_failure_is_surfaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / f"generated-fallback-cleanup-failure-{artifact_kind}"
+    output_dir.mkdir()
+    target = output_dir / (
+        "thumb.jpg" if artifact_kind == "thumbnail" else "source.jpg"
+    )
+    sha256, source_stat = scanner_module._stable_hash(source)
+    original_target = b"stale-preserved-copy"
+    cleanup_attempted = False
+
+    if artifact_kind == "replace":
+        target.write_bytes(original_target)
+
+    _force_generated_file_fallback(monkeypatch)
+
+    def fail_before_state(
+        descriptor: int,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        raise ScannerWorkflowError(
+            f"synthetic generated-state failure before return: {purpose}"
+        )
+
+    def refuse_owned_cleanup(
+        state: scanner_module._CreatedArtifactState,
+    ) -> bool:
+        nonlocal cleanup_attempted
+        cleanup_attempted = True
+        current = state.path.lstat()
+        assert current.st_dev == state.identity[0]
+        assert current.st_ino == state.identity[1]
+        return False
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_generated_file_state",
+        fail_before_state,
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "_remove_created_artifact",
+        refuse_owned_cleanup,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="failed to clean generated fallback",
+    ):
+        if artifact_kind == "source":
+            scanner_module._copy_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+        elif artifact_kind == "replace":
+            scanner_module._replace_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+        else:
+            scanner_module._write_thumbnail(source, target)
+
+    assert cleanup_attempted is True
+    assert len(list(output_dir.glob(".*.tmp"))) == 1
+    if artifact_kind == "replace":
+        assert target.read_bytes() == original_target
+    else:
+        assert not target.exists()
+
+
 def test_generated_file_fallback_without_otmpfile_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
