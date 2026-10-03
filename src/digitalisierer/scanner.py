@@ -1188,6 +1188,85 @@ def _descriptor_sha256(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+def _sealed_memfd_snapshot(
+    source_descriptor: int,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    name: str,
+    purpose: str,
+) -> int:
+    try:
+        descriptor = os.memfd_create(
+            name,
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+    except (AttributeError, OSError) as exc:
+        raise ScannerWorkflowError(
+            f"{purpose} requires Linux sealed memfd support"
+        ) from exc
+
+    try:
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        copied = 0
+        with (
+            os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
+            os.fdopen(os.dup(descriptor), "wb") as target_handle,
+        ):
+            for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                copied += len(chunk)
+                target_handle.write(chunk)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+
+        if (
+            copied != expected_size
+            or not secrets.compare_digest(
+                digest.hexdigest(),
+                expected_sha256,
+            )
+        ):
+            raise ScannerWorkflowError(
+                f"{purpose} changed while creating sealed snapshot"
+            )
+
+        os.fchmod(descriptor, 0o400)
+        before_seal = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before_seal.st_mode)
+            or before_seal.st_size != expected_size
+        ):
+            raise ScannerWorkflowError(
+                f"{purpose} sealed snapshot is invalid"
+            )
+
+        required_seals = (
+            fcntl.F_SEAL_WRITE
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_SEAL
+        )
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required_seals)
+        applied_seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        if applied_seals & required_seals != required_seals:
+            raise ScannerWorkflowError(
+                f"{purpose} sealed snapshot is not immutable"
+            )
+        if not secrets.compare_digest(
+            _descriptor_sha256(descriptor),
+            expected_sha256,
+        ):
+            raise ScannerWorkflowError(
+                f"{purpose} sealed snapshot digest mismatch"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _restore_claimed_file(claimed: Path, destination: Path) -> bool:
     try:
         claimed_before = claimed.lstat()
@@ -3375,110 +3454,85 @@ def _verify_preserved_sources(
 @contextmanager
 def _verified_export_source_snapshots(
     active: list[MediaAsset],
-    staging: Path,
 ) -> Iterator[list[Path]]:
     bound_paths: list[Path] = []
     bound_descriptors: list[int] = []
-    with tempfile.TemporaryDirectory(
-        prefix=".verified-export-sources.",
-        dir=staging,
-    ) as snapshot_dir_name:
-        snapshot_dir = Path(snapshot_dir_name)
-        try:
-            for index, asset in enumerate(active):
-                expected_sha256 = asset.sha256
-                if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+    try:
+        for index, asset in enumerate(active):
+            expected_sha256 = asset.sha256
+            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+                raise ScannerWorkflowError(
+                    f"scanner source digest is invalid for export: {asset.asset_id}"
+                )
+            try:
+                source_fd = os.open(
+                    asset.path,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                )
+            except OSError as exc:
+                raise ScannerWorkflowError(
+                    f"preserved scanner source cannot be snapshotted: {asset.asset_id}"
+                ) from exc
+
+            sealed_fd = -1
+            try:
+                before = os.fstat(source_fd)
+                if not stat.S_ISREG(before.st_mode):
                     raise ScannerWorkflowError(
-                        f"scanner source digest is invalid for export: {asset.asset_id}"
+                        f"preserved scanner source is not regular: {asset.asset_id}"
                     )
                 try:
-                    source_fd = os.open(
-                        asset.path,
-                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-                    )
+                    current = asset.path.lstat()
                 except OSError as exc:
                     raise ScannerWorkflowError(
-                        f"preserved scanner source cannot be snapshotted: {asset.asset_id}"
+                        f"preserved scanner source changed before snapshotting: {asset.asset_id}"
                     ) from exc
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or _stat_identity(current) != _stat_identity(before)
+                ):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed before snapshotting: {asset.asset_id}"
+                    )
 
-                suffix = asset.path.suffix or ".bin"
-                snapshot_path = snapshot_dir / f"{index:06d}{suffix}"
-                snapshot_fd = -1
+                sealed_fd = _sealed_memfd_snapshot(
+                    source_fd,
+                    expected_sha256=expected_sha256,
+                    expected_size=before.st_size,
+                    name=f"digitalisierer-source-{index:06d}",
+                    purpose=f"preserved scanner source {asset.asset_id}",
+                )
+
+                after = os.fstat(source_fd)
                 try:
-                    snapshot_fd = os.open(
-                        snapshot_path,
-                        os.O_RDWR
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | os.O_CLOEXEC
-                        | os.O_NOFOLLOW,
-                        0o400,
+                    current = asset.path.lstat()
+                except OSError as exc:
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {asset.asset_id}"
+                    ) from exc
+                if (
+                    _stat_identity(before) != _stat_identity(after)
+                    or not stat.S_ISREG(current.st_mode)
+                    or _stat_identity(current) != _stat_identity(after)
+                ):
+                    raise ScannerWorkflowError(
+                        f"preserved scanner source changed while snapshotting: {asset.asset_id}"
                     )
-                    before = os.fstat(source_fd)
-                    if not stat.S_ISREG(before.st_mode):
-                        raise ScannerWorkflowError(
-                            f"preserved scanner source is not regular: {asset.asset_id}"
-                        )
 
-                    digest = hashlib.sha256()
-                    with (
-                        os.fdopen(os.dup(source_fd), "rb") as source_handle,
-                        os.fdopen(os.dup(snapshot_fd), "wb") as snapshot_handle,
-                    ):
-                        for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                            snapshot_handle.write(chunk)
-                        snapshot_handle.flush()
-                        os.fsync(snapshot_handle.fileno())
+                bound_descriptors.append(sealed_fd)
+                bound_paths.append(
+                    Path(f"/proc/{os.getpid()}/fd/{sealed_fd}")
+                )
+                sealed_fd = -1
+            finally:
+                if sealed_fd >= 0:
+                    os.close(sealed_fd)
+                os.close(source_fd)
 
-                    after = os.fstat(source_fd)
-                    try:
-                        current = asset.path.lstat()
-                        snapshot_current = snapshot_path.lstat()
-                    except OSError as exc:
-                        raise ScannerWorkflowError(
-                            f"preserved scanner source changed while snapshotting: {asset.asset_id}"
-                        ) from exc
-                    snapshot_stat = os.fstat(snapshot_fd)
-                    if (
-                        _stat_identity(before) != _stat_identity(after)
-                        or not stat.S_ISREG(current.st_mode)
-                        or current.st_dev != after.st_dev
-                        or current.st_ino != after.st_ino
-                        or _stat_identity(current) != _stat_identity(after)
-                        or not stat.S_ISREG(snapshot_stat.st_mode)
-                        or not stat.S_ISREG(snapshot_current.st_mode)
-                        or snapshot_stat.st_dev != snapshot_current.st_dev
-                        or snapshot_stat.st_ino != snapshot_current.st_ino
-                        or snapshot_stat.st_size != after.st_size
-                        or stat.S_IMODE(snapshot_stat.st_mode) != 0o400
-                        or not secrets.compare_digest(
-                            digest.hexdigest(),
-                            expected_sha256,
-                        )
-                    ):
-                        raise ScannerWorkflowError(
-                            f"preserved scanner source changed while snapshotting: {asset.asset_id}"
-                        )
-
-                    # Keep the exact verified inode open throughout PDF derivation.
-                    # A parent-PID proc-fd path remains readable by subprocess
-                    # builders while a same-user rebind of snapshot_path cannot
-                    # redirect the bytes seen by the builder.
-                    bound_descriptors.append(snapshot_fd)
-                    bound_paths.append(
-                        Path(f"/proc/{os.getpid()}/fd/{snapshot_fd}")
-                    )
-                    snapshot_fd = -1
-                finally:
-                    if snapshot_fd >= 0:
-                        os.close(snapshot_fd)
-                    os.close(source_fd)
-
-            yield bound_paths
-        finally:
-            for descriptor in reversed(bound_descriptors):
-                os.close(descriptor)
+        yield bound_paths
+    finally:
+        for descriptor in reversed(bound_descriptors):
+            os.close(descriptor)
 
 
 class _Img2PdfBuilder:
@@ -4073,7 +4127,7 @@ def finalize_scan_session(
         report = staging / "report.txt"
         manifest_path = staging / "manifest.json"
 
-        with _verified_export_source_snapshots(active, staging) as export_sources:
+        with _verified_export_source_snapshots(active) as export_sources:
             pdf_builder(export_sources, master)
         master_sha256, master_identity = _regular_file_snapshot(
             master,
@@ -4088,41 +4142,36 @@ def finalize_scan_session(
             raise ScannerWorkflowError(
                 "master PDF cannot be bound safely for OCR"
             ) from exc
+        sealed_master_descriptor = -1
         try:
             master_before = os.fstat(master_descriptor)
             if (
                 not stat.S_ISREG(master_before.st_mode)
                 or _stat_identity(master_before) != master_identity
-                or not secrets.compare_digest(
-                    _descriptor_sha256(master_descriptor),
-                    master_sha256,
-                )
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR"
+                    "master PDF changed before OCR snapshot"
                 )
             try:
                 master_current = master.lstat()
             except OSError as exc:
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR"
+                    "master PDF changed before OCR snapshot"
                 ) from exc
             if (
                 not stat.S_ISREG(master_current.st_mode)
                 or _stat_identity(master_current) != master_identity
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed before OCR"
+                    "master PDF changed before OCR snapshot"
                 )
 
-            bound_master = Path(
-                f"/proc/{os.getpid()}/fd/{master_descriptor}"
-            )
-            ocr_backend.searchable_pdf(
-                bound_master,
-                searchable,
-                text_file,
-                language=language,
+            sealed_master_descriptor = _sealed_memfd_snapshot(
+                master_descriptor,
+                expected_sha256=master_sha256,
+                expected_size=master_before.st_size,
+                name="digitalisierer-master-pdf",
+                purpose="master PDF",
             )
 
             master_after = os.fstat(master_descriptor)
@@ -4130,22 +4179,32 @@ def finalize_scan_session(
                 master_current = master.lstat()
             except OSError as exc:
                 raise ScannerWorkflowError(
-                    "master PDF changed during OCR"
+                    "master PDF changed while creating OCR snapshot"
                 ) from exc
             if (
                 _stat_identity(master_after) != master_identity
                 or not stat.S_ISREG(master_current.st_mode)
                 or _stat_identity(master_current) != master_identity
-                or not secrets.compare_digest(
-                    _descriptor_sha256(master_descriptor),
-                    master_sha256,
-                )
             ):
                 raise ScannerWorkflowError(
-                    "master PDF changed during OCR"
+                    "master PDF changed while creating OCR snapshot"
                 )
         finally:
             os.close(master_descriptor)
+
+        try:
+            bound_master = Path(
+                f"/proc/{os.getpid()}/fd/{sealed_master_descriptor}"
+            )
+            ocr_backend.searchable_pdf(
+                bound_master,
+                searchable,
+                text_file,
+                language=language,
+            )
+        finally:
+            if sealed_master_descriptor >= 0:
+                os.close(sealed_master_descriptor)
         searchable_sha256, searchable_identity = _regular_file_snapshot(
             searchable,
             purpose="searchable PDF output",

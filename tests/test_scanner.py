@@ -2007,49 +2007,44 @@ def test_finalize_uses_verified_snapshot_during_transient_source_rewrite(
 
 
 
-def test_finalize_export_snapshot_stays_bound_when_directory_entry_is_rebound(
+def test_finalize_export_snapshot_has_no_mutable_directory_entry(
     tmp_path: Path,
 ) -> None:
-    capture = tmp_path / "capture-finalize-export-snapshot-rebind"
+    capture = tmp_path / "capture-finalize-export-sealed-snapshot"
     capture.mkdir()
     source = capture / "image00001.jpg"
     _image(source, 100)
-    replacement = tmp_path / "snapshot-replacement.jpg"
-    _image(replacement, 210)
     paths = create_or_resume_scan_session(
         "book",
-        "finalize-export-snapshot-rebind",
+        "finalize-export-sealed-snapshot",
         tmp_path / "library",
     )
     observe_scan_folder(paths, capture)
     session = json.loads(paths.session_file.read_text(encoding="utf-8"))
     preserved = paths.root / session["assets"][0]["preserved_path"]
     original_bytes = preserved.read_bytes()
-    replacement_bytes = replacement.read_bytes()
     expected_digest = hashlib.sha256(original_bytes).digest()
-    rebound = False
+    saw_sealed_memfd = False
 
-    class _SnapshotRebindingPdf:
-        name = "snapshot-rebinding-pdf"
+    class _SealedSnapshotPdf:
+        name = "sealed-snapshot-pdf"
 
         def version(self) -> str:
             return "test"
 
         def __call__(self, images: list[Path], output: Path) -> None:
-            nonlocal rebound
+            nonlocal saw_sealed_memfd
             assert len(images) == 1
-            snapshot_dirs = [
+            assert not [
                 entry
                 for entry in output.parent.iterdir()
                 if entry.is_dir()
                 and entry.name.startswith(".verified-export-sources.")
             ]
-            assert len(snapshot_dirs) == 1
-            visible_entries = list(snapshot_dirs[0].iterdir())
-            assert len(visible_entries) == 1
-            visible_entries[0].unlink()
-            visible_entries[0].write_bytes(replacement_bytes)
-            rebound = True
+            assert str(images[0]).startswith(f"/proc/{os.getpid()}/fd/")
+            link_target = os.readlink(images[0])
+            assert "memfd:digitalisierer-source-" in link_target
+            saw_sealed_memfd = True
             output.write_bytes(
                 b"PDF:" + hashlib.sha256(images[0].read_bytes()).digest()
             )
@@ -2057,10 +2052,85 @@ def test_finalize_export_snapshot_stays_bound_when_directory_entry_is_rebound(
     exported = finalize_scan_session(
         paths,
         _FakeOcr(),
-        pdf_builder=_SnapshotRebindingPdf(),
+        pdf_builder=_SealedSnapshotPdf(),
     )
 
-    assert rebound is True
+    assert saw_sealed_memfd is True
+    assert preserved.read_bytes() == original_bytes
+    assert (exported.export_dir / "master.pdf").read_bytes() == (
+        b"PDF:" + expected_digest
+    )
+
+
+
+def test_finalize_export_snapshot_bytes_are_immutable_during_pdf_build(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-finalize-export-snapshot-inplace"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    _image(source, 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "finalize-export-snapshot-inplace",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    expected_digest = hashlib.sha256(original_bytes).digest()
+    mutation_succeeded = False
+
+    class _SnapshotInPlacePdf:
+        name = "snapshot-inplace-pdf"
+
+        def version(self) -> str:
+            return "test"
+
+        def __call__(self, images: list[Path], output: Path) -> None:
+            nonlocal mutation_succeeded
+            assert len(images) == 1
+            bound = images[0]
+            original = bound.read_bytes()
+            original_stat = bound.stat()
+            foreign = bytes((byte ^ 0xFF) for byte in original)
+            observed = original
+            os.chmod(bound, 0o600)
+            try:
+                try:
+                    with bound.open("r+b", buffering=0) as handle:
+                        handle.seek(0)
+                        handle.write(foreign)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    mutation_succeeded = True
+                    observed = bound.read_bytes()
+                except OSError:
+                    observed = bound.read_bytes()
+            finally:
+                if mutation_succeeded:
+                    with bound.open("r+b", buffering=0) as handle:
+                        handle.seek(0)
+                        handle.write(original)
+                        handle.truncate(len(original))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        bound,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+                os.chmod(bound, original_stat.st_mode & 0o777)
+            output.write_bytes(
+                b"PDF:" + hashlib.sha256(observed).digest()
+            )
+
+    exported = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_SnapshotInPlacePdf(),
+    )
+
     assert preserved.read_bytes() == original_bytes
     assert (exported.export_dir / "master.pdf").read_bytes() == (
         b"PDF:" + expected_digest
@@ -2248,6 +2318,80 @@ def test_finalize_binds_verified_master_pdf_through_ocr(
     )
 
     assert rebound is True
+    master_bytes = (exported.export_dir / "master.pdf").read_bytes()
+    assert (exported.export_dir / "searchable.pdf").read_bytes() == (
+        master_bytes + b"-ocr"
+    )
+
+
+def test_finalize_master_bytes_are_immutable_during_ocr(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-master-ocr-inplace"
+    capture.mkdir()
+    _image(capture / "image00001.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "master-ocr-inplace",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    mutation_succeeded = False
+
+    class _MasterInPlaceOcr:
+        name = "master-inplace-ocr"
+
+        def version(self) -> str:
+            return "test"
+
+        def searchable_pdf(
+            self,
+            master_pdf: Path,
+            output_pdf: Path,
+            sidecar_txt: Path,
+            *,
+            language: str,
+        ) -> None:
+            nonlocal mutation_succeeded
+            assert language == "deu"
+            original = master_pdf.read_bytes()
+            original_stat = master_pdf.stat()
+            foreign = bytes((byte ^ 0xA5) for byte in original)
+            observed = original
+            os.chmod(master_pdf, 0o600)
+            try:
+                try:
+                    with master_pdf.open("r+b", buffering=0) as handle:
+                        handle.seek(0)
+                        handle.write(foreign)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    mutation_succeeded = True
+                    observed = master_pdf.read_bytes()
+                except OSError:
+                    observed = master_pdf.read_bytes()
+            finally:
+                if mutation_succeeded:
+                    with master_pdf.open("r+b", buffering=0) as handle:
+                        handle.seek(0)
+                        handle.write(original)
+                        handle.truncate(len(original))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        master_pdf,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+                os.chmod(master_pdf, original_stat.st_mode & 0o777)
+            output_pdf.write_bytes(observed + b"-ocr")
+            sidecar_txt.write_text("recognized", encoding="utf-8")
+
+    exported = finalize_scan_session(
+        paths,
+        _MasterInPlaceOcr(),
+        pdf_builder=_fake_pdf,
+    )
+
     master_bytes = (exported.export_dir / "master.pdf").read_bytes()
     assert (exported.export_dir / "searchable.pdf").read_bytes() == (
         master_bytes + b"-ocr"
