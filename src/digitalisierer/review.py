@@ -12,6 +12,7 @@ import secrets
 import socket
 import stat
 import tempfile
+from threading import BoundedSemaphore
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -27,6 +28,7 @@ from .scanner import (
 
 
 MAX_FORM_BYTES = 16 * 1024
+MAX_REVIEW_SOURCE_SNAPSHOT_BYTES = 64 * 1024 * 1024
 
 
 class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -469,6 +471,7 @@ def build_review_server(
     if isinstance(port, bool) or not 0 <= port <= 65535:
         raise ValueError("review UI port must be between 0 and 65535")
     csrf_token = secrets.token_urlsafe(32)
+    source_snapshot_gate = BoundedSemaphore(value=1)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "DigitalisiererReview/1"
@@ -615,8 +618,14 @@ def build_review_server(
                     self.wfile.write(payload)
                     return
 
+                if before.st_size > MAX_REVIEW_SOURCE_SNAPSHOT_BYTES:
+                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
                 try:
-                    verified_source = tempfile.TemporaryFile(mode="w+b")
+                    verified_source = tempfile.TemporaryFile(
+                        mode="w+b",
+                        dir=paths.root,
+                    )
                 except OSError:
                     self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
@@ -667,32 +676,44 @@ def build_review_server(
                     ):
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    try:
-                        sealed_source_fd = _sealed_memfd_snapshot(
-                            verified_source.fileno(),
-                            expected_sha256=expected_sha256,
-                            expected_size=after.st_size,
-                            name="digitalisierer-review-source",
-                            purpose="review source",
+                    if not source_snapshot_gate.acquire(blocking=False):
+                        self.send_error(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            "another full-resolution source response is active",
                         )
-                    except (OSError, ScannerWorkflowError):
-                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
                     try:
-                        os.lseek(sealed_source_fd, 0, os.SEEK_SET)
-                        self._headers(
-                            HTTPStatus.OK,
-                            content_type=content_type,
-                            content_length=after.st_size,
-                        )
-                        with os.fdopen(os.dup(sealed_source_fd), "rb") as sealed_source:
-                            for chunk in iter(
-                                lambda: sealed_source.read(1024 * 1024),
-                                b"",
-                            ):
-                                self.wfile.write(chunk)
+                        try:
+                            sealed_source_fd = _sealed_memfd_snapshot(
+                                verified_source.fileno(),
+                                expected_sha256=expected_sha256,
+                                expected_size=after.st_size,
+                                name="digitalisierer-review-source",
+                                purpose="review source",
+                            )
+                        except (OSError, ScannerWorkflowError):
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+                        try:
+                            os.lseek(sealed_source_fd, 0, os.SEEK_SET)
+                            self._headers(
+                                HTTPStatus.OK,
+                                content_type=content_type,
+                                content_length=after.st_size,
+                            )
+                            with os.fdopen(
+                                os.dup(sealed_source_fd),
+                                "rb",
+                            ) as sealed_source:
+                                for chunk in iter(
+                                    lambda: sealed_source.read(1024 * 1024),
+                                    b"",
+                                ):
+                                    self.wfile.write(chunk)
+                        finally:
+                            os.close(sealed_source_fd)
                     finally:
-                        os.close(sealed_source_fd)
+                        source_snapshot_gate.release()
             return
 
         def do_POST(self) -> None:  # noqa: N802

@@ -3,7 +3,7 @@ from html.parser import HTMLParser
 from http import HTTPStatus
 import json
 import os
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 from pathlib import Path
 import socket
@@ -1176,6 +1176,96 @@ def test_review_server_streams_verified_source_snapshot_after_in_place_race(
     _, body = response.split(b"\r\n\r\n", 1)
     assert body == original_bytes
     assert body != preserved.read_bytes()
+
+
+def test_review_server_rejects_source_above_sealed_snapshot_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "source-over-snapshot-budget"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "source-over-snapshot-budget",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    monkeypatch.setattr(
+        review_module,
+        "MAX_REVIEW_SOURCE_SNAPSHOT_BYTES",
+        preserved.stat().st_size - 1,
+        raising=False,
+    )
+
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        response = _get_review_path(review_server, f"/source/{asset_id}")
+    finally:
+        review_server.server.server_close()
+
+    assert b" 413 " in response.splitlines()[0]
+
+
+def test_review_server_serializes_sealed_source_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "source-single-sealed-snapshot"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "source-single-sealed-snapshot",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+
+    original_snapshot: Any = getattr(review_module, "_sealed_memfd_snapshot")
+    first_snapshot_ready = Event()
+    release_first_snapshot = Event()
+    snapshot_calls = 0
+
+    def blocking_snapshot(*args: Any, **kwargs: Any) -> int:
+        nonlocal snapshot_calls
+        descriptor = int(original_snapshot(*args, **kwargs))
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            first_snapshot_ready.set()
+            assert release_first_snapshot.wait(timeout=5)
+        return descriptor
+
+    monkeypatch.setattr(review_module, "_sealed_memfd_snapshot", blocking_snapshot)
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                _get_review_path,
+                review_server,
+                f"/source/{asset_id}",
+            )
+            assert first_snapshot_ready.wait(timeout=5)
+            second = executor.submit(
+                _get_review_path,
+                review_server,
+                f"/source/{asset_id}",
+            )
+            second_response = second.result(timeout=5)
+            assert b" 503 " in second_response.splitlines()[0]
+            release_first_snapshot.set()
+            first_response = first.result(timeout=5)
+    finally:
+        release_first_snapshot.set()
+        review_server.server.server_close()
+
+    assert b" 200 " in first_response.splitlines()[0]
+    assert snapshot_calls == 1
 
 
 def test_review_replacement_choices_are_materialized_once(

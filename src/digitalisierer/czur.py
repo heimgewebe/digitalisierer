@@ -639,7 +639,7 @@ class CzurCaptureBackend:
                 config_after_identity,
                 backup_identity,
             )
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             if published and published_identity is not None:
                 rollback_complete = self._rollback_published_claim(
                     claimed_preimage=claimed_preimage,
@@ -722,7 +722,7 @@ class CzurCaptureBackend:
                 os.fsync(handle.fileno())
             os.chmod(temporary, restore_mode)
             self._fsync_directory(self.config_path.parent)
-        except Exception:
+        except (Exception, KeyboardInterrupt):
             try:
                 temporary.unlink()
             except FileNotFoundError:
@@ -924,7 +924,7 @@ class CzurCaptureBackend:
                 config_after_identity,
                 backup_identity,
             ) = self._apply_curved_books_preset_transaction(backup)
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             rollback_errors = self._rollback_created_directories(
                 session_output,
                 output_existed,
@@ -942,7 +942,7 @@ class CzurCaptureBackend:
             try:
                 self._focus(windows[-1])
                 self._activate_curved_books_mode(windows[-1])
-            except Exception as exc:
+            except (Exception, KeyboardInterrupt) as exc:
                 rollback_errors = self._rollback_failed_prelaunch(
                     output_dir=session_output,
                     output_existed=output_existed,
@@ -955,12 +955,13 @@ class CzurCaptureBackend:
                     config_after=config_after,
                     config_after_identity=config_after_identity,
                 )
-                suffix = (
-                    "; rollback incomplete: " + "; ".join(rollback_errors)
-                    if rollback_errors
-                    else ""
-                )
-                raise CzurAdapterError(f"{exc}{suffix}") from exc
+                if rollback_errors:
+                    raise CzurAdapterError(
+                        f"{exc}; rollback incomplete: " + "; ".join(rollback_errors)
+                    ) from exc
+                if isinstance(exc, Exception):
+                    raise CzurAdapterError(str(exc)) from exc
+                raise
             return
 
         if not self._launcher_ready():
@@ -1030,7 +1031,7 @@ class CzurCaptureBackend:
             raise CzurAdapterError(
                 "CZUR application did not expose a visible window"
             )
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             process_errors = self._stop_launched_process(launched_process)
             if process_errors:
                 raise CzurAdapterError(
@@ -1048,12 +1049,13 @@ class CzurCaptureBackend:
                 config_after=config_after,
                 config_after_identity=config_after_identity,
             )
-            suffix = (
-                "; rollback incomplete: " + "; ".join(rollback_errors)
-                if rollback_errors
-                else ""
-            )
-            raise CzurAdapterError(f"{exc}{suffix}") from exc
+            if rollback_errors:
+                raise CzurAdapterError(
+                    f"{exc}; rollback incomplete: " + "; ".join(rollback_errors)
+                ) from exc
+            if isinstance(exc, Exception):
+                raise CzurAdapterError(str(exc)) from exc
+            raise
 
 
     def capture(self) -> None:

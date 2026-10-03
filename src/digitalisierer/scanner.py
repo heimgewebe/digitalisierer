@@ -2893,7 +2893,7 @@ def _observe_scan_folder_unlocked(
                     "thumbnail_sha256": thumbnail_sha256,
                     "image": image,
                 }
-            except Exception as exc:
+            except (Exception, KeyboardInterrupt) as exc:
                 cleanup_failed = False
                 for state in reversed(attempt_created):
                     if not _remove_created_artifact(state):
@@ -2932,7 +2932,7 @@ def _observe_scan_folder_unlocked(
         )
         review["items"] = review_items
 
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         cleanup_failed = False
         for state in reversed(created_artifacts):
             if not _remove_created_artifact(state):
@@ -3037,7 +3037,7 @@ def _observe_scan_folder_unlocked(
                 "capture folder changed while Digitalisierer observed it"
             )
         _atomic_write_text(paths.session_file, next_session_text)
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         rollback_error: Exception | None = None
 
         # Keep every artifact compatible with the forward recovery marker until
