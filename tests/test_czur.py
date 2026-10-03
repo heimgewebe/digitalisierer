@@ -2148,3 +2148,74 @@ def test_preexisting_stale_backup_gets_durable_transaction_recovery_before_claim
     assert len(recoveries) == 1
     assert recoveries[0].read_bytes() == before
     assert not config.exists()
+
+
+def test_final_preset_sync_failure_restores_canonical_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "keep",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    before = config.read_bytes()
+    before_mode = config.stat().st_mode & 0o7777
+    backup = config.with_name("config.pre-digitalisierer-curved-books.json")
+    backend = CzurCaptureBackend(config_path=config)
+    original_snapshot = backend._snapshot_regular_file
+    original_fsync_directory = backend._fsync_directory
+    claimed_snapshots = 0
+    final_preimage_verified = False
+    failed = False
+
+    def mark_final_preimage_verification(
+        path: Path,
+    ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+        nonlocal claimed_snapshots, final_preimage_verified
+        result = original_snapshot(path)
+        if (
+            path.name == "preimage"
+            and path.parent.name.startswith(".config.json.digitalisierer.claim.")
+        ):
+            claimed_snapshots += 1
+            if claimed_snapshots == 2:
+                final_preimage_verified = True
+        return result
+
+    def fail_commit_sync(directory: Path) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and final_preimage_verified
+            and directory == config.parent
+        ):
+            failed = True
+            raise OSError("synthetic final publication sync failure")
+        original_fsync_directory(directory)
+
+    monkeypatch.setattr(
+        backend,
+        "_snapshot_regular_file",
+        mark_final_preimage_verification,
+    )
+    monkeypatch.setattr(backend, "_fsync_directory", fail_commit_sync)
+
+    with pytest.raises(OSError, match="synthetic final publication sync failure"):
+        backend.apply_curved_books_preset()
+
+    assert failed is True
+    assert claimed_snapshots == 2
+    assert config.is_file()
+    assert config.read_bytes() == before
+    assert config.stat().st_mode & 0o7777 == before_mode
+    assert not backup.exists()

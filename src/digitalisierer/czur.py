@@ -662,6 +662,12 @@ class CzurCaptureBackend:
                     "CZUR config preimage changed while Curved Books preset was being applied"
                 )
 
+            # Commit the published canonical config while both recovery
+            # preimages still exist. If this sync fails, the existing exception
+            # path can restore the exact pre-preset config instead of stranding
+            # the published config under a rollback directory.
+            self._fsync_directory(self.config_path.parent)
+
             claimed_preimage.unlink()
             claimed = False
             try:
@@ -673,7 +679,6 @@ class CzurCaptureBackend:
                 guard_dir.rmdir()
             except OSError:
                 pass
-            self._fsync_directory(self.config_path.parent)
             return (
                 before,
                 config_before,
