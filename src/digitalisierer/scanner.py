@@ -663,11 +663,13 @@ def create_or_resume_scan_session(
         )
 
     # A resumed session is ready only when its individually valid metadata also
-    # forms one coherent scanner state. Only an actual crash marker needs the
-    # session lock; ordinary resume remains side-effect free here.
+    # forms one coherent scanner state. Enter the lock only for known durable
+    # recovery markers so ordinary resume remains side-effect free.
     if (
         _observation_rollback_holder(paths) is not None
         or _observation_commit_holder(paths) is not None
+        or next(paths.sources.glob(".*.repair-intent.json"), None) is not None
+        or next(paths.thumbnails.glob(".*.repair-intent.json"), None) is not None
     ):
         with _review_update_lock(paths):
             pass

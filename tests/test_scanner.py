@@ -3179,6 +3179,79 @@ def test_observe_resume_recovers_interrupted_preserved_source_repair(
 
 
 
+def test_create_or_resume_recovers_interrupted_preserved_source_repair_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-repair-init-crash"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-init-crash",
+        library,
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    source_bytes = source.read_bytes()
+    corrupted = b"corrupted-preserved-source-before-init-resume"
+    preserved.write_bytes(corrupted)
+
+    original_rename = scanner_module._rename_noreplace
+    crashed = False
+
+    def crash_after_preimage_claim(source_path: Path, target_path: Path) -> None:
+        nonlocal crashed
+        if (
+            not crashed
+            and source_path == preserved
+            and target_path.name.endswith(".repair-preimage")
+        ):
+            original_rename(source_path, target_path)
+            crashed = True
+            raise SystemExit("synthetic crash before init-resume preserved recovery")
+        original_rename(source_path, target_path)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_rename_noreplace",
+        crash_after_preimage_claim,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash before init-resume preserved recovery",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    assert not preserved.exists()
+    assert len(list(paths.sources.glob(".*.repair-preimage"))) == 1
+    assert len(list(paths.sources.glob(".*.repair-intent.json"))) == 1
+    assert not (paths.root / scanner_module.OBSERVATION_COMMIT_FILE).exists()
+    assert not (paths.root / scanner_module.OBSERVATION_ROLLBACK_FILE).exists()
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", original_rename)
+    resumed = create_or_resume_scan_session(
+        "book",
+        "resume-repair-init-crash",
+        library,
+        repairable_capture_sources=frozenset({str(source.resolve())}),
+    )
+
+    assert resumed == paths
+    assert preserved.read_bytes() == corrupted
+    assert not list(paths.sources.glob(".*.repair-preimage"))
+    assert not list(paths.sources.glob(".*.repair-intent.json"))
+
+    repaired = observe_scan_folder(resumed, capture)
+    assert repaired.imported_asset_ids == ()
+    assert preserved.read_bytes() == source_bytes
+
+
 def test_observe_resume_recovers_interrupted_preserved_source_cleanup_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3783,6 +3856,109 @@ def test_thumbnail_repair_crash_recovers_before_review_load(
     assert not list(paths.thumbnails.glob(".*.repair-intent.json"))
     assert not list(paths.thumbnails.glob(".*.rollback-preimage"))
 
+
+
+def test_create_or_resume_recovers_thumbnail_repair_intent_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "thumbnail-init-resume-crash"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    library = tmp_path / "library"
+    paths = create_or_resume_scan_session(
+        "book",
+        "thumbnail-init-resume-crash",
+        library,
+    )
+    first = observe_scan_folder(paths, capture)
+    asset_id = first.imported_asset_ids[0]
+    session_before = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    record_before = next(
+        item for item in session_before["assets"] if item["asset_id"] == asset_id
+    )
+    original_digest = record_before["thumbnail_sha256"]
+    thumbnail = paths.root / record_before["thumbnail_path"]
+    thumbnail.write_bytes(b"force-thumbnail-repair-before-init-resume")
+
+    original_writer = scanner_module._write_thumbnail
+    original_prepare = scanner_module._prepare_thumbnail_repair
+    crashed = False
+
+    def alternate_writer(source_path: Path | int, target: Path) -> object:
+        published = original_writer(source_path, target)
+        assert published is not None
+        with target.open("ab") as handle:
+            handle.write(b"-init-resume-alternate-render")
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest, identity = scanner_module._regular_file_snapshot(
+            target,
+            purpose="alternate init-resume repaired thumbnail",
+        )
+        return scanner_module._CreatedArtifactState(
+            path=target,
+            sha256=digest,
+            identity=identity,
+        )
+
+    def crash_after_repair(
+        source_path: Path | int,
+        target: Path,
+        *,
+        asset_id: str,
+        recorded_thumbnail_sha256: str,
+    ) -> object:
+        nonlocal crashed
+        original_prepare(
+            source_path,
+            target,
+            asset_id=asset_id,
+            recorded_thumbnail_sha256=recorded_thumbnail_sha256,
+        )
+        crashed = True
+        raise SystemExit("synthetic crash before init-resume thumbnail recovery")
+
+    monkeypatch.setattr(scanner_module, "_write_thumbnail", alternate_writer)
+    monkeypatch.setattr(
+        scanner_module,
+        "_prepare_thumbnail_repair",
+        crash_after_repair,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash before init-resume thumbnail recovery",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    assert len(list(paths.thumbnails.glob(".*.repair-intent.json"))) == 1
+    assert not (paths.root / scanner_module.OBSERVATION_COMMIT_FILE).exists()
+    assert not (paths.root / scanner_module.OBSERVATION_ROLLBACK_FILE).exists()
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_prepare_thumbnail_repair",
+        original_prepare,
+    )
+    resumed = create_or_resume_scan_session(
+        "book",
+        "thumbnail-init-resume-crash",
+        library,
+    )
+
+    assert resumed == paths
+    session_after = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    repaired = next(
+        item for item in session_after["assets"] if item["asset_id"] == asset_id
+    )
+    current_digest = hashlib.sha256(thumbnail.read_bytes()).hexdigest()
+    assert repaired["thumbnail_sha256"] == current_digest
+    assert current_digest != original_digest
+    assert not list(paths.thumbnails.glob(".*.repair-intent.json"))
+    assert not list(paths.thumbnails.glob(".*.rollback-preimage"))
+    assert not list(paths.thumbnails.glob(".*.repair-replacement"))
 
 
 def test_thumbnail_repair_intent_publish_failure_preserves_replacement_for_recovery(
