@@ -1613,6 +1613,70 @@ def _force_generated_file_fallback(
     monkeypatch.setattr(os, "open", no_anonymous_tmp)
 
 
+@pytest.mark.parametrize("artifact_kind", ["source", "thumbnail", "replace"])
+def test_generated_file_fallback_cleanup_before_state_is_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / f"generated-fallback-early-{artifact_kind}"
+    output_dir.mkdir()
+    target = output_dir / (
+        "thumb.jpg" if artifact_kind == "thumbnail" else "source.jpg"
+    )
+    sha256, source_stat = scanner_module._stable_hash(source)
+    original_target = b"stale-preserved-copy"
+
+    if artifact_kind == "replace":
+        target.write_bytes(original_target)
+
+    _force_generated_file_fallback(monkeypatch)
+
+    def fail_before_state(
+        descriptor: int,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        raise ScannerWorkflowError(
+            f"synthetic generated-state failure before return: {purpose}"
+        )
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_generated_file_state",
+        fail_before_state,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="synthetic generated-state failure before return",
+    ):
+        if artifact_kind == "source":
+            scanner_module._copy_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+        elif artifact_kind == "replace":
+            scanner_module._replace_preserved(
+                source,
+                target,
+                expected_sha256=sha256,
+                expected_stat=source_stat,
+            )
+        else:
+            scanner_module._write_thumbnail(source, target)
+
+    assert not list(output_dir.glob(".*.tmp"))
+    if artifact_kind == "replace":
+        assert target.read_bytes() == original_target
+    else:
+        assert not target.exists()
+
+
 def test_generated_file_fallback_without_otmpfile_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

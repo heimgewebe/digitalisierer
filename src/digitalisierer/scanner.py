@@ -802,12 +802,7 @@ def _write_thumbnail(
             identity=published_identity,
         )
     finally:
-        if expected_sha256 is not None and expected_identity is not None:
-            _cleanup_generated_file(
-                generated,
-                sha256=expected_sha256,
-                identity=expected_identity,
-            )
+        _cleanup_generated_file(generated)
         os.close(generated.descriptor)
 
 
@@ -965,19 +960,24 @@ def _link_descriptor_noreplace(descriptor: int, target: Path) -> None:
         os.close(directory_descriptor)
 
 
-def _cleanup_generated_file(
-    generated: _GeneratedFile,
-    *,
-    sha256: str,
-    identity: tuple[int, int, int, int],
-) -> None:
+def _cleanup_generated_file(generated: _GeneratedFile) -> None:
     if generated.fallback_path is None:
+        return
+    try:
+        before = os.fstat(generated.descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            return
+        digest = _descriptor_sha256(generated.descriptor)
+        after = os.fstat(generated.descriptor)
+    except OSError:
+        return
+    if _stat_identity(before) != _stat_identity(after):
         return
     _remove_created_artifact(
         _CreatedArtifactState(
             path=generated.fallback_path,
-            sha256=sha256,
-            identity=identity,
+            sha256=digest,
+            identity=_stat_identity(after),
         )
     )
 
@@ -2205,12 +2205,7 @@ def _copy_preserved(
             identity=published_identity,
         )
     finally:
-        if copied_sha is not None and expected_identity is not None:
-            _cleanup_generated_file(
-                generated,
-                sha256=copied_sha,
-                identity=expected_identity,
-            )
+        _cleanup_generated_file(generated)
         os.close(generated.descriptor)
 
 
@@ -2350,12 +2345,7 @@ def _replace_preserved(
                 f"preserved source repair preimage cleanup failed: {target.name}"
             )
     finally:
-        if copied_sha is not None and generated_identity is not None:
-            _cleanup_generated_file(
-                generated,
-                sha256=copied_sha,
-                identity=generated_identity,
-            )
+        _cleanup_generated_file(generated)
         os.close(generated.descriptor)
 
 
