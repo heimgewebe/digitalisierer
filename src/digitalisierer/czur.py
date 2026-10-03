@@ -61,6 +61,7 @@ class CzurCaptureBackend:
         self._session_output: Path | None = None
 
     def _load_config_payload(self) -> dict[str, Any]:
+        self._recover_interrupted_config_claim()
         try:
             raw_bytes, _ = self._snapshot_regular_file(self.config_path)
         except FileNotFoundError as exc:
@@ -110,6 +111,182 @@ class CzurCaptureBackend:
             raise CzurAdapterError(
                 f"CZUR config directory is not writable: {self.config_path.parent}"
             )
+
+    def _recover_interrupted_config_claim(self) -> None:
+        parent = self.config_path.parent
+        if not parent.is_dir():
+            return
+        prefix = ".config.json.digitalisierer.claim."
+        candidates: list[tuple[Path, Path | None, Path, bytes]] = []
+        try:
+            entries = list(os.scandir(parent))
+        except OSError as exc:
+            raise CzurAdapterError(
+                "CZUR interrupted config recovery state cannot be inspected"
+            ) from exc
+
+        for entry in entries:
+            if not entry.name.startswith(prefix) or entry.name == prefix:
+                continue
+            guard_dir = parent / entry.name
+            try:
+                guard_stat = guard_dir.lstat()
+            except OSError as exc:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state changed while being inspected"
+                ) from exc
+            if (
+                not stat.S_ISDIR(guard_stat.st_mode)
+                or stat.S_ISLNK(guard_stat.st_mode)
+                or guard_stat.st_uid != os.geteuid()
+            ):
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state is ambiguous"
+                )
+            try:
+                names = {child.name for child in os.scandir(guard_dir)}
+            except OSError as exc:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state cannot be inspected"
+                ) from exc
+            if not names:
+                continue
+            if not names.issubset({"preimage", "recovery"}) or "recovery" not in names:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state is ambiguous"
+                )
+
+            recovery = guard_dir / "recovery"
+            try:
+                recovery_stat = recovery.lstat()
+                recovery_content, _ = self._snapshot_regular_file(recovery)
+            except OSError as exc:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state is invalid"
+                ) from exc
+            if recovery_stat.st_uid != os.geteuid() or recovery_stat.st_nlink != 1:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery state is ambiguous"
+                )
+
+            preimage: Path | None = None
+            if "preimage" in names:
+                preimage = guard_dir / "preimage"
+                try:
+                    pre_stat = preimage.lstat()
+                    pre_content, _ = self._snapshot_regular_file(preimage)
+                except OSError as exc:
+                    raise CzurAdapterError(
+                        "CZUR interrupted config recovery state is invalid"
+                    ) from exc
+                if (
+                    pre_stat.st_uid != os.geteuid()
+                    or pre_stat.st_nlink != 1
+                    or pre_content != recovery_content
+                ):
+                    raise CzurAdapterError(
+                        "CZUR interrupted config recovery state is ambiguous"
+                    )
+            candidates.append((guard_dir, preimage, recovery, recovery_content))
+
+        if not candidates:
+            return
+        if len(candidates) != 1:
+            raise CzurAdapterError(
+                "CZUR interrupted config recovery state is ambiguous"
+            )
+
+        guard_dir, preimage, recovery, expected_content = candidates[0]
+        try:
+            raw = expected_content.decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CzurAdapterError(
+                "CZUR interrupted config recovery preimage is invalid"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CzurAdapterError(
+                "CZUR interrupted config recovery preimage is invalid"
+            )
+        setting = payload.setdefault("setting", {})
+        if not isinstance(setting, dict):
+            raise CzurAdapterError(
+                "CZUR interrupted config recovery preimage is invalid"
+            )
+        for key, value in CURVED_BOOKS_SETTINGS.items():
+            setting[key] = value
+        preset_content = (
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+
+        committed_preset = False
+        if os.path.lexists(self.config_path):
+            try:
+                canonical_content, canonical_identity = self._config_snapshot()
+            except OSError as exc:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery canonical state is invalid"
+                ) from exc
+            if preimage is None:
+                if canonical_content == preset_content:
+                    committed_preset = True
+                elif canonical_content != expected_content:
+                    raise CzurAdapterError(
+                        "CZUR interrupted config recovery canonical state is ambiguous"
+                    )
+            elif canonical_content == expected_content:
+                pass
+            elif canonical_content == preset_content:
+                if not self._rollback_published_claim(
+                    claimed_preimage=preimage,
+                    preset_content=preset_content,
+                    published_identity=canonical_identity,
+                ):
+                    raise CzurAdapterError(
+                        "CZUR interrupted preset publication could not be rolled back"
+                    )
+                preimage = None
+            else:
+                raise CzurAdapterError(
+                    "CZUR interrupted config recovery canonical state is ambiguous"
+                )
+        else:
+            restore_source = preimage if preimage is not None else recovery
+            if not self._restore_claimed_config(restore_source):
+                raise CzurAdapterError(
+                    "CZUR interrupted config claim could not be restored"
+                )
+            if restore_source == preimage:
+                preimage = None
+
+        if not committed_preset:
+            try:
+                restored_content, _ = self._snapshot_regular_file(self.config_path)
+            except OSError as exc:
+                raise CzurAdapterError(
+                    "CZUR interrupted config claim restoration could not be verified"
+                ) from exc
+            if restored_content != expected_content:
+                raise CzurAdapterError(
+                    "CZUR interrupted config claim restoration changed content"
+                )
+
+        for claim_path in (preimage, recovery):
+            if claim_path is None or not os.path.lexists(claim_path):
+                continue
+            try:
+                claim_path.unlink()
+            except OSError:
+                return
+        try:
+            self._fsync_directory(guard_dir)
+        except OSError:
+            return
+        try:
+            guard_dir.rmdir()
+            self._fsync_directory(parent)
+        except OSError:
+            pass
 
     def _capture_root_ready(self) -> bool:
         candidate = self.capture_root
@@ -470,6 +647,7 @@ class CzurCaptureBackend:
         tuple[int, int, int, int, int, int] | None,
     ]:
         self._require_config_write_ready()
+        self._recover_interrupted_config_claim()
         try:
             config_before, config_before_identity = self._config_snapshot()
             raw = config_before.decode("utf-8")

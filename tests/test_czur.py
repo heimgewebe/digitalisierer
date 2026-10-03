@@ -1123,6 +1123,241 @@ def test_apply_preset_crash_after_config_claim_keeps_durable_backup(
     assert not config.exists()
 
 
+def test_status_recovers_interrupted_config_claim_before_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    before = config.read_bytes()
+    backend = CzurCaptureBackend(config_path=config)
+    original_rename = os.rename
+    crashed = False
+
+    def crash_after_claim(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal crashed
+        destination = Path(dst)
+        if (
+            not crashed
+            and Path(src) == config
+            and destination.name == "preimage"
+            and destination.parent.name.startswith(
+                ".config.json.digitalisierer.claim."
+            )
+        ):
+            original_rename(src, dst)
+            crashed = True
+            raise SystemExit("synthetic process loss after config claim")
+        original_rename(src, dst)
+
+    monkeypatch.setattr("digitalisierer.czur.os.rename", crash_after_claim)
+
+    with pytest.raises(SystemExit, match="synthetic process loss after config claim"):
+        backend.apply_curved_books_preset()
+
+    claims = list(tmp_path.glob(".config.json.digitalisierer.claim.*/preimage"))
+    recoveries = list(tmp_path.glob(".config.json.digitalisierer.claim.*/recovery"))
+    assert crashed is True
+    assert not config.exists()
+    assert len(claims) == 1
+    assert len(recoveries) == 1
+    assert claims[0].read_bytes() == before
+    assert recoveries[0].read_bytes() == before
+
+    resumed = CzurCaptureBackend(config_path=config)
+    resumed.status()
+
+    assert config.read_bytes() == before
+    assert not list(tmp_path.glob(".config.json.digitalisierer.claim.*"))
+
+
+def test_status_rolls_back_interrupted_preset_publication_before_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config.chmod(0o640)
+    before = config.read_bytes()
+    backend = CzurCaptureBackend(config_path=config)
+    original_link = os.link
+    crashed = False
+
+    def crash_after_publication(
+        src: os.PathLike[str] | str,
+        dst: os.PathLike[str] | str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal crashed
+        source = Path(src)
+        destination = Path(dst)
+        if (
+            not crashed
+            and destination == config
+            and source.name.startswith(".config.json.digitalisierer.")
+        ):
+            original_link(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            crashed = True
+            raise SystemExit("synthetic process loss after preset publication")
+        original_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr("digitalisierer.czur.os.link", crash_after_publication)
+
+    with pytest.raises(
+        SystemExit,
+        match="synthetic process loss after preset publication",
+    ):
+        backend.apply_curved_books_preset()
+
+    claims = list(tmp_path.glob(".config.json.digitalisierer.claim.*/preimage"))
+    recoveries = list(tmp_path.glob(".config.json.digitalisierer.claim.*/recovery"))
+    assert crashed is True
+    assert config.exists()
+    assert config.read_bytes() != before
+    assert len(claims) == 1
+    assert len(recoveries) == 1
+    assert claims[0].read_bytes() == before
+    assert recoveries[0].read_bytes() == before
+
+    resumed = CzurCaptureBackend(config_path=config)
+    resumed.status()
+
+    assert config.read_bytes() == before
+    assert not list(tmp_path.glob(".config.json.digitalisierer.claim.*"))
+
+
+def test_status_finishes_cleanup_after_committed_preset_loses_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "setting": {
+                    "unrelated": "original",
+                    "scan_preview_capture_type": "single",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    backend = CzurCaptureBackend(config_path=config)
+    original_unlink = Path.unlink
+    crashed = False
+
+    def crash_before_recovery_cleanup(
+        target: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        nonlocal crashed
+        if (
+            not crashed
+            and target.name == "recovery"
+            and target.parent.name.startswith(
+                ".config.json.digitalisierer.claim."
+            )
+        ):
+            assert not (target.parent / "preimage").exists()
+            crashed = True
+            raise SystemExit("synthetic process loss after config commit boundary")
+        original_unlink(target, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", crash_before_recovery_cleanup)
+
+    with pytest.raises(
+        SystemExit,
+        match="synthetic process loss after config commit boundary",
+    ):
+        backend.apply_curved_books_preset()
+
+    assert crashed is True
+    committed = config.read_bytes()
+    assert committed != before
+    claims = list(tmp_path.glob(".config.json.digitalisierer.claim.*/preimage"))
+    recoveries = list(tmp_path.glob(".config.json.digitalisierer.claim.*/recovery"))
+    assert claims == []
+    assert len(recoveries) == 1
+    assert recoveries[0].read_bytes() == before
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    resumed = CzurCaptureBackend(config_path=config)
+    resumed.status()
+
+    assert config.read_bytes() == committed
+    assert not list(tmp_path.glob(".config.json.digitalisierer.claim.*"))
+
+
+def test_config_claim_recovery_rejects_multiple_candidates(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.json"
+    payload = b'{"setting":{"scan_preview_capture_type":"single"}}\n'
+    backend = CzurCaptureBackend(config_path=config)
+
+    for suffix in ("one", "two"):
+        guard = tmp_path / f".config.json.digitalisierer.claim.{suffix}"
+        guard.mkdir(mode=0o700)
+        (guard / "preimage").write_bytes(payload)
+        (guard / "recovery").write_bytes(payload)
+
+    with pytest.raises(
+        CzurAdapterError,
+        match="interrupted config recovery state is ambiguous",
+    ):
+        backend._load_config_payload()
+
+    assert not config.exists()
+    guards = sorted(tmp_path.glob(".config.json.digitalisierer.claim.*"))
+    assert len(guards) == 2
+    for guard in guards:
+        assert (guard / "preimage").read_bytes() == payload
+        assert (guard / "recovery").read_bytes() == payload
+
+
 def test_apply_preset_keyboard_interrupt_after_config_claim_restores_canonical_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
