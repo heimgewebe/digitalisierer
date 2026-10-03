@@ -1178,7 +1178,7 @@ def test_review_server_streams_verified_source_snapshot_after_in_place_race(
     assert body != preserved.read_bytes()
 
 
-def test_review_server_rejects_source_above_sealed_snapshot_budget(
+def test_review_server_streams_source_above_sealed_snapshot_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1195,6 +1195,8 @@ def test_review_server_rejects_source_above_sealed_snapshot_budget(
     asset_id = observed.imported_asset_ids[0]
     session = json.loads(paths.session_file.read_text(encoding="utf-8"))
     preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    assert original_bytes
     monkeypatch.setattr(
         review_module,
         "MAX_REVIEW_SOURCE_SNAPSHOT_BYTES",
@@ -1202,13 +1204,20 @@ def test_review_server_rejects_source_above_sealed_snapshot_budget(
         raising=False,
     )
 
+    def reject_memfd(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("large review sources must not use sealed memfd snapshots")
+
+    monkeypatch.setattr(review_module, "_sealed_memfd_snapshot", reject_memfd)
+
     review_server = build_review_server(paths, host="127.0.0.1", port=0)
     try:
         response = _get_review_path(review_server, f"/source/{asset_id}")
     finally:
         review_server.server.server_close()
 
-    assert b" 413 " in response.splitlines()[0]
+    assert b" 200 " in response.splitlines()[0]
+    _, body = response.split(b"\r\n\r\n", 1)
+    assert body == original_bytes
 
 
 def test_review_server_serializes_sealed_source_snapshots(

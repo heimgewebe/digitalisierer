@@ -618,102 +618,108 @@ def build_review_server(
                     self.wfile.write(payload)
                     return
 
-                if before.st_size > MAX_REVIEW_SOURCE_SNAPSHOT_BYTES:
-                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                if not source_snapshot_gate.acquire(blocking=False):
+                    self.send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "another full-resolution source response is active",
+                    )
                     return
                 try:
-                    verified_source = tempfile.TemporaryFile(
-                        mode="w+b",
-                        dir=paths.root,
-                    )
-                except OSError:
-                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                    return
-                with verified_source:
-                    digest = hashlib.sha256()
                     try:
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                            verified_source.write(chunk)
-                        verified_source.flush()
+                        verified_source = tempfile.TemporaryFile(
+                            mode="w+b",
+                            dir=paths.root,
+                        )
                     except OSError:
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    after = os.fstat(source.fileno())
-                    try:
-                        current = target.lstat()
-                    except OSError:
-                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                        return
-                    if (
-                        not stat.S_ISREG(current.st_mode)
-                        or (
-                            before.st_dev,
-                            before.st_ino,
-                            before.st_size,
-                            before.st_mtime_ns,
-                        )
-                        != (
-                            after.st_dev,
-                            after.st_ino,
-                            after.st_size,
-                            after.st_mtime_ns,
-                        )
-                        or current.st_dev != after.st_dev
-                        or current.st_ino != after.st_ino
-                        or (
-                            current.st_size,
-                            current.st_mtime_ns,
-                        )
-                        != (
-                            after.st_size,
-                            after.st_mtime_ns,
-                        )
-                        or not secrets.compare_digest(
-                            digest.hexdigest(),
-                            expected_sha256,
-                        )
-                    ):
-                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-                        return
-                    if not source_snapshot_gate.acquire(blocking=False):
-                        self.send_error(
-                            HTTPStatus.SERVICE_UNAVAILABLE,
-                            "another full-resolution source response is active",
-                        )
-                        return
-                    try:
+                    with verified_source:
+                        digest = hashlib.sha256()
                         try:
-                            sealed_source_fd = _sealed_memfd_snapshot(
-                                verified_source.fileno(),
-                                expected_sha256=expected_sha256,
-                                expected_size=after.st_size,
-                                name="digitalisierer-review-source",
-                                purpose="review source",
-                            )
-                        except (OSError, ScannerWorkflowError):
+                            for chunk in iter(
+                                lambda: source.read(1024 * 1024),
+                                b"",
+                            ):
+                                digest.update(chunk)
+                                verified_source.write(chunk)
+                            verified_source.flush()
+                        except OSError:
                             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                             return
+                        after = os.fstat(source.fileno())
                         try:
-                            os.lseek(sealed_source_fd, 0, os.SEEK_SET)
+                            current = target.lstat()
+                        except OSError:
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+                        if (
+                            not stat.S_ISREG(current.st_mode)
+                            or (
+                                before.st_dev,
+                                before.st_ino,
+                                before.st_size,
+                                before.st_mtime_ns,
+                            )
+                            != (
+                                after.st_dev,
+                                after.st_ino,
+                                after.st_size,
+                                after.st_mtime_ns,
+                            )
+                            or current.st_dev != after.st_dev
+                            or current.st_ino != after.st_ino
+                            or (
+                                current.st_size,
+                                current.st_mtime_ns,
+                            )
+                            != (
+                                after.st_size,
+                                after.st_mtime_ns,
+                            )
+                            or not secrets.compare_digest(
+                                digest.hexdigest(),
+                                expected_sha256,
+                            )
+                        ):
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+
+                        response_descriptor = verified_source.fileno()
+                        sealed_source_fd: int | None = None
+                        if after.st_size <= MAX_REVIEW_SOURCE_SNAPSHOT_BYTES:
+                            try:
+                                sealed_source_fd = _sealed_memfd_snapshot(
+                                    response_descriptor,
+                                    expected_sha256=expected_sha256,
+                                    expected_size=after.st_size,
+                                    name="digitalisierer-review-source",
+                                    purpose="review source",
+                                )
+                            except (OSError, ScannerWorkflowError):
+                                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                                return
+                            response_descriptor = sealed_source_fd
+                        try:
+                            os.lseek(response_descriptor, 0, os.SEEK_SET)
                             self._headers(
                                 HTTPStatus.OK,
                                 content_type=content_type,
                                 content_length=after.st_size,
                             )
                             with os.fdopen(
-                                os.dup(sealed_source_fd),
+                                os.dup(response_descriptor),
                                 "rb",
-                            ) as sealed_source:
+                            ) as response_source:
                                 for chunk in iter(
-                                    lambda: sealed_source.read(1024 * 1024),
+                                    lambda: response_source.read(1024 * 1024),
                                     b"",
                                 ):
                                     self.wfile.write(chunk)
                         finally:
-                            os.close(sealed_source_fd)
-                    finally:
-                        source_snapshot_gate.release()
+                            if sealed_source_fd is not None:
+                                os.close(sealed_source_fd)
+                finally:
+                    source_snapshot_gate.release()
             return
 
         def do_POST(self) -> None:  # noqa: N802
