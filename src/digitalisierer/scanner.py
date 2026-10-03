@@ -4578,8 +4578,11 @@ def _cleanup_scanner_export_staging(
     staging: Path,
     directory_fd: int,
     directory_identity: tuple[int, int],
+    *,
+    final_dir: Path,
+    publication_attempted: bool,
 ) -> None:
-    """Clean only the staging directory already bound by the directory fd."""
+    """Clean only the exact unpublished staging directory bound by the fd."""
 
     try:
         current = os.fstat(directory_fd)
@@ -4588,6 +4591,30 @@ def _cleanup_scanner_export_staging(
             or (current.st_dev, current.st_ino) != directory_identity
         ):
             return
+
+        if publication_attempted:
+            try:
+                published = final_dir.lstat()
+            except OSError:
+                published = None
+            if (
+                published is not None
+                and stat.S_ISDIR(published.st_mode)
+                and (published.st_dev, published.st_ino) == directory_identity
+            ):
+                return
+
+            try:
+                current_staging = staging.lstat()
+            except OSError:
+                return
+            if (
+                not stat.S_ISDIR(current_staging.st_mode)
+                or (current_staging.st_dev, current_staging.st_ino)
+                != directory_identity
+            ):
+                return
+
         names = set(os.listdir(directory_fd))
     except OSError:
         return
@@ -5024,6 +5051,7 @@ def finalize_scan_session(
         raise ScannerWorkflowError(
             "scanner export staging directory changed during reservation"
         )
+    publication_attempted = False
     try:
         master = staging / "master.pdf"
         searchable = staging / "searchable.pdf"
@@ -5226,6 +5254,7 @@ def finalize_scan_session(
                     "scanner session metadata changed while finalizing"
                 )
 
+            publication_attempted = True
             _publish_verified_staging(
                 staging,
                 final_dir,
@@ -5246,5 +5275,7 @@ def finalize_scan_session(
                 staging,
                 staging_directory_fd,
                 staging_directory_identity,
+                final_dir=final_dir,
+                publication_attempted=publication_attempted,
             )
         os.close(staging_directory_fd)

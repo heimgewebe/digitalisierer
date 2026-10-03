@@ -688,6 +688,30 @@ class CzurCaptureBackend:
                 backup_identity,
             )
         except (Exception, KeyboardInterrupt) as exc:
+            claim_transition_ambiguous = False
+            if not claimed and not published:
+                canonical_present = os.path.lexists(self.config_path)
+                claim_present = os.path.lexists(claimed_preimage)
+                if claim_present and not canonical_present:
+                    try:
+                        interrupted_content, interrupted_identity = (
+                            self._snapshot_regular_file(claimed_preimage)
+                        )
+                    except OSError:
+                        claim_transition_ambiguous = True
+                    else:
+                        if self._same_claimed_preimage(
+                            config_before,
+                            config_before_identity,
+                            interrupted_content,
+                            interrupted_identity,
+                        ):
+                            claimed = True
+                        else:
+                            claim_transition_ambiguous = True
+                elif claim_present or not canonical_present:
+                    claim_transition_ambiguous = True
+
             if published and published_identity is not None:
                 rollback_complete = self._rollback_published_claim(
                     claimed_preimage=claimed_preimage,
@@ -702,7 +726,7 @@ class CzurCaptureBackend:
                     claimed = False
 
             recovery_cleanup_safe = rollback_complete or (
-                not claimed and not published
+                not claimed and not published and not claim_transition_ambiguous
             )
             if recovery_cleanup_safe and recovery_created:
                 try:
@@ -713,7 +737,7 @@ class CzurCaptureBackend:
 
             backup_cleanup_failed = False
             backup_cleanup_safe = rollback_complete or (
-                not claimed and not published
+                not claimed and not published and not claim_transition_ambiguous
             )
             if backup_cleanup_safe and backup_identity is not None:
                 backup_cleanup_failed = not self._remove_owned_backup(

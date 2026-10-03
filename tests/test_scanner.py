@@ -5092,6 +5092,55 @@ def test_observe_preview_derivation_remains_bound_after_snapshot_path_rebind(
 
 
 
+def test_finalize_interrupt_after_publication_return_keeps_complete_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "publication-return-interrupt"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "publication-return-interrupt",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    original_publish = scanner_module._publish_verified_staging
+    published_dir: Path | None = None
+
+    def interrupt_after_publication(
+        staging: Path,
+        final_dir: Path,
+        expected: dict[str, tuple[str, tuple[int, int, int, int]]],
+    ) -> None:
+        nonlocal published_dir
+        original_publish(staging, final_dir, expected)
+        published_dir = final_dir
+        raise KeyboardInterrupt("synthetic interrupt after export publication")
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_publish_verified_staging",
+        interrupt_after_publication,
+    )
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="synthetic interrupt after export publication",
+    ):
+        finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert published_dir is not None
+    assert published_dir.is_dir()
+    assert {path.name for path in published_dir.iterdir()} == set(
+        scanner_module._SCANNER_EXPORT_STAGING_FILES
+    )
+    for artifact in published_dir.iterdir():
+        assert artifact.is_file()
+        assert artifact.stat().st_size > 0
+        assert artifact.stat().st_mode & 0o777 == 0o400
+
+
 def test_finalize_cleanup_keeps_foreign_staging_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
