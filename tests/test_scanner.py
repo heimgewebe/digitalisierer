@@ -1521,6 +1521,82 @@ def test_observe_rejects_transient_session_rewrite_with_restored_mtime(
     assert len(resumed.imported_asset_ids) == 1
 
 
+def test_observe_rejects_transient_review_rewrite_with_restored_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "capture-transient-review-rewrite"
+    capture.mkdir()
+    first_source = capture / "image00001.jpg"
+    _image(first_source, 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "transient-review-rewrite",
+        tmp_path / "library",
+    )
+    first = observe_scan_folder(paths, capture)
+    first_asset_id = first.imported_asset_ids[0]
+    second_source = capture / "image00002.jpg"
+    _image(second_source, 110)
+
+    original_review_bytes = paths.review_file.read_bytes()
+    original_review_stat = paths.review_file.stat()
+    original_session_bytes = paths.session_file.read_bytes()
+    original_findings_bytes = paths.findings_file.read_bytes()
+    existing_sources = sorted(path.name for path in paths.sources.iterdir())
+    existing_thumbnails = sorted(path.name for path in paths.thumbnails.iterdir())
+
+    transient_review = json.loads(original_review_bytes.decode("utf-8"))
+    transient_review["items"][first_asset_id]["included"] = False
+    transient_review_bytes = scanner_module._json_text(transient_review).encode("utf-8")
+    original_load_json = scanner_module._load_json
+    injected = False
+    ctime_changed = False
+
+    def load_transient_review_once(path: Path) -> dict[str, object]:
+        nonlocal injected, ctime_changed
+        if path == paths.review_file and not injected:
+            path.write_bytes(transient_review_bytes)
+            os.utime(
+                path,
+                ns=(original_review_stat.st_atime_ns, original_review_stat.st_mtime_ns),
+            )
+            loaded = original_load_json(path)
+            path.write_bytes(original_review_bytes)
+            os.utime(
+                path,
+                ns=(original_review_stat.st_atime_ns, original_review_stat.st_mtime_ns),
+            )
+            current_stat = path.stat()
+            ctime_changed = current_stat.st_ctime_ns != original_review_stat.st_ctime_ns
+            injected = True
+            return loaded
+        return original_load_json(path)
+
+    monkeypatch.setattr(scanner_module, "_load_json", load_transient_review_once)
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="scan review changed while being snapshotted",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert injected is True
+    assert ctime_changed is True
+    assert paths.review_file.stat().st_mtime_ns == original_review_stat.st_mtime_ns
+    assert paths.review_file.read_bytes() == original_review_bytes
+    assert paths.session_file.read_bytes() == original_session_bytes
+    assert paths.findings_file.read_bytes() == original_findings_bytes
+    assert sorted(path.name for path in paths.sources.iterdir()) == existing_sources
+    assert sorted(path.name for path in paths.thumbnails.iterdir()) == existing_thumbnails
+
+    monkeypatch.setattr(scanner_module, "_load_json", original_load_json)
+    resumed = observe_scan_folder(paths, capture)
+    assert len(resumed.imported_asset_ids) == 1
+    review_after = json.loads(paths.review_file.read_text(encoding="utf-8"))
+    assert review_after["items"][first_asset_id]["included"] is True
+
+
 def test_observe_session_commit_failure_restores_previous_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
