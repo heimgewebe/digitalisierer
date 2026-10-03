@@ -3117,6 +3117,67 @@ def test_observe_resume_repairs_recorded_preserved_source_and_thumbnail(
     assert hashlib.sha256(thumbnail.read_bytes()).hexdigest() == repaired["thumbnail_sha256"]
 
 
+
+def test_observe_resume_recovers_interrupted_preserved_source_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "resume-repair-crash"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    _image(source, 110)
+    paths = create_or_resume_scan_session(
+        "book",
+        "resume-repair-crash",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    asset = session["assets"][0]
+    preserved = paths.root / asset["preserved_path"]
+    original_source = source.read_bytes()
+    corrupted = b"corrupted-preserved-source"
+    preserved.write_bytes(corrupted)
+
+    original_rename = scanner_module._rename_noreplace
+    crashed = False
+
+    def crash_after_preimage_claim(source_path: Path, target_path: Path) -> None:
+        nonlocal crashed
+        if (
+            not crashed
+            and source_path == preserved
+            and target_path.name.endswith(".repair-preimage")
+        ):
+            original_rename(source_path, target_path)
+            crashed = True
+            raise SystemExit("synthetic crash after preserved-source claim")
+        original_rename(source_path, target_path)
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_rename_noreplace",
+        crash_after_preimage_claim,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="synthetic crash after preserved-source claim",
+    ):
+        observe_scan_folder(paths, capture)
+
+    assert crashed is True
+    assert not preserved.exists()
+    assert len(list(paths.sources.glob(".*.repair-preimage"))) == 1
+
+    monkeypatch.setattr(scanner_module, "_rename_noreplace", original_rename)
+    resumed = observe_scan_folder(paths, capture)
+
+    assert resumed.imported_asset_ids == ()
+    assert preserved.read_bytes() == original_source
+    assert not list(paths.sources.glob(".*.repair-preimage"))
+    assert not list(paths.sources.glob(".*.repair-intent.json"))
+
+
 def test_observe_resume_repair_rejects_preserved_symlink_swap_before_hash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

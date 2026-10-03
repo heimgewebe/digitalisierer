@@ -349,6 +349,7 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             if os.path.lexists(root / OBSERVATION_COMMIT_FILE):
                 _recover_observation_metadata_commit(paths)
+            _recover_interrupted_preserved_repairs(paths)
             _recover_interrupted_thumbnail_repairs(paths)
             yield
         finally:
@@ -1431,6 +1432,246 @@ def _remove_owned_claim(
         return False
 
 
+def _preserved_repair_intent_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.repair-intent.json")
+
+
+def _recover_interrupted_preserved_repairs(paths: ScanSessionPaths) -> None:
+    _validate_session_storage_directory(paths, paths.sources, "sources")
+
+    session, _ = _stable_json_snapshot(paths.session_file)
+    _validate_session_identity(paths, session)
+    assets = session.get("assets")
+    if not isinstance(assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+
+    def parse_identity(value: object) -> tuple[int, int, int, int]:
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+        ):
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+        return tuple(value)
+
+    def exact_state(
+        path: Path,
+        expected_sha256: str,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        purpose: str,
+    ) -> bool:
+        if not os.path.lexists(path):
+            return False
+        current_sha256, current_identity = _regular_file_snapshot(
+            path,
+            purpose=purpose,
+        )
+        return (
+            current_identity == expected_identity
+            and secrets.compare_digest(current_sha256, expected_sha256)
+        )
+
+    for intent_path in sorted(paths.sources.glob(".*.repair-intent.json")):
+        raw_intent = _stable_file_bytes(intent_path)
+        intent_sha256, intent_identity = _regular_file_snapshot(
+            intent_path,
+            purpose="preserved source repair intent",
+        )
+        if not secrets.compare_digest(
+            hashlib.sha256(raw_intent).hexdigest(),
+            intent_sha256,
+        ):
+            raise ScannerWorkflowError("preserved source repair intent changed while reading")
+        try:
+            intent = json.loads(raw_intent.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ScannerWorkflowError("preserved source repair intent is invalid") from exc
+        if (
+            not isinstance(intent, dict)
+            or intent.get("schema_version") != 1
+            or intent.get("kind") != "digitalisierer.preserved-source-repair-intent"
+            or set(intent)
+            != {
+                "schema_version",
+                "kind",
+                "target_name",
+                "expected_sha256",
+                "preimage",
+                "replacement",
+            }
+        ):
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+
+        target_name = intent.get("target_name")
+        expected_sha256 = intent.get("expected_sha256")
+        preimage = intent.get("preimage")
+        replacement = intent.get("replacement")
+        if (
+            not isinstance(target_name, str)
+            or Path(target_name).name != target_name
+            or Path(target_name).suffix.lower() not in IMAGE_SUFFIXES
+            or not _is_sha256(expected_sha256)
+            or not isinstance(preimage, dict)
+            or set(preimage) != {"path_name", "sha256", "identity"}
+            or not isinstance(replacement, dict)
+            or set(replacement) != {"path_name", "sha256", "identity"}
+        ):
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+        assert isinstance(expected_sha256, str)
+
+        target = paths.sources / target_name
+        if intent_path != _preserved_repair_intent_path(target):
+            raise ScannerWorkflowError("preserved source repair intent path is invalid")
+
+        matches = [
+            item
+            for item in assets
+            if isinstance(item, dict)
+            and item.get("preserved_path") == f"sources/{target_name}"
+            and item.get("sha256") == expected_sha256
+        ]
+        if len(matches) != 1:
+            raise ScannerWorkflowError("preserved source repair asset binding is invalid")
+
+        preimage_name = preimage.get("path_name")
+        preimage_sha256 = preimage.get("sha256")
+        if (
+            not isinstance(preimage_name, str)
+            or Path(preimage_name).name != preimage_name
+            or not preimage_name.startswith(f".{target_name}.")
+            or not preimage_name.endswith(".repair-preimage")
+            or not _is_sha256(preimage_sha256)
+        ):
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+        assert isinstance(preimage_sha256, str)
+        preimage_identity = parse_identity(preimage.get("identity"))
+        preimage_path = paths.sources / preimage_name
+
+        replacement_name = replacement.get("path_name")
+        replacement_sha256 = replacement.get("sha256")
+        if (
+            replacement_name is not None
+            and (
+                not isinstance(replacement_name, str)
+                or Path(replacement_name).name != replacement_name
+                or not replacement_name.startswith(f".{target_name}.")
+                or not replacement_name.endswith(".tmp")
+            )
+        ):
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+        if replacement_sha256 != expected_sha256:
+            raise ScannerWorkflowError("preserved source repair intent is invalid")
+        replacement_identity = parse_identity(replacement.get("identity"))
+        replacement_path = (
+            paths.sources / replacement_name
+            if isinstance(replacement_name, str)
+            else None
+        )
+
+        canonical_replacement = exact_state(
+            target,
+            expected_sha256,
+            replacement_identity,
+            purpose="recovered preserved source replacement",
+        )
+        canonical_preimage = exact_state(
+            target,
+            preimage_sha256,
+            preimage_identity,
+            purpose="recovered preserved source preimage",
+        )
+        claimed_preimage = exact_state(
+            preimage_path,
+            preimage_sha256,
+            preimage_identity,
+            purpose="claimed preserved source repair preimage",
+        )
+
+        if canonical_replacement:
+            if claimed_preimage:
+                if not _remove_created_artifact(
+                    _CreatedArtifactState(
+                        path=target,
+                        sha256=expected_sha256,
+                        identity=replacement_identity,
+                    )
+                ):
+                    raise ScannerWorkflowError(
+                        "failed to roll back interrupted preserved source replacement"
+                    )
+                if not _restore_owned_claim(
+                    preimage_path,
+                    preimage_sha256,
+                    preimage_identity,
+                    target,
+                ):
+                    raise ScannerWorkflowError(
+                        "failed to restore interrupted preserved source preimage"
+                    )
+            elif os.path.lexists(preimage_path):
+                raise ScannerWorkflowError(
+                    "preserved source repair preimage changed during recovery"
+                )
+        elif canonical_preimage:
+            if claimed_preimage and not _remove_owned_claim(
+                preimage_path,
+                preimage_sha256,
+                preimage_identity,
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean duplicate preserved source preimage"
+                )
+        elif not os.path.lexists(target):
+            if not claimed_preimage:
+                raise ScannerWorkflowError(
+                    "preserved source repair preimage is missing during recovery"
+                )
+            if not _restore_owned_claim(
+                preimage_path,
+                preimage_sha256,
+                preimage_identity,
+                target,
+            ):
+                raise ScannerWorkflowError(
+                    "failed to restore interrupted preserved source preimage"
+                )
+        else:
+            raise ScannerWorkflowError(
+                "preserved source changed during interrupted repair recovery"
+            )
+
+        if replacement_path is not None and os.path.lexists(replacement_path):
+            if not exact_state(
+                replacement_path,
+                expected_sha256,
+                replacement_identity,
+                purpose="staged preserved source repair replacement",
+            ):
+                raise ScannerWorkflowError(
+                    "preserved source repair replacement changed during recovery"
+                )
+            if not _remove_created_artifact(
+                _CreatedArtifactState(
+                    path=replacement_path,
+                    sha256=expected_sha256,
+                    identity=replacement_identity,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    "failed to clean interrupted preserved source replacement"
+                )
+
+        if not _remove_owned_claim(
+            intent_path,
+            intent_sha256,
+            intent_identity,
+        ):
+            raise ScannerWorkflowError(
+                "failed to clear preserved source repair intent"
+            )
+
+
 def _thumbnail_repair_intent_path(thumbnail: Path) -> Path:
     return thumbnail.with_name(f".{thumbnail.name}.repair-intent.json")
 
@@ -2396,6 +2637,9 @@ def _replace_preserved(
     preimage_claim: Path | None = None
     preimage_sha256: str | None = None
     preimage_identity: tuple[int, int, int, int] | None = None
+    intent_path: Path | None = None
+    intent_sha256: str | None = None
+    intent_identity: tuple[int, int, int, int] | None = None
     try:
         with _stable_source_descriptor(
             source,
@@ -2417,18 +2661,75 @@ def _replace_preserved(
                 f"scan source changed while repairing preserved copy: {source}"
             )
 
+        preimage_claim_path: Path | None = None
         if os.path.lexists(target):
             preimage_sha256, preimage_identity = _regular_file_snapshot(
                 target,
                 purpose="preserved source repair preimage",
             )
+            token = secrets.token_hex(8)
+            preimage_claim_path = target.with_name(
+                f".{target.name}.{token}.repair-preimage"
+            )
+            intent_path = _preserved_repair_intent_path(target)
+            if (
+                os.path.lexists(intent_path)
+                or os.path.lexists(preimage_claim_path)
+            ):
+                raise ScannerWorkflowError(
+                    f"unfinished preserved source repair exists for {target.name}"
+                )
+            intent_payload = {
+                "schema_version": 1,
+                "kind": "digitalisierer.preserved-source-repair-intent",
+                "target_name": target.name,
+                "expected_sha256": expected_sha256,
+                "preimage": {
+                    "path_name": preimage_claim_path.name,
+                    "sha256": preimage_sha256,
+                    "identity": list(preimage_identity),
+                },
+                "replacement": {
+                    "path_name": (
+                        generated.fallback_path.name
+                        if generated.fallback_path is not None
+                        else None
+                    ),
+                    "sha256": expected_sha256,
+                    "identity": list(generated_identity),
+                },
+            }
+            intent_text = _json_text(intent_payload)
+            _atomic_write_text(intent_path, intent_text)
+            intent_sha256, intent_identity = _regular_file_snapshot(
+                intent_path,
+                purpose="preserved source repair intent",
+            )
+            if not secrets.compare_digest(
+                intent_sha256,
+                hashlib.sha256(intent_text.encode("utf-8")).hexdigest(),
+            ):
+                raise ScannerWorkflowError(
+                    "preserved source repair intent changed while being prepared"
+                )
+
             preimage_claim = _claim_owned_regular_file(
                 target,
                 preimage_sha256,
                 preimage_identity,
                 marker="repair-preimage",
+                claimed_path=preimage_claim_path,
             )
             if preimage_claim is None:
+                if not _remove_owned_claim(
+                    intent_path,
+                    intent_sha256,
+                    intent_identity,
+                ):
+                    raise ScannerWorkflowError(
+                        f"preserved source repair intent cleanup failed: {target.name}"
+                    )
+                intent_path = None
                 raise ScannerWorkflowError(
                     f"preserved source changed before repair: {target.name}"
                 )
@@ -2436,17 +2737,35 @@ def _replace_preserved(
         try:
             _link_descriptor_noreplace(generated.descriptor, target)
         except BaseException as exc:
+            restored = True
             if (
                 preimage_claim is not None
                 and preimage_sha256 is not None
                 and preimage_identity is not None
-                and not _restore_owned_claim(
+            ):
+                restored = _restore_owned_claim(
                     preimage_claim,
                     preimage_sha256,
                     preimage_identity,
                     target,
                 )
+                if restored:
+                    preimage_claim = None
+            intent_cleared = True
+            if (
+                restored
+                and intent_path is not None
+                and intent_sha256 is not None
+                and intent_identity is not None
             ):
+                intent_cleared = _remove_owned_claim(
+                    intent_path,
+                    intent_sha256,
+                    intent_identity,
+                )
+                if intent_cleared:
+                    intent_path = None
+            if not restored or not intent_cleared:
                 raise ScannerWorkflowError(
                     f"failed to restore preserved source after repair error: {target.name}"
                 ) from exc
@@ -2483,7 +2802,24 @@ def _replace_preserved(
                     preimage_identity,
                     target,
                 )
-            if not removed or not restored:
+                if restored:
+                    preimage_claim = None
+            intent_cleared = True
+            if (
+                removed
+                and restored
+                and intent_path is not None
+                and intent_sha256 is not None
+                and intent_identity is not None
+            ):
+                intent_cleared = _remove_owned_claim(
+                    intent_path,
+                    intent_sha256,
+                    intent_identity,
+                )
+                if intent_cleared:
+                    intent_path = None
+            if not removed or not restored or not intent_cleared:
                 raise ScannerWorkflowError(
                     f"failed to roll back preserved source repair: {target.name}"
                 ) from exc
@@ -2501,6 +2837,21 @@ def _replace_preserved(
         ):
             raise ScannerWorkflowError(
                 f"preserved source repair preimage cleanup failed: {target.name}"
+            )
+        preimage_claim = None
+
+        if (
+            intent_path is not None
+            and intent_sha256 is not None
+            and intent_identity is not None
+            and not _remove_owned_claim(
+                intent_path,
+                intent_sha256,
+                intent_identity,
+            )
+        ):
+            raise ScannerWorkflowError(
+                f"preserved source repair intent cleanup failed: {target.name}"
             )
     finally:
         _cleanup_generated_file(generated)
