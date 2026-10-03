@@ -1529,6 +1529,167 @@ def test_publication_verification_failure_removes_owned_new_artifact(
     assert list(output_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("artifact_kind", ["source", "thumbnail", "replace"])
+def test_generated_artifacts_hash_from_open_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / "generated"
+    output_dir.mkdir()
+    target = output_dir / (
+        "thumb.jpg" if artifact_kind == "thumbnail" else "source.jpg"
+    )
+    sha256, source_stat = scanner_module._stable_hash(source)
+
+    if artifact_kind == "replace":
+        target.write_bytes(b"stale-preserved-copy")
+
+    def reject_path_hash(path: Path) -> str:
+        pytest.fail(
+            f"generated temporary was reopened by path for hashing: {path.name}"
+        )
+
+    monkeypatch.setattr(scanner_module, "_sha256_file", reject_path_hash)
+
+    if artifact_kind == "source":
+        scanner_module._copy_preserved(
+            source,
+            target,
+            expected_sha256=sha256,
+            expected_stat=source_stat,
+        )
+        assert scanner_module._regular_file_snapshot(
+            target,
+            purpose="test preserved source",
+        )[0] == sha256
+    elif artifact_kind == "replace":
+        scanner_module._replace_preserved(
+            source,
+            target,
+            expected_sha256=sha256,
+            expected_stat=source_stat,
+        )
+        assert scanner_module._regular_file_snapshot(
+            target,
+            purpose="test repaired preserved source",
+        )[0] == sha256
+    else:
+        state = scanner_module._write_thumbnail(source, target)
+        assert state is not None
+        digest, identity = scanner_module._regular_file_snapshot(
+            target,
+            purpose="test generated thumbnail",
+        )
+        assert digest == state.sha256
+        assert identity == state.identity
+
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def _force_generated_file_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = os.open
+
+    def no_anonymous_tmp(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        o_tmpfile = getattr(os, "O_TMPFILE", 0)
+        if o_tmpfile and flags & o_tmpfile == o_tmpfile:
+            raise OSError(95, "synthetic O_TMPFILE unsupported")
+        if dir_fd is None:
+            return int(original_open(path, flags, mode))
+        return int(original_open(path, flags, mode, dir_fd=dir_fd))
+
+    monkeypatch.setattr(os, "open", no_anonymous_tmp)
+
+
+def test_generated_file_fallback_without_otmpfile_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / "generated-fallback"
+    output_dir.mkdir()
+    target = output_dir / "source.jpg"
+    sha256, source_stat = scanner_module._stable_hash(source)
+    _force_generated_file_fallback(monkeypatch)
+
+    scanner_module._copy_preserved(
+        source,
+        target,
+        expected_sha256=sha256,
+        expected_stat=source_stat,
+    )
+
+    assert scanner_module._regular_file_snapshot(
+        target,
+        purpose="test fallback publication",
+    )[0] == sha256
+    assert not list(output_dir.glob(".*.tmp"))
+
+
+def test_generated_file_fallback_rebind_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jpg"
+    _image(source, 100)
+    output_dir = tmp_path / "generated-fallback-race"
+    output_dir.mkdir()
+    target = output_dir / "source.jpg"
+    sha256, source_stat = scanner_module._stable_hash(source)
+    original_generated_state = scanner_module._generated_file_state
+    foreign = b"foreign-fallback-replacement"
+    replaced: Path | None = None
+    _force_generated_file_fallback(monkeypatch)
+
+    def replace_visible_fallback(
+        descriptor: int,
+        *,
+        purpose: str,
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        nonlocal replaced
+        state = original_generated_state(descriptor, purpose=purpose)
+        candidates = list(output_dir.glob(".*.tmp"))
+        assert len(candidates) == 1
+        replaced = candidates[0]
+        replaced.unlink()
+        replaced.write_bytes(foreign)
+        return state
+
+    monkeypatch.setattr(
+        scanner_module,
+        "_generated_file_state",
+        replace_visible_fallback,
+    )
+
+    with pytest.raises(
+        ScannerWorkflowError,
+        match="descriptor-bound scanner publication failed",
+    ):
+        scanner_module._copy_preserved(
+            source,
+            target,
+            expected_sha256=sha256,
+            expected_stat=source_stat,
+        )
+
+    assert not target.exists()
+    assert replaced is not None
+    assert replaced.read_bytes() == foreign
+
+
 @pytest.mark.parametrize("artifact_kind", ["source", "thumbnail"])
 def test_observe_rollback_preserves_foreign_replacement_of_new_artifact(
     tmp_path: Path,

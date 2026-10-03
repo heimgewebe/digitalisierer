@@ -744,24 +744,25 @@ def _write_thumbnail(
 ) -> _CreatedArtifactState | None:
     Image, _ = _pillow_modules()
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    generated = _open_generated_file(target.parent, name_hint=target.name)
+    expected_sha256: str | None = None
+    expected_identity: tuple[int, int, int, int] | None = None
     try:
         with _pillow_image_source(source) as image_source:
             with Image.open(image_source) as image:
                 image.load()
                 thumbnail = image.convert("RGB")
                 thumbnail.thumbnail((720, 960))
-                with temporary.open("xb") as handle:
+                with os.fdopen(os.dup(generated.descriptor), "wb") as handle:
                     thumbnail.save(handle, format="JPEG", quality=82, optimize=True)
                     handle.flush()
                     os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        expected_sha256 = _sha256_file(temporary)
-        expected_identity = _stat_identity(
-            os.stat(temporary, follow_symlinks=False)
+        expected_sha256, expected_identity = _generated_file_state(
+            generated.descriptor,
+            purpose="generated scan thumbnail",
         )
         try:
-            _rename_noreplace(temporary, target)
+            _link_descriptor_noreplace(generated.descriptor, target)
         except FileExistsError:
             existing_sha256, _ = _regular_file_snapshot(
                 target,
@@ -771,7 +772,6 @@ def _write_thumbnail(
                 raise ScannerWorkflowError(
                     f"scan thumbnail collision for {target.name}"
                 )
-            temporary.unlink()
             return None
         expected_state = _CreatedArtifactState(
             path=target,
@@ -802,10 +802,13 @@ def _write_thumbnail(
             identity=published_identity,
         )
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if expected_sha256 is not None and expected_identity is not None:
+            _cleanup_generated_file(
+                generated,
+                sha256=expected_sha256,
+                identity=expected_identity,
+            )
+        os.close(generated.descriptor)
 
 
 def _existing_regular_file_hash(path: Path) -> str | None:
@@ -852,6 +855,131 @@ def _existing_regular_file_hash(path: Path) -> str | None:
         ) from exc
     finally:
         os.close(fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedFile:
+    descriptor: int
+    fallback_path: Path | None
+
+
+_AT_EMPTY_PATH = 0x1000
+
+
+def _open_generated_file(parent: Path, *, name_hint: str) -> _GeneratedFile:
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_TMPFILE"):
+        try:
+            descriptor = os.open(
+                parent,
+                flags | os.O_TMPFILE | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            pass
+        else:
+            metadata = os.fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+                return _GeneratedFile(descriptor=descriptor, fallback_path=None)
+            os.close(descriptor)
+
+    fallback = parent / f".{name_hint}.{secrets.token_hex(8)}.tmp"
+    try:
+        descriptor = os.open(
+            fallback,
+            flags | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"cannot create scanner generated file for {name_hint}"
+        ) from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise ScannerWorkflowError(
+            f"scanner generated file is not a regular file: {name_hint}"
+        )
+    return _GeneratedFile(descriptor=descriptor, fallback_path=fallback)
+
+
+def _generated_file_state(
+    descriptor: int,
+    *,
+    purpose: str,
+) -> tuple[str, tuple[int, int, int, int]]:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ScannerWorkflowError(f"{purpose} is not a regular file")
+    os.fchmod(descriptor, 0o600)
+    os.fsync(descriptor)
+    digest = _descriptor_sha256(descriptor)
+    after = os.fstat(descriptor)
+    if _stat_identity(before) != _stat_identity(after):
+        raise ScannerWorkflowError(f"{purpose} changed while hashing")
+    return digest, _stat_identity(after)
+
+
+def _link_descriptor_noreplace(descriptor: int, target: Path) -> None:
+    try:
+        directory_descriptor = os.open(
+            target.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"scanner publication directory is invalid: {target.parent}"
+        ) from exc
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = getattr(libc, "linkat", None)
+        if linkat is None:
+            raise ScannerWorkflowError(
+                "descriptor-bound scanner publication requires Linux linkat"
+            )
+        linkat.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        linkat.restype = ctypes.c_int
+        result = linkat(
+            descriptor,
+            b"",
+            directory_descriptor,
+            os.fsencode(target.name),
+            _AT_EMPTY_PATH,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            if error == 17:
+                raise FileExistsError(target)
+            detail = OSError(error, os.strerror(error), target)
+            raise ScannerWorkflowError(
+                f"descriptor-bound scanner publication failed: {target.name}"
+            ) from detail
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _cleanup_generated_file(
+    generated: _GeneratedFile,
+    *,
+    sha256: str,
+    identity: tuple[int, int, int, int],
+) -> None:
+    if generated.fallback_path is None:
+        return
+    _remove_created_artifact(
+        _CreatedArtifactState(
+            path=generated.fallback_path,
+            sha256=sha256,
+            identity=identity,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2016,7 +2144,9 @@ def _copy_preserved(
                 f"preserved source collision for {target.name}"
             )
         return None
-    temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    generated = _open_generated_file(target.parent, name_hint=target.name)
+    copied_sha: str | None = None
+    expected_identity: tuple[int, int, int, int] | None = None
     try:
         with _stable_source_descriptor(
             source,
@@ -2024,29 +2154,27 @@ def _copy_preserved(
         ) as (source_descriptor, _):
             with (
                 os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
-                temporary.open("xb") as target_handle,
+                os.fdopen(os.dup(generated.descriptor), "wb") as target_handle,
             ):
                 shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
                 target_handle.flush()
                 os.fsync(target_handle.fileno())
-        copied_sha = _sha256_file(temporary)
+        copied_sha, expected_identity = _generated_file_state(
+            generated.descriptor,
+            purpose="generated preserved source",
+        )
         if copied_sha != expected_sha256:
             raise ScannerWorkflowError(
                 f"scan source changed while preserving: {source}"
             )
-        os.chmod(temporary, 0o600)
-        expected_identity = _stat_identity(
-            os.stat(temporary, follow_symlinks=False)
-        )
         try:
-            os.link(temporary, target)
+            _link_descriptor_noreplace(generated.descriptor, target)
         except FileExistsError:
             existing_hash = _existing_regular_file_hash(target)
             if existing_hash is None or existing_hash != expected_sha256:
                 raise ScannerWorkflowError(
                     f"preserved source collision for {target.name}"
                 )
-            temporary.unlink()
             return None
         expected_state = _CreatedArtifactState(
             path=target,
@@ -2071,17 +2199,19 @@ def _copy_preserved(
                     f"failed to roll back published preserved source: {target.name}"
                 ) from exc
             raise
-        temporary.unlink()
         return _CreatedArtifactState(
             path=target,
             sha256=published_sha256,
             identity=published_identity,
         )
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if copied_sha is not None and expected_identity is not None:
+            _cleanup_generated_file(
+                generated,
+                sha256=copied_sha,
+                identity=expected_identity,
+            )
+        os.close(generated.descriptor)
 
 
 def _asset_id(source_name: str, sha256: str) -> str:
@@ -2107,7 +2237,12 @@ def _replace_preserved(
     expected_stat: os.stat_result,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    generated = _open_generated_file(target.parent, name_hint=target.name)
+    copied_sha: str | None = None
+    generated_identity: tuple[int, int, int, int] | None = None
+    preimage_claim: Path | None = None
+    preimage_sha256: str | None = None
+    preimage_identity: tuple[int, int, int, int] | None = None
     try:
         with _stable_source_descriptor(
             source,
@@ -2115,28 +2250,113 @@ def _replace_preserved(
         ) as (source_descriptor, _):
             with (
                 os.fdopen(os.dup(source_descriptor), "rb") as source_handle,
-                temporary.open("xb") as target_handle,
+                os.fdopen(os.dup(generated.descriptor), "wb") as target_handle,
             ):
                 shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
                 target_handle.flush()
                 os.fsync(target_handle.fileno())
-        copied_sha = _sha256_file(temporary)
+        copied_sha, generated_identity = _generated_file_state(
+            generated.descriptor,
+            purpose="generated preserved source repair",
+        )
         if copied_sha != expected_sha256:
             raise ScannerWorkflowError(
                 f"scan source changed while repairing preserved copy: {source}"
             )
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, target)
-        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+
+        if os.path.lexists(target):
+            preimage_sha256, preimage_identity = _regular_file_snapshot(
+                target,
+                purpose="preserved source repair preimage",
+            )
+            preimage_claim = _claim_owned_regular_file(
+                target,
+                preimage_sha256,
+                preimage_identity,
+                marker="repair-preimage",
+            )
+            if preimage_claim is None:
+                raise ScannerWorkflowError(
+                    f"preserved source changed before repair: {target.name}"
+                )
+
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            _link_descriptor_noreplace(generated.descriptor, target)
+        except BaseException as exc:
+            if (
+                preimage_claim is not None
+                and preimage_sha256 is not None
+                and preimage_identity is not None
+                and not _restore_owned_claim(
+                    preimage_claim,
+                    preimage_sha256,
+                    preimage_identity,
+                    target,
+                )
+            ):
+                raise ScannerWorkflowError(
+                    f"failed to restore preserved source after repair error: {target.name}"
+                ) from exc
+            raise
+
+        published_state = _CreatedArtifactState(
+            path=target,
+            sha256=expected_sha256,
+            identity=generated_identity,
+        )
+        try:
+            published_sha256, published_identity = _regular_file_snapshot(
+                target,
+                purpose="repaired preserved source",
+            )
+            if (
+                published_identity != generated_identity
+                or not secrets.compare_digest(published_sha256, expected_sha256)
+            ):
+                raise ScannerWorkflowError(
+                    f"preserved source changed during repair: {target.name}"
+                )
+        except BaseException as exc:
+            removed = _remove_created_artifact(published_state)
+            restored = True
+            if (
+                preimage_claim is not None
+                and preimage_sha256 is not None
+                and preimage_identity is not None
+            ):
+                restored = _restore_owned_claim(
+                    preimage_claim,
+                    preimage_sha256,
+                    preimage_identity,
+                    target,
+                )
+            if not removed or not restored:
+                raise ScannerWorkflowError(
+                    f"failed to roll back preserved source repair: {target.name}"
+                ) from exc
+            raise
+
+        if (
+            preimage_claim is not None
+            and preimage_sha256 is not None
+            and preimage_identity is not None
+            and not _remove_owned_claim(
+                preimage_claim,
+                preimage_sha256,
+                preimage_identity,
+            )
+        ):
+            raise ScannerWorkflowError(
+                f"preserved source repair preimage cleanup failed: {target.name}"
+            )
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if copied_sha is not None and generated_identity is not None:
+            _cleanup_generated_file(
+                generated,
+                sha256=copied_sha,
+                identity=generated_identity,
+            )
+        os.close(generated.descriptor)
 
 
 def _repair_recorded_asset(
