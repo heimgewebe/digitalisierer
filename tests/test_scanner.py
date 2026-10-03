@@ -2007,6 +2007,66 @@ def test_finalize_uses_verified_snapshot_during_transient_source_rewrite(
 
 
 
+def test_finalize_export_snapshot_stays_bound_when_directory_entry_is_rebound(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture-finalize-export-snapshot-rebind"
+    capture.mkdir()
+    source = capture / "image00001.jpg"
+    _image(source, 100)
+    replacement = tmp_path / "snapshot-replacement.jpg"
+    _image(replacement, 210)
+    paths = create_or_resume_scan_session(
+        "book",
+        "finalize-export-snapshot-rebind",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+    expected_digest = hashlib.sha256(original_bytes).digest()
+    rebound = False
+
+    class _SnapshotRebindingPdf:
+        name = "snapshot-rebinding-pdf"
+
+        def version(self) -> str:
+            return "test"
+
+        def __call__(self, images: list[Path], output: Path) -> None:
+            nonlocal rebound
+            assert len(images) == 1
+            snapshot_dirs = [
+                entry
+                for entry in output.parent.iterdir()
+                if entry.is_dir()
+                and entry.name.startswith(".verified-export-sources.")
+            ]
+            assert len(snapshot_dirs) == 1
+            visible_entries = list(snapshot_dirs[0].iterdir())
+            assert len(visible_entries) == 1
+            visible_entries[0].unlink()
+            visible_entries[0].write_bytes(replacement_bytes)
+            rebound = True
+            output.write_bytes(
+                b"PDF:" + hashlib.sha256(images[0].read_bytes()).digest()
+            )
+
+    exported = finalize_scan_session(
+        paths,
+        _FakeOcr(),
+        pdf_builder=_SnapshotRebindingPdf(),
+    )
+
+    assert rebound is True
+    assert preserved.read_bytes() == original_bytes
+    assert (exported.export_dir / "master.pdf").read_bytes() == (
+        b"PDF:" + expected_digest
+    )
+
+
 def test_finalize_verified_snapshot_is_readable_by_pdf_subprocess(
     tmp_path: Path,
 ) -> None:
