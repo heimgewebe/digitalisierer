@@ -19,6 +19,7 @@ from .scanner import (
     ScanSessionPaths,
     ScannerWorkflowError,
     ScannerReviewConflict,
+    _sealed_memfd_snapshot,
     load_review_state,
     review_item_snapshot,
     update_review_item,
@@ -667,20 +668,31 @@ def build_review_server(
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
                     try:
-                        verified_source.seek(0)
-                    except OSError:
+                        sealed_source_fd = _sealed_memfd_snapshot(
+                            verified_source.fileno(),
+                            expected_sha256=expected_sha256,
+                            expected_size=after.st_size,
+                            name="digitalisierer-review-source",
+                            purpose="review source",
+                        )
+                    except (OSError, ScannerWorkflowError):
                         self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
                         return
-                    self._headers(
-                        HTTPStatus.OK,
-                        content_type=content_type,
-                        content_length=after.st_size,
-                    )
-                    for chunk in iter(
-                        lambda: verified_source.read(1024 * 1024),
-                        b"",
-                    ):
-                        self.wfile.write(chunk)
+                    try:
+                        os.lseek(sealed_source_fd, 0, os.SEEK_SET)
+                        self._headers(
+                            HTTPStatus.OK,
+                            content_type=content_type,
+                            content_length=after.st_size,
+                        )
+                        with os.fdopen(os.dup(sealed_source_fd), "rb") as sealed_source:
+                            for chunk in iter(
+                                lambda: sealed_source.read(1024 * 1024),
+                                b"",
+                            ):
+                                self.wfile.write(chunk)
+                    finally:
+                        os.close(sealed_source_fd)
             return
 
         def do_POST(self) -> None:  # noqa: N802

@@ -7,6 +7,7 @@ from threading import Barrier
 from typing import Any
 from pathlib import Path
 import socket
+import tempfile
 from urllib.parse import urlencode
 
 from PIL import Image
@@ -1463,3 +1464,82 @@ def test_review_form_requires_unambiguous_snapshot_and_csrf(
         assert paths.review_file.read_bytes() == before
     finally:
         server.server.server_close()
+
+
+
+def test_review_server_stream_snapshot_is_immutable_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "source-verified-snapshot-in-place"
+    capture.mkdir()
+    image_path = capture / "page.jpg"
+    Image.new("RGB", (100, 140), color="white").save(image_path, format="JPEG")
+    paths = create_or_resume_scan_session(
+        "book",
+        "source-verified-snapshot-in-place",
+        tmp_path / "library",
+    )
+    observed = observe_scan_folder(paths, capture)
+    asset_id = observed.imported_asset_ids[0]
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    preserved = paths.root / session["assets"][0]["preserved_path"]
+    original_bytes = preserved.read_bytes()
+    raced_bytes = bytes((original_bytes[0] ^ 1,)) + original_bytes[1:]
+
+    captured_verified: list[Any] = []
+    original_temporary_file = tempfile.TemporaryFile
+
+    def tracking_temporary_file(*args: Any, **kwargs: Any) -> Any:
+        handle = original_temporary_file(*args, **kwargs)
+        captured_verified.append(handle)
+        return handle
+
+    monkeypatch.setattr(
+        tempfile,
+        "TemporaryFile",
+        tracking_temporary_file,
+    )
+    review_server = build_review_server(paths, host="127.0.0.1", port=0)
+    handler: Any = review_server.server.RequestHandlerClass
+    original_headers = handler._headers
+    attacked = False
+
+    def mutate_verified_snapshot(
+        self: Any,
+        status: Any,
+        *,
+        content_type: str,
+        content_length: int,
+    ) -> None:
+        nonlocal attacked
+        if not attacked and status == HTTPStatus.OK and captured_verified:
+            descriptor = captured_verified[-1].fileno()
+            os.fchmod(descriptor, 0o600)
+            writer = os.open(
+                f"/proc/{os.getpid()}/fd/{descriptor}",
+                os.O_WRONLY | os.O_CLOEXEC,
+            )
+            try:
+                os.lseek(writer, 0, os.SEEK_SET)
+                os.write(writer, raced_bytes)
+                attacked = True
+            finally:
+                os.close(writer)
+        original_headers(
+            self,
+            status,
+            content_type=content_type,
+            content_length=content_length,
+        )
+
+    monkeypatch.setattr(handler, "_headers", mutate_verified_snapshot)
+    try:
+        response = _get_review_path(review_server, f"/source/{asset_id}")
+    finally:
+        review_server.server.server_close()
+
+    assert attacked is True
+    assert b" 200 " in response.splitlines()[0]
+    _, body = response.split(b"\r\n\r\n", 1)
+    assert body == original_bytes

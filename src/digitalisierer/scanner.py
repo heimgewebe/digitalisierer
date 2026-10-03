@@ -297,6 +297,10 @@ def _json_text(payload: object) -> str:
     ) + "\n"
 
 
+def _utf8_display(value: object) -> str:
+    return str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
@@ -1096,6 +1100,7 @@ def _verified_preview_source_snapshot(
             ) from exc
         snapshot_fd = -1
         snapshot_read_fd = -1
+        sealed_snapshot_fd = -1
         try:
             try:
                 snapshot_fd = os.open(
@@ -1168,13 +1173,22 @@ def _verified_preview_source_snapshot(
                     raise ScannerWorkflowError(
                         f"preview snapshot changed before derivation: {source.name}"
                     )
+                sealed_snapshot_fd = _sealed_memfd_snapshot(
+                    snapshot_read_fd,
+                    expected_sha256=expected_sha256,
+                    expected_size=snapshot_read_stat.st_size,
+                    name="digitalisierer-preview-source",
+                    purpose=f"preview source {source.name}",
+                )
             finally:
                 if snapshot_fd >= 0:
                     os.close(snapshot_fd)
                 os.close(source_fd)
 
-            yield snapshot_read_fd
+            yield sealed_snapshot_fd
         finally:
+            if sealed_snapshot_fd >= 0:
+                os.close(sealed_snapshot_fd)
             if snapshot_read_fd >= 0:
                 os.close(snapshot_read_fd)
 
@@ -4222,7 +4236,7 @@ def finalize_scan_session(
                 [
                     "Digitalisierer Scanner Finalize Report",
                     "====================================",
-                    f"Session: {paths.root}",
+                    f"Session: {_utf8_display(paths.root)}",
                     f"Included pages: {len(active)}",
                     f"Recorded source assets: {len(verified_sources)}",
                     f"Quality findings: {findings_count}",

@@ -4529,24 +4529,38 @@ def test_observe_preview_derivation_remains_bound_after_snapshot_path_rebind(
         "preview-snapshot-rebind",
         tmp_path / "library",
     )
-    original_inspect = scanner_module._inspect_image
+    original_seal = scanner_module._sealed_memfd_snapshot
     attacked = False
 
-    def inspect_after_snapshot_rebind(path: Path | int) -> dict[str, object]:
+    def seal_after_snapshot_rebind(
+        source_descriptor: int,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        name: str,
+        purpose: str,
+    ) -> int:
         nonlocal attacked
         if not attacked:
-            if isinstance(path, int):
-                backing = Path(os.readlink(f"/proc/self/fd/{path}"))
-            else:
-                backing = path
+            backing = Path(os.readlink(f"/proc/self/fd/{source_descriptor}"))
             if backing.parent.name.startswith(".digitalisierer-preview-source."):
                 injected = backing.with_name("replacement-injected.jpg")
                 injected.write_bytes(replacement_bytes)
                 os.replace(injected, backing)
                 attacked = True
-        return original_inspect(path)
+        return original_seal(
+            source_descriptor,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            name=name,
+            purpose=purpose,
+        )
 
-    monkeypatch.setattr(scanner_module, "_inspect_image", inspect_after_snapshot_rebind)
+    monkeypatch.setattr(
+        scanner_module,
+        "_sealed_memfd_snapshot",
+        seal_after_snapshot_rebind,
+    )
 
     observed = observe_scan_folder(paths, capture)
 
@@ -5431,3 +5445,73 @@ def test_finalize_detaches_preopened_writer_from_published_artifact(
     assert hashlib.sha256(manifest.read_bytes()).hexdigest() == exported.output_hashes[
         "manifest.json"
     ]
+
+
+
+def test_observe_preview_snapshot_is_immutable_during_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "preview-snapshot-in-place"
+    capture.mkdir()
+    source = capture / "page.jpg"
+    replacement = tmp_path / "replacement-preview-in-place.jpg"
+    _image(source, 80)
+    _image(replacement, 220)
+    expected_image = scanner_module._inspect_image(source)
+    replacement_bytes = replacement.read_bytes()
+    paths = create_or_resume_scan_session(
+        "book",
+        "preview-snapshot-in-place",
+        tmp_path / "library",
+    )
+    original_inspect = scanner_module._inspect_image
+    attacked = False
+
+    def inspect_after_in_place_attack(path: Path | int) -> dict[str, object]:
+        nonlocal attacked
+        if isinstance(path, int) and not attacked:
+            os.fchmod(path, 0o600)
+            writer = os.open(
+                f"/proc/{os.getpid()}/fd/{path}",
+                os.O_WRONLY | os.O_CLOEXEC,
+            )
+            try:
+                os.lseek(writer, 0, os.SEEK_SET)
+                with pytest.raises(PermissionError):
+                    os.write(writer, replacement_bytes)
+                attacked = True
+            finally:
+                os.close(writer)
+        return original_inspect(path)
+
+    monkeypatch.setattr(scanner_module, "_inspect_image", inspect_after_in_place_attack)
+
+    observed = observe_scan_folder(paths, capture)
+
+    assert attacked is True
+    session = json.loads(paths.session_file.read_text(encoding="utf-8"))
+    assert session["assets"][0]["image"] == expected_image
+
+
+def test_finalize_report_escapes_surrogateescaped_session_path(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "surrogate-report-source"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    library_bytes = os.fsencode(tmp_path) + b"/library-\xff"
+    os.mkdir(library_bytes)
+    library = Path(os.fsdecode(library_bytes))
+    paths = create_or_resume_scan_session(
+        "book",
+        "surrogate-report",
+        library,
+    )
+    observe_scan_folder(paths, capture)
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    report = (exported.export_dir / "report.txt").read_text(encoding="utf-8")
+    assert "Session: " in report
+    assert "\\udcff" in report
