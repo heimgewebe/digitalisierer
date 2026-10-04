@@ -14,6 +14,7 @@ import secrets
 import shutil
 
 from .domain import ExportArtifact, TranscriptSegment, TranscriptionResult
+from .library import DEFAULT_INBOX_PROJECT_ID, default_library_root
 from .ports import TranscriptionBackend
 
 
@@ -21,8 +22,6 @@ class TranscriptionWorkflowError(RuntimeError):
     """Raised when a transcription session cannot be finalized safely."""
 
 
-DEFAULT_LIBRARY_DIRNAME = "Digitalisierer"
-DEFAULT_PROJECT_ID = "inbox"
 TRANSCRIPTION_BUNDLE_LAYOUT = "digitalisierer.transcription-bundle.v1"
 PRESERVED_SOURCE_NAME = "source.original"
 
@@ -38,13 +37,6 @@ class TranscriptionSourceIdentity:
     path: Path
     sha256: str
     stat_identity: tuple[int, int, int, int]
-
-
-def default_library_root() -> Path:
-    configured = os.environ.get("DIGITALISIERER_LIBRARY_ROOT")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / DEFAULT_LIBRARY_DIRNAME
 
 
 def _safe_session_stem(value: str) -> str:
@@ -100,7 +92,7 @@ def _default_output_dir_from_identity(
         f"{_safe_session_stem(identity.path.stem)}--{identity.sha256[:12]}"
     )
     root = (library_root or default_library_root()).expanduser()
-    return root / "projects" / DEFAULT_PROJECT_ID / "sessions" / session_id
+    return root / "projects" / DEFAULT_INBOX_PROJECT_ID / "sessions" / session_id
 
 
 def default_output_dir(source: Path, library_root: Path | None = None) -> Path:

@@ -1,0 +1,851 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import html
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
+import ipaddress
+import os
+from pathlib import Path
+import secrets
+import socket
+import stat
+import tempfile
+from threading import BoundedSemaphore
+from typing import Any
+from urllib.parse import parse_qs, quote, urlparse
+
+from .scanner import (
+    ScanSessionPaths,
+    ScannerWorkflowError,
+    ScannerReviewConflict,
+    _sealed_memfd_snapshot,
+    load_review_state,
+    review_item_snapshot,
+    update_review_item,
+)
+
+
+MAX_FORM_BYTES = 16 * 1024
+MAX_REVIEW_SOURCE_SNAPSHOT_BYTES = 64 * 1024 * 1024
+
+
+class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            f"review asset must be a non-symlink regular file: {path.name}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScannerWorkflowError(
+                f"review asset must be a non-symlink regular file: {path.name}"
+            )
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                f"review asset changed while hashing: {path.name}"
+            ) from exc
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.st_dev
+            or current.st_ino != after.st_ino
+            or (current.st_size, current.st_mtime_ns)
+            != (after.st_size, after.st_mtime_ns)
+        ):
+            raise ScannerWorkflowError(
+                f"review asset changed while hashing: {path.name}"
+            )
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewServer:
+    server: ThreadingHTTPServer
+    csrf_token: str
+
+    @property
+    def url(self) -> str:
+        host_value, port_value = self.server.server_address[:2]
+        host = (
+            host_value.decode("ascii")
+            if isinstance(host_value, bytes)
+            else str(host_value)
+        )
+        port = int(port_value)
+        rendered_host = f"[{host}]" if ":" in host else host
+        return f"http://{rendered_host}:{port}/"
+
+
+def _loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _display_filesystem_name(value: str) -> str:
+    rendered: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if 0xDC80 <= codepoint <= 0xDCFF:
+            rendered.append(f"\\x{codepoint - 0xDC00:02x}")
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            rendered.append(f"\\u{codepoint:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
+
+
+def _finding_index(
+    payload: dict[str, Any],
+) -> tuple[dict[str, list[str]], list[str]]:
+    raw = payload.get("findings")
+    index: dict[str, list[str]] = {}
+    session_findings: list[str] = []
+    if not isinstance(raw, list):
+        raise ScannerWorkflowError("scan findings must be a list")
+    for finding in raw:
+        if not isinstance(finding, dict):
+            continue
+        message = finding.get("message")
+        kind = finding.get("kind")
+        asset_ids = finding.get("asset_ids")
+        if (
+            not isinstance(message, str)
+            or not isinstance(kind, str)
+            or not isinstance(asset_ids, list)
+        ):
+            continue
+        rendered = f"{kind}: {message}"
+        if not asset_ids:
+            session_findings.append(rendered)
+            continue
+        for asset_id in asset_ids:
+            if isinstance(asset_id, str):
+                index.setdefault(asset_id, []).append(rendered)
+    return index, session_findings
+
+
+def render_review_html(paths: ScanSessionPaths, *, csrf_token: str) -> str:
+    session, review, findings_payload, _ = load_review_state(paths)
+    assets = session.get("assets")
+    decisions = review.get("items")
+    if not isinstance(assets, list) or not isinstance(decisions, dict):
+        raise ScannerWorkflowError("scan session/review state has invalid shape")
+
+    findings, session_findings = _finding_index(findings_payload)
+    session_findings_html = ""
+    if session_findings:
+        finding_items = "".join(
+            f"<li>{html.escape(message)}</li>" for message in session_findings
+        )
+        session_findings_html = f"""\n<section class="session-findings" aria-label="Hinweise zur Sitzung">\n  <h2>Hinweise zur Sitzung</h2>\n  <ul>{finding_items}</ul>\n</section>\n"""
+    _review_asset_paths_from_session(paths, session)
+    known_ids = [
+        str(asset["asset_id"])
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str)
+    ]
+    replacement_options = "".join(
+        f'<option value="{html.escape(candidate, quote=True)}"></option>'
+        for candidate in known_ids
+    )
+    cards: list[str] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        asset_id = asset.get("asset_id")
+        source_name = asset.get("source_name")
+        thumbnail = asset.get("thumbnail_path")
+        if (
+            not isinstance(asset_id, str)
+            or not isinstance(thumbnail, str)
+        ):
+            raise ScannerWorkflowError("scan asset record has invalid review metadata")
+        if not isinstance(source_name, str) or not source_name:
+            raise ScannerWorkflowError(
+                f"scan asset source_name is invalid for review: {asset_id}"
+            )
+        display_source_name = _display_filesystem_name(source_name)
+        decision = decisions.get(asset_id)
+        if not isinstance(decision, dict):
+            raise ScannerWorkflowError(f"review state missing for {asset_id}")
+        included = decision.get("included") is True
+        sequence = decision.get("sequence")
+        replacement_for = decision.get("replacement_for")
+        image = asset.get("image")
+        dimensions = ""
+        if isinstance(image, dict):
+            dimensions = (
+                f"{html.escape(str(image.get('width', '?')))} × "
+                f"{html.escape(str(image.get('height', '?')))}"
+            )
+        finding_html = "".join(
+            f"<li>{html.escape(message)}</li>"
+            for message in findings.get(asset_id, [])
+        )
+        if not finding_html:
+            finding_html = "<li>keine Hinweise</li>"
+        checked = " checked" if included else ""
+        sequence_value = "" if sequence is None else html.escape(str(sequence))
+        replacement_value = (
+            "" if replacement_for is None else html.escape(replacement_for, quote=True)
+        )
+        cards.append(
+            f"""
+<article class="page-card">
+  <a class="page-image-link" href="/source/{quote(asset_id, safe='')}" title="Original in voller Auflösung öffnen">
+    <img loading="lazy" src="/thumbnail/{quote(asset_id, safe='')}" alt="{html.escape(display_source_name, quote=True)}">
+  </a>
+  <div class="page-meta">
+    <h2>{html.escape(display_source_name)}</h2>
+    <p><code>{html.escape(asset_id)}</code> · {dimensions}</p>
+    <ul>{finding_html}</ul>
+    <form method="post" action="/save">
+      <input type="hidden" name="csrf" value="{html.escape(csrf_token, quote=True)}">
+      <input type="hidden" name="asset_id" value="{html.escape(asset_id, quote=True)}">
+      <input type="hidden" name="review_snapshot" value="{review_item_snapshot(asset_id, decision)}">
+      <input type="hidden" name="original_sequence" value="{sequence_value}">
+      <input type="hidden" name="original_replacement_for" value="{replacement_value}">
+      <label><input type="checkbox" name="included" value="1"{checked}> enthalten</label>
+      <label>Position <input name="sequence" inputmode="numeric" value="{sequence_value}"></label>
+      <label>Ersatz für
+        <input
+          name="replacement_for"
+          list="replacement-assets"
+          value="{replacement_value}"
+          autocomplete="off"
+        >
+      </label>
+      <button type="submit">Speichern</button>
+    </form>
+  </div>
+</article>
+"""
+        )
+
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Digitalisierer · Scan-Review</title>
+<style>
+:root {{ font-family: system-ui, sans-serif; font-size: 18px; color-scheme: light dark; }}
+body {{ margin: 0 auto; max-width: 1500px; padding: 24px; }}
+header {{ position: sticky; top: 0; padding: 12px 0; backdrop-filter: blur(12px); z-index: 2; }}
+.grid {{ display: grid; gap: 24px; grid-template-columns: repeat(auto-fit,minmax(440px,1fr)); }}
+.page-card {{ border: 1px solid #7777; border-radius: 14px; padding: 16px; display: grid; grid-template-columns: minmax(220px,42%) 1fr; gap: 18px; }}
+.page-image-link {{ display: block; align-self: start; }}
+.page-card img {{ width: 100%; max-height: 72vh; object-fit: contain; background: #8882; }}
+.page-meta h2 {{ margin-top: 0; }}
+form {{ display: grid; gap: 12px; }}
+input, select, button {{ font: inherit; padding: 8px; }}
+button {{ min-height: 48px; }}
+code {{ word-break: break-all; }}
+@media (max-width: 760px) {{ .page-card {{ grid-template-columns: 1fr; }} .grid {{ grid-template-columns: 1fr; }} }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Scan-Review</h1>
+  <p>{html.escape(str(session.get('project_id')))} / {html.escape(str(session.get('session_id')))} · {len(cards)} Seiten</p>
+</header>
+{session_findings_html}<main class="grid">
+{''.join(cards)}
+</main>
+<datalist id="replacement-assets">
+{replacement_options}
+</datalist>
+</body>
+</html>
+"""
+
+
+def _review_thumbnail_path(
+    paths: ScanSessionPaths,
+    asset_id: str,
+    relative: str,
+    expected_sha256: str,
+) -> Path:
+    expected = f"thumbnails/{asset_id}.jpg"
+    if relative != expected:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is not canonical for {asset_id}"
+        )
+    expected_path = paths.thumbnails / f"{asset_id}.jpg"
+    if paths.thumbnails.is_symlink() or expected_path.is_symlink():
+        raise ScannerWorkflowError(
+            f"scan thumbnail path must not be a symlink for {asset_id}"
+        )
+    try:
+        root = paths.root.resolve(strict=True)
+        thumbnails_root = paths.thumbnails.resolve(strict=True)
+        candidate = expected_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path is invalid for {asset_id}"
+        ) from exc
+    if not thumbnails_root.is_dir() or thumbnails_root.parent != root:
+        raise ScannerWorkflowError("scan thumbnails directory is invalid")
+    try:
+        candidate.relative_to(thumbnails_root)
+    except ValueError as exc:
+        raise ScannerWorkflowError(
+            f"scan thumbnail path escapes thumbnails for {asset_id}"
+        ) from exc
+    if (
+        candidate != thumbnails_root / f"{asset_id}.jpg"
+        or not candidate.is_file()
+    ):
+        raise ScannerWorkflowError(
+            f"scan thumbnail must be the canonical regular file for {asset_id}"
+        )
+    if (
+        len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+        or not secrets.compare_digest(_sha256_file(candidate), expected_sha256)
+    ):
+        raise ScannerWorkflowError(
+            f"scan thumbnail hash mismatch for {asset_id}"
+        )
+    return candidate
+
+
+def _review_asset_paths_from_session(
+    paths: ScanSessionPaths,
+    session_payload: dict[str, Any],
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    raw_assets = session_payload.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+    thumbnail_by_id: dict[str, Path] = {}
+    source_by_id: dict[str, Path] = {}
+    for asset in raw_assets:
+        if not isinstance(asset, dict):
+            raise ScannerWorkflowError("scan asset record must be an object")
+        asset_id = asset.get("asset_id")
+        thumbnail = asset.get("thumbnail_path")
+        thumbnail_sha256 = asset.get("thumbnail_sha256")
+        preserved = asset.get("preserved_path")
+        if not isinstance(asset_id, str) or not asset_id:
+            raise ScannerWorkflowError("scan asset record has an invalid asset_id")
+        if (
+            not isinstance(thumbnail, str)
+            or not isinstance(thumbnail_sha256, str)
+            or not isinstance(preserved, str)
+        ):
+            raise ScannerWorkflowError("scan asset record has invalid review paths")
+        thumbnail_by_id[asset_id] = _review_thumbnail_path(
+            paths,
+            asset_id,
+            thumbnail,
+            thumbnail_sha256,
+        )
+        source_by_id[asset_id] = paths.root / preserved
+    return thumbnail_by_id, source_by_id
+
+
+def _review_asset_path(
+    paths: ScanSessionPaths,
+    asset_id: str,
+    *,
+    kind: str,
+) -> tuple[Path, str] | None:
+    session_payload, _, _, processing = load_review_state(paths)
+    raw_assets = session_payload.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ScannerWorkflowError("scan session assets must be a list")
+    asset = next(
+        (
+            item
+            for item in raw_assets
+            if isinstance(item, dict) and item.get("asset_id") == asset_id
+        ),
+        None,
+    )
+    if asset is None:
+        return None
+
+    if kind == "thumbnail":
+        thumbnail = asset.get("thumbnail_path")
+        thumbnail_sha256 = asset.get("thumbnail_sha256")
+        if not isinstance(thumbnail, str) or not isinstance(thumbnail_sha256, str):
+            raise ScannerWorkflowError("scan asset record has invalid review paths")
+        return (
+            _review_thumbnail_path(
+                paths,
+                asset_id,
+                thumbnail,
+                thumbnail_sha256,
+            ),
+            thumbnail_sha256,
+        )
+
+    if kind != "source":
+        raise ValueError(f"unsupported review asset kind: {kind}")
+    source_sha256 = asset.get("sha256")
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_sha256)
+    ):
+        raise ScannerWorkflowError("scan asset record has invalid source digest")
+    processing_item = next(
+        (
+            item
+            for item in processing.items
+            if item.asset.asset_id == asset_id
+        ),
+        None,
+    )
+    if processing_item is None:
+        raise ScannerWorkflowError(f"review state missing for {asset_id}")
+    return processing_item.asset.path, source_sha256
+
+
+def _trusted_host_header(
+    raw_values: list[str],
+    *,
+    configured_host: str,
+    bound_host: str,
+    bound_port: int,
+) -> bool:
+    if len(raw_values) != 1:
+        return False
+    raw_host = raw_values[0]
+    if not raw_host or raw_host != raw_host.strip():
+        return False
+    try:
+        parsed = urlparse(f"//{raw_host}")
+        requested_port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    allowed_hosts = {configured_host.lower(), bound_host.lower()}
+    if parsed.hostname.lower() not in allowed_hosts:
+        return False
+    return requested_port is None or requested_port == bound_port
+
+
+def build_review_server(
+    paths: ScanSessionPaths,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+) -> ReviewServer:
+    if not _loopback_host(host):
+        raise ValueError("review UI may bind only to a loopback address")
+    if isinstance(port, bool) or not 0 <= port <= 65535:
+        raise ValueError("review UI port must be between 0 and 65535")
+    csrf_token = secrets.token_urlsafe(32)
+    source_snapshot_gate = BoundedSemaphore(value=1)
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "DigitalisiererReview/1"
+
+        def _headers(
+            self,
+            status: HTTPStatus,
+            *,
+            content_type: str,
+            content_length: int,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            )
+            self.end_headers()
+
+        def _request_host_is_trusted(self) -> bool:
+            server_address = self.server.server_address
+            if not isinstance(server_address, tuple) or len(server_address) < 2:
+                return False
+            bound_host_value, bound_port_value = server_address[:2]
+            bound_host = (
+                bound_host_value.decode("ascii")
+                if isinstance(bound_host_value, bytes)
+                else str(bound_host_value)
+            )
+            return _trusted_host_header(
+                list(self.headers.get_all("Host", [])),
+                configured_host=host,
+                bound_host=bound_host,
+                bound_port=int(bound_port_value),
+            )
+
+        def do_GET(self) -> None:  # noqa: N802
+            if not self._request_host_is_trusted():
+                self.send_error(HTTPStatus.MISDIRECTED_REQUEST)
+                return
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                payload = render_review_html(paths, csrf_token=csrf_token).encode(
+                    "utf-8"
+                )
+                self._headers(
+                    HTTPStatus.OK,
+                    content_type="text/html; charset=utf-8",
+                    content_length=len(payload),
+                )
+                self.wfile.write(payload)
+                return
+            requested: tuple[str, str] | None = None
+            for prefix, kind in (
+                ("/thumbnail/", "thumbnail"),
+                ("/source/", "source"),
+            ):
+                if parsed.path.startswith(prefix):
+                    requested = (parsed.path[len(prefix) :], kind)
+                    break
+            if requested is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            asset_id, kind = requested
+            try:
+                resolved = _review_asset_path(paths, asset_id, kind=kind)
+            except ScannerWorkflowError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            if resolved is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            target, expected_sha256 = resolved
+            content_type = (
+                "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
+            )
+            try:
+                descriptor = os.open(
+                    target,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                )
+            except FileNotFoundError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            except OSError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            with os.fdopen(descriptor, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+
+                if kind == "thumbnail":
+                    payload = source.read()
+                    after = os.fstat(source.fileno())
+                    try:
+                        current = target.lstat()
+                    except OSError:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                        )
+                        != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
+                        or current.st_dev != after.st_dev
+                        or current.st_ino != after.st_ino
+                        or (
+                            current.st_size,
+                            current.st_mtime_ns,
+                        )
+                        != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                        )
+                        or not secrets.compare_digest(
+                            hashlib.sha256(payload).hexdigest(),
+                            expected_sha256,
+                        )
+                    ):
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    self._headers(
+                        HTTPStatus.OK,
+                        content_type=content_type,
+                        content_length=len(payload),
+                    )
+                    self.wfile.write(payload)
+                    return
+
+                if not source_snapshot_gate.acquire(blocking=False):
+                    self.send_error(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "another full-resolution source response is active",
+                    )
+                    return
+                try:
+                    try:
+                        verified_source = tempfile.TemporaryFile(
+                            mode="w+b",
+                            dir=paths.root,
+                        )
+                    except OSError:
+                        self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    with verified_source:
+                        digest = hashlib.sha256()
+                        snapshot_chunk_digests: list[bytes] = []
+                        try:
+                            for chunk in iter(
+                                lambda: source.read(1024 * 1024),
+                                b"",
+                            ):
+                                digest.update(chunk)
+                                snapshot_chunk_digests.append(
+                                    hashlib.sha256(chunk).digest()
+                                )
+                                verified_source.write(chunk)
+                            verified_source.flush()
+                        except OSError:
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+                        after = os.fstat(source.fileno())
+                        try:
+                            current = target.lstat()
+                        except OSError:
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+                        if (
+                            not stat.S_ISREG(current.st_mode)
+                            or (
+                                before.st_dev,
+                                before.st_ino,
+                                before.st_size,
+                                before.st_mtime_ns,
+                            )
+                            != (
+                                after.st_dev,
+                                after.st_ino,
+                                after.st_size,
+                                after.st_mtime_ns,
+                            )
+                            or current.st_dev != after.st_dev
+                            or current.st_ino != after.st_ino
+                            or (
+                                current.st_size,
+                                current.st_mtime_ns,
+                            )
+                            != (
+                                after.st_size,
+                                after.st_mtime_ns,
+                            )
+                            or not secrets.compare_digest(
+                                digest.hexdigest(),
+                                expected_sha256,
+                            )
+                        ):
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+
+                        response_descriptor = verified_source.fileno()
+                        sealed_source_fd: int | None = None
+                        if after.st_size <= MAX_REVIEW_SOURCE_SNAPSHOT_BYTES:
+                            try:
+                                sealed_source_fd = _sealed_memfd_snapshot(
+                                    response_descriptor,
+                                    expected_sha256=expected_sha256,
+                                    expected_size=after.st_size,
+                                    name="digitalisierer-review-source",
+                                    purpose="review source",
+                                )
+                            except (OSError, ScannerWorkflowError):
+                                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                                return
+                            response_descriptor = sealed_source_fd
+                        try:
+                            os.lseek(response_descriptor, 0, os.SEEK_SET)
+                            self._headers(
+                                HTTPStatus.OK,
+                                content_type=content_type,
+                                content_length=after.st_size,
+                            )
+                            with os.fdopen(
+                                os.dup(response_descriptor),
+                                "rb",
+                            ) as response_source:
+                                streamed_chunks = 0
+                                for chunk in iter(
+                                    lambda: response_source.read(1024 * 1024),
+                                    b"",
+                                ):
+                                    if sealed_source_fd is None:
+                                        if (
+                                            streamed_chunks
+                                            >= len(snapshot_chunk_digests)
+                                            or not secrets.compare_digest(
+                                                hashlib.sha256(chunk).digest(),
+                                                snapshot_chunk_digests[
+                                                    streamed_chunks
+                                                ],
+                                            )
+                                        ):
+                                            self.close_connection = True
+                                            return
+                                    self.wfile.write(chunk)
+                                    streamed_chunks += 1
+                                if (
+                                    sealed_source_fd is None
+                                    and streamed_chunks
+                                    != len(snapshot_chunk_digests)
+                                ):
+                                    self.close_connection = True
+                                    return
+                        finally:
+                            if sealed_source_fd is not None:
+                                os.close(sealed_source_fd)
+                finally:
+                    source_snapshot_gate.release()
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            if not self._request_host_is_trusted():
+                self.send_error(HTTPStatus.MISDIRECTED_REQUEST)
+                return
+            if urlparse(self.path).path != "/save":
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if length <= 0 or length > MAX_FORM_BYTES:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            fields = parse_qs(
+                self.rfile.read(length).decode("utf-8", errors="strict"),
+                keep_blank_values=True,
+            )
+            if fields.get("csrf", [""])[0] != csrf_token:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            asset_id = fields.get("asset_id", [""])[0]
+            try:
+                _, _, _, processing = load_review_state(paths)
+            except ScannerWorkflowError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            if not any(
+                item.asset.asset_id == asset_id for item in processing.items
+            ):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            snapshots = fields.get("review_snapshot", [])
+            if (
+                len(snapshots) != 1
+                or len(snapshots[0]) != 64
+                or any(char not in "0123456789abcdef" for char in snapshots[0])
+            ):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            sequence_raw = fields.get("sequence", [""])[0].strip()
+            original_sequence_raw = fields.get("original_sequence", [""])[0].strip()
+            replacement = fields.get("replacement_for", [""])[0].strip()
+            original_replacement = fields.get(
+                "original_replacement_for", [""]
+            )[0].strip()
+            try:
+                sequence = int(sequence_raw) if sequence_raw else None
+                if (
+                    replacement
+                    and replacement != original_replacement
+                    and sequence_raw == original_sequence_raw
+                ):
+                    sequence = None
+                update_review_item(
+                    paths,
+                    asset_id,
+                    included=fields.get("included", [""])[0] == "1",
+                    sequence=sequence,
+                    replacement_for=replacement or None,
+                    expected_snapshot=snapshots[0],
+                )
+            except ScannerReviewConflict:
+                self.send_error(
+                    HTTPStatus.CONFLICT,
+                    "Review-Konflikt: Seite neu laden und erneut bearbeiten.",
+                    explain="Die gespeicherte Entscheidung wurde inzwischen geaendert. "
+                    "Dieses veraltete Formular hat keine Aenderung gespeichert.",
+                )
+                return
+            except (ValueError, ScannerWorkflowError):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server_class = _IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
+    server = server_class((host, port), Handler)
+    return ReviewServer(server=server, csrf_token=csrf_token)
+
+
+def serve_review(
+    paths: ScanSessionPaths,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> str:
+    review_server = build_review_server(paths, host=host, port=port)
+    url = review_server.url
+    print(url, flush=True)
+    try:
+        review_server.server.serve_forever()
+    finally:
+        review_server.server.server_close()
+    return url
