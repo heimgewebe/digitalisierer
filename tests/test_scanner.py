@@ -5258,6 +5258,125 @@ def test_finalize_reclaims_owned_stale_export_staging_before_reservation(
     assert (foreign / "foreign.txt").read_bytes() == foreign_extra
 
 
+def test_finalize_reclaims_owned_helper_temporaries_from_stale_export_staging(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "stale-export-helper-temporaries"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "stale-export-helper-temporaries",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    stale = paths.exports / ".export--0123456789ab.staging-0123456789abcdef"
+    stale.mkdir(mode=0o700)
+    owned_helpers = {
+        ".report.txt.0123456789abcdef.tmp": b"partial-report\n",
+        ".manifest.json.1111111111111111.tmp": b"partial-manifest\n",
+        ".master.pdf.2222222222222222.publication-snapshot": b"snapshot\n",
+        ".searchable.pdf.3333333333333333.publication-preimage": b"preimage\n",
+        "..text.txt.4444444444444444.publication-preimage."
+        "5555555555555555.cleanup-claim": b"cleanup-claim\n",
+    }
+    for name, payload in owned_helpers.items():
+        (stale / name).write_bytes(payload)
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert stale.is_dir()
+    assert list(stale.iterdir()) == []
+
+
+def test_finalize_reclaims_owned_hardlinked_helper_pair_from_stale_export_staging(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "stale-export-helper-hardlinks"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "stale-export-helper-hardlinks",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    stale = paths.exports / ".export--0123456789ab.staging-0123456789abcdef"
+    stale.mkdir(mode=0o700)
+    preimage = stale / ".master.pdf.0123456789abcdef.publication-preimage"
+    cleanup_claim = (
+        stale
+        / "..master.pdf.0123456789abcdef.publication-preimage."
+        "1111111111111111.cleanup-claim"
+    )
+    preimage.write_bytes(b"owned-hardlink-pair\n")
+    os.link(preimage, cleanup_claim)
+
+    assert preimage.stat().st_nlink == 2
+    assert cleanup_claim.stat().st_nlink == 2
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert stale.is_dir()
+    assert list(stale.iterdir()) == []
+
+
+def test_finalize_keeps_owned_helper_with_external_hardlink(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "stale-export-helper-external-hardlink"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "stale-export-helper-external-hardlink",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    stale = paths.exports / ".export--0123456789ab.staging-0123456789abcdef"
+    stale.mkdir(mode=0o700)
+    helper = stale / ".report.txt.0123456789abcdef.tmp"
+    helper.write_bytes(b"owned-but-linked-elsewhere\n")
+    outside = tmp_path / "outside-helper-link"
+    os.link(helper, outside)
+
+    assert helper.stat().st_nlink == 2
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert helper.read_bytes() == b"owned-but-linked-elsewhere\n"
+    assert outside.read_bytes() == b"owned-but-linked-elsewhere\n"
+
+
+def test_finalize_keeps_near_miss_helper_name_in_stale_export_staging(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "stale-export-helper-near-miss"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "stale-export-helper-near-miss",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    stale = paths.exports / ".export--0123456789ab.staging-0123456789abcdef"
+    stale.mkdir(mode=0o700)
+    near_miss = stale / ".report.txt.not-a-token.tmp"
+    payload = b"foreign-near-miss\n"
+    near_miss.write_bytes(payload)
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert near_miss.read_bytes() == payload
+
+
 def test_finalize_cleanup_keeps_foreign_staging_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

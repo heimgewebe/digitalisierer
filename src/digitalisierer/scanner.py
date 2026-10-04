@@ -4610,6 +4610,32 @@ _SCANNER_EXPORT_STAGING_FILES = frozenset(
 _SCANNER_EXPORT_STAGING_NAME_RE = re.compile(
     r"\.export--[0-9a-f]{12}\.staging-[0-9a-f]{16}\Z"
 )
+_SCANNER_EXPORT_STAGING_ARTIFACT_RE = (
+    "(?:" + "|".join(
+        re.escape(name) for name in sorted(_SCANNER_EXPORT_STAGING_FILES)
+    ) + ")"
+)
+_SCANNER_EXPORT_STAGING_TEXT_ARTIFACT_RE = (
+    "(?:" + "|".join(
+        re.escape(name) for name in ("manifest.json", "report.txt")
+    ) + ")"
+)
+_SCANNER_EXPORT_STAGING_HELPER_NAME_RE = re.compile(
+    rf"(?:"
+    rf"\.{_SCANNER_EXPORT_STAGING_TEXT_ARTIFACT_RE}\.[0-9a-f]{{16}}\.tmp"
+    rf"|\.{_SCANNER_EXPORT_STAGING_ARTIFACT_RE}\.[0-9a-f]{{16}}"
+    rf"\.(?:publication-snapshot|publication-preimage)"
+    rf"|\.\.{_SCANNER_EXPORT_STAGING_ARTIFACT_RE}\.[0-9a-f]{{16}}"
+    rf"\.publication-preimage\.[0-9a-f]{{16}}\.cleanup-claim"
+    rf")\Z"
+)
+
+
+def _is_owned_scanner_export_staging_name(name: str) -> bool:
+    return (
+        name in _SCANNER_EXPORT_STAGING_FILES
+        or _SCANNER_EXPORT_STAGING_HELPER_NAME_RE.fullmatch(name) is not None
+    )
 
 
 def _cleanup_scanner_export_staging(
@@ -4657,7 +4683,9 @@ def _cleanup_scanner_export_staging(
     except OSError:
         return
 
-    for name in names & _SCANNER_EXPORT_STAGING_FILES:
+    for name in names:
+        if not _is_owned_scanner_export_staging_name(name):
+            continue
         try:
             os.unlink(name, dir_fd=directory_fd)
         except OSError:
@@ -4730,10 +4758,14 @@ def _reclaim_interrupted_scanner_export_staging(exports: Path) -> None:
                     child_names = set(os.listdir(directory_fd))
                 except OSError:
                     continue
-                if not child_names.issubset(_SCANNER_EXPORT_STAGING_FILES):
+                if not all(
+                    _is_owned_scanner_export_staging_name(child_name)
+                    for child_name in child_names
+                ):
                     continue
 
                 safe = True
+                child_states: dict[str, os.stat_result] = {}
                 for child_name in child_names:
                     try:
                         child_state = os.stat(
@@ -4747,11 +4779,22 @@ def _reclaim_interrupted_scanner_export_staging(exports: Path) -> None:
                     if (
                         not stat.S_ISREG(child_state.st_mode)
                         or child_state.st_uid != os.geteuid()
-                        or child_state.st_nlink != 1
                     ):
                         safe = False
                         break
+                    child_states[child_name] = child_state
                 if not safe:
+                    continue
+
+                observed_links: dict[tuple[int, int], int] = {}
+                for child_state in child_states.values():
+                    inode = (child_state.st_dev, child_state.st_ino)
+                    observed_links[inode] = observed_links.get(inode, 0) + 1
+                if any(
+                    child_state.st_nlink
+                    != observed_links[(child_state.st_dev, child_state.st_ino)]
+                    for child_state in child_states.values()
+                ):
                     continue
 
                 _cleanup_scanner_export_staging(
