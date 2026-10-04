@@ -1331,6 +1331,36 @@ def test_status_finishes_cleanup_after_committed_preset_loses_preimage(
     assert not list(tmp_path.glob(".config.json.digitalisierer.claim.*"))
 
 
+def test_status_finishes_interrupted_hard_link_restore(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.json"
+    payload = b'{"setting":{"scan_preview_capture_type":"single"}}\n'
+    guard = tmp_path / ".config.json.digitalisierer.claim.restore"
+    guard.mkdir(mode=0o700)
+    preimage = guard / "preimage"
+    recovery = guard / "recovery"
+    preimage.write_bytes(payload)
+    recovery.write_bytes(payload)
+    os.link(preimage, config)
+
+    pre_stat = preimage.stat()
+    config_stat = config.stat()
+    assert pre_stat.st_nlink == 2
+    assert config_stat.st_nlink == 2
+    assert (pre_stat.st_dev, pre_stat.st_ino) == (
+        config_stat.st_dev,
+        config_stat.st_ino,
+    )
+
+    backend = CzurCaptureBackend(config_path=config)
+    backend.status()
+
+    assert config.read_bytes() == payload
+    assert config.stat().st_nlink == 1
+    assert not guard.exists()
+
+
 def test_config_claim_recovery_rejects_multiple_candidates(
     tmp_path: Path,
 ) -> None:

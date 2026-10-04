@@ -179,9 +179,22 @@ class CzurCaptureBackend:
                     raise CzurAdapterError(
                         "CZUR interrupted config recovery state is invalid"
                     ) from exc
+                preimage_link_state_valid = pre_stat.st_nlink == 1
+                if pre_stat.st_nlink == 2:
+                    try:
+                        canonical_link_stat = self.config_path.lstat()
+                    except OSError:
+                        canonical_link_stat = None
+                    if canonical_link_stat is not None:
+                        preimage_link_state_valid = (
+                            stat.S_ISREG(canonical_link_stat.st_mode)
+                            and canonical_link_stat.st_dev == pre_stat.st_dev
+                            and canonical_link_stat.st_ino == pre_stat.st_ino
+                            and canonical_link_stat.st_nlink == 2
+                        )
                 if (
                     pre_stat.st_uid != os.geteuid()
-                    or pre_stat.st_nlink != 1
+                    or not preimage_link_state_valid
                     or pre_content != recovery_content
                 ):
                     raise CzurAdapterError(
