@@ -1,11 +1,14 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from digitalisierer import cli
 from digitalisierer.domain import ExportArtifact
+from digitalisierer.scanner import scan_session_paths
 from digitalisierer.transcription import TranscriptionExport, default_output_dir
 
 
@@ -15,6 +18,10 @@ def _all_tools_present(name: str) -> cli.ToolCheck:
 
 def _unexpected_transcription_capability() -> cli.CapabilityStatus:
     pytest.fail("transcription must not be probed unless it is required")
+
+
+def _unexpected_capture_capability() -> cli.CapabilityStatus:
+    pytest.fail("CZUR capture must not be probed unless it is required")
 
 
 def _transcription_status(ready: bool) -> cli.CapabilityStatus:
@@ -30,6 +37,27 @@ def _transcription_status(ready: bool) -> cli.CapabilityStatus:
     }
 
 
+def _capture_status(ready: bool) -> cli.CapabilityStatus:
+    return {
+        "ready": ready,
+        "checks": {
+            "xdotool": {
+                "found": ready,
+                "path": "/tools/xdotool" if ready else None,
+            },
+            "czur-launcher": {
+                "found": ready,
+                "path": "/tools/czur-scanner" if ready else None,
+            },
+            "czur-config": {
+                "found": ready,
+                "path": "/config/czur.json" if ready else None,
+            },
+        },
+        "detail": "ready" if ready else "not ready",
+    }
+
+
 def test_cli_entrypoint_is_callable() -> None:
     assert callable(cli.main)
 
@@ -39,12 +67,8 @@ def test_doctor_reports_uniform_capability_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    app.chmod(0o755)
-
     monkeypatch.setattr(cli, "_which", _all_tools_present)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
@@ -54,10 +78,12 @@ def test_doctor_reports_uniform_capability_json(
     assert payload["required_capabilities"] == ["media", "ocr"]
     assert payload["capabilities"]["media"]["ready"] is True
     assert payload["capabilities"]["ocr"]["ready"] is True
-    assert payload["capabilities"]["capture-czur"]["ready"] is True
-    assert payload["capabilities"]["capture-czur"]["checks"]["czur-app"] == {
-        "found": True,
-        "path": str(app),
+    assert payload["capabilities"]["capture-czur"] == {
+        "ready": None,
+        "checks": {},
+        "detail": (
+            "not checked; use --require capture-czur for a live CZUR readiness probe"
+        ),
     }
     assert payload["capabilities"]["transcription"] == {
         "ready": None,
@@ -66,17 +92,12 @@ def test_doctor_reports_uniform_capability_json(
     }
 
 
-def test_doctor_can_require_executable_czur_app(
-    tmp_path: Path,
+def test_doctor_capture_czur_uses_backend_readiness(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("not executable\n", encoding="utf-8")
-    app.chmod(0o644)
-
     monkeypatch.setattr(cli, "_which", _all_tools_present)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", lambda: _capture_status(False))
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor", "--require", "capture-czur"]) == 1
@@ -84,11 +105,7 @@ def test_doctor_can_require_executable_czur_app(
 
     assert payload["ready"] is False
     assert payload["required_capabilities"] == ["capture-czur"]
-    assert payload["capabilities"]["capture-czur"]["ready"] is False
-    assert (
-        payload["capabilities"]["capture-czur"]["checks"]["czur-app"]["found"]
-        is False
-    )
+    assert payload["capabilities"]["capture-czur"] == _capture_status(False)
 
 
 def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
@@ -96,17 +113,13 @@ def test_doctor_default_exit_fails_when_required_core_capability_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    app = tmp_path / "CzurScanner"
-    app.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    app.chmod(0o755)
-
     def missing_tesseract(name: str) -> cli.ToolCheck:
         if name == "tesseract":
             return {"found": False, "path": None}
         return {"found": True, "path": f"/tools/{name}"}
 
     monkeypatch.setattr(cli, "_which", missing_tesseract)
-    monkeypatch.setattr(cli, "_czur_app_path", lambda: app)
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 1
@@ -123,6 +136,7 @@ def test_doctor_require_transcription_reflects_backend_readiness(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(
         cli,
         "_transcription_capability",
@@ -149,6 +163,7 @@ def test_doctor_emits_ascii_json_for_non_utf8_tool_path(
         "_which",
         lambda _name: {"found": True, "path": weird_path},
     )
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
     monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
 
     assert cli.main(["doctor"]) == 0
@@ -223,3 +238,134 @@ def test_default_output_dir_uses_standard_library_layout(tmp_path: Path) -> None
         / "sessions"
         / f"My-Recording--{source_sha256[:12]}"
     )
+
+def test_scan_observe_opts_into_repairable_missing_preserved_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "capture"
+    source.mkdir()
+    selected = source / "page.jpg"
+    selected.write_bytes(b"synthetic-image")
+    library = tmp_path / "library"
+    observed_repairable_sources: list[frozenset[str]] = []
+    validation_events: list[tuple[str, Any]] = []
+
+    def fake_create_or_resume(
+        project_id: str,
+        session_id: str,
+        library_root: Path | None = None,
+        *,
+        repairable_capture_sources: frozenset[str] = frozenset(),
+    ) -> Any:
+        observed_repairable_sources.append(repairable_capture_sources)
+        return scan_session_paths(project_id, session_id, library_root)
+
+    def fake_observe(
+        paths: Any,
+        folder: Path,
+        *,
+        start: int = 1,
+        limit: int | None = None,
+    ) -> Any:
+        assert folder == source.resolve()
+        assert start == 1
+        assert limit is None
+        return SimpleNamespace(
+            session_root=paths.root,
+            imported_asset_ids=(),
+            skipped_asset_ids=(),
+            findings=(),
+        )
+
+    def fake_load_processing_session(paths: Any) -> Any:
+        validation_events.append(("strict", paths))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "create_or_resume_scan_session", fake_create_or_resume)
+    monkeypatch.setattr(cli, "observe_scan_folder", fake_observe)
+    monkeypatch.setattr(cli, "load_processing_session", fake_load_processing_session)
+    monkeypatch.setattr(cli, "CzurCaptureBackend", lambda: object())
+
+    assert cli.main(
+        [
+            "scan",
+            "observe",
+            "--project",
+            "book",
+            "--session",
+            "chapter",
+            "--library-root",
+            str(library),
+            "--source",
+            str(source),
+        ]
+    ) == 0
+    assert observed_repairable_sources == [
+        frozenset({str(selected.resolve())})
+    ]
+    assert validation_events == [
+        ("strict", scan_session_paths("book", "chapter", library))
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source_folder"] == str(source.resolve())
+
+
+def test_invalid_scanner_jobs_env_does_not_break_unrelated_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CZUR_OCR_JOBS", "not-an-integer")
+    monkeypatch.setattr(cli, "_which", _all_tools_present)
+    monkeypatch.setattr(cli, "_czur_capture_capability", _unexpected_capture_capability)
+    monkeypatch.setattr(cli, "_transcription_capability", _unexpected_transcription_capability)
+
+    assert cli.main(["doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["ready"] is True
+
+
+def test_invalid_scanner_jobs_env_is_reported_by_scan_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CZUR_OCR_JOBS", "not-an-integer")
+
+    assert (
+        cli.main(
+            [
+                "scan",
+                "finalize",
+                "--project",
+                "book",
+                "--session",
+                "chapter",
+            ]
+        )
+        == 1
+    )
+    assert "scan failed:" in capsys.readouterr().err
+
+def test_invalid_scan_identity_is_reported_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        cli.main(
+            [
+                "scan",
+                "init",
+                "--project",
+                "../bad",
+                "--session",
+                "chapter",
+                "--library-root",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("scan failed: ")
+    assert "Traceback" not in captured.err

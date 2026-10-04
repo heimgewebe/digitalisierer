@@ -19,20 +19,22 @@ The roadmap is organized around **vertical slices** that stress different parts 
 
 Use the already proven ET24 path to exercise real capture, review and export:
 
-- [ ] create/resume a project and scan session
-- [ ] CZUR launch/focus adapter
-- [ ] Curved Books preset
-- [ ] capture-folder observation
-- [ ] thumbnail generation
-- [ ] page ordering/exclusion/replacement
-- [ ] blank/duplicate/anomaly findings
-- [ ] master PDF
-- [ ] OCR PDF + text
-- [ ] manifest/report with exact input/output hashes
-- [ ] large HiDPI review UI
-- [ ] migrate the proven local `czur-finalize` behavior into tested adapters/jobs
+- [x] create/resume a project and scan session
+- [x] CZUR launch/focus adapter
+- [x] Curved Books preset
+- [x] capture-folder observation
+- [x] thumbnail generation
+- [x] page ordering/exclusion/replacement
+- [x] blank/duplicate/anomaly findings
+- [x] master PDF
+- [x] OCR PDF + text
+- [x] manifest/report with exact input/output hashes
+- [x] large HiDPI review UI
+- [x] migrate the proven local `czur-finalize` behavior into tested adapters/jobs
 
 **Exit criterion:** one real chapter can be captured, corrected and finalized without needing the CZUR UI for review/export.
+
+Validated on a real ET24 chapter: 28 captured source images were preserved and reviewed; blank/error captures and duplicate rescans were excluded non-destructively, the active order was normalized to 21 pages, and Digitalisierer produced a 21-page master PDF, searchable OCR PDF, extracted text and a hash-bound manifest. The review/export flow did not require the CZUR UI.
 
 ## M2 — Audio/video transcription slice
 
