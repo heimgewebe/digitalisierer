@@ -5141,6 +5141,123 @@ def test_finalize_interrupt_after_publication_return_keeps_complete_export(
         assert artifact.stat().st_mode & 0o777 == 0o400
 
 
+def test_finalize_serializes_export_staging_between_finalizers(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "serialized-finalizers"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "serialized-finalizers",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    first_builder_entered = threading.Event()
+    release_first_builder = threading.Event()
+    second_done = threading.Event()
+    call_lock = threading.Lock()
+    builder_calls = 0
+    exports: list[scanner_module.ScanExport] = []
+    failures: list[BaseException] = []
+
+    class BlockingPdf(_FakePdf):
+        def __call__(self, images: list[Path], output: Path) -> None:
+            nonlocal builder_calls
+            with call_lock:
+                builder_calls += 1
+                call_number = builder_calls
+            if call_number == 1:
+                first_builder_entered.set()
+                assert release_first_builder.wait(timeout=2.0)
+            super().__call__(images, output)
+
+    pdf_builder = BlockingPdf()
+
+    def finalize(*, mark_done: bool = False) -> None:
+        try:
+            exports.append(
+                finalize_scan_session(
+                    paths,
+                    _FakeOcr(),
+                    pdf_builder=pdf_builder,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            if mark_done:
+                second_done.set()
+
+    first = threading.Thread(target=finalize)
+    second = threading.Thread(target=lambda: finalize(mark_done=True))
+    first.start()
+    assert first_builder_entered.wait(timeout=2.0)
+
+    active_staging = [
+        entry
+        for entry in paths.exports.iterdir()
+        if ".staging-" in entry.name
+    ]
+    assert len(active_staging) == 1
+
+    second.start()
+    assert second_done.wait(timeout=0.1) is False
+
+    release_first_builder.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_done.is_set()
+    assert builder_calls == 1
+    assert len(exports) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ScannerWorkflowError)
+    assert "scan export already exists" in str(failures[0])
+    assert exports[0].export_dir.is_dir()
+
+
+def test_finalize_reclaims_owned_stale_export_staging_before_reservation(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "stale-export-staging"
+    capture.mkdir()
+    _image(capture / "page.jpg", 100)
+    paths = create_or_resume_scan_session(
+        "book",
+        "stale-export-staging",
+        tmp_path / "library",
+    )
+    observe_scan_folder(paths, capture)
+
+    stale = paths.exports / ".export--0123456789ab.staging-0123456789abcdef"
+    stale.mkdir(mode=0o700)
+    stale_payloads = {
+        name: (f"stale-{name}\n").encode("utf-8")
+        for name in scanner_module._SCANNER_EXPORT_STAGING_FILES
+    }
+    for name, payload in stale_payloads.items():
+        (stale / name).write_bytes(payload)
+
+    foreign = paths.exports / ".export--fedcba987654.staging-fedcba9876543210"
+    foreign.mkdir(mode=0o700)
+    foreign_master = b"foreign-master\n"
+    foreign_extra = b"foreign-extra\n"
+    (foreign / "master.pdf").write_bytes(foreign_master)
+    (foreign / "foreign.txt").write_bytes(foreign_extra)
+
+    exported = finalize_scan_session(paths, _FakeOcr(), pdf_builder=_fake_pdf)
+
+    assert exported.export_dir.is_dir()
+    assert stale.is_dir()
+    assert list(stale.iterdir()) == []
+    assert (foreign / "master.pdf").read_bytes() == foreign_master
+    assert (foreign / "foreign.txt").read_bytes() == foreign_extra
+
+
 def test_finalize_cleanup_keeps_foreign_staging_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

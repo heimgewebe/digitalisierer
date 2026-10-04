@@ -28,6 +28,7 @@ SCAN_EXPORT_LAYOUT = "digitalisierer.scan-export.v1"
 SESSION_FILE = "session.json"
 REVIEW_FILE = "review.json"
 REVIEW_LOCK_FILE = ".review.lock"
+EXPORT_LOCK_FILE = ".export.lock"
 FINDINGS_FILE = "findings.json"
 OBSERVATION_COMMIT_FILE = ".observation-metadata-commit.json"
 OBSERVATION_ROLLBACK_FILE = ".observation-artifact-rollback.json"
@@ -354,6 +355,40 @@ def _review_update_lock(paths: ScanSessionPaths) -> Iterator[None]:
                 _recover_observation_metadata_commit(paths)
             _recover_interrupted_preserved_repairs(paths)
             _recover_interrupted_thumbnail_repairs(paths)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+@contextmanager
+def _export_finalize_lock(paths: ScanSessionPaths) -> Iterator[None]:
+    if not paths.root.is_dir() or not paths.session_file.is_file():
+        raise ScannerWorkflowError(
+            f"scanner session is not initialized: {paths.root}"
+        )
+    root = _validate_session_root(paths)
+    try:
+        root_descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError("scan session root is invalid") from exc
+    try:
+        descriptor = os.open(
+            EXPORT_LOCK_FILE,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
         finally:
             try:
@@ -4572,6 +4607,9 @@ _SCANNER_EXPORT_STAGING_FILES = frozenset(
         "manifest.json",
     }
 )
+_SCANNER_EXPORT_STAGING_NAME_RE = re.compile(
+    r"\.export--[0-9a-f]{12}\.staging-[0-9a-f]{16}\Z"
+)
 
 
 def _cleanup_scanner_export_staging(
@@ -4629,6 +4667,108 @@ def _cleanup_scanner_export_staging(
     # race-free name-based rmdir-if-inode-matches primitive; another same-user
     # process could replace that pathname after any identity check. Leaving an
     # empty owned staging directory is safer than deleting a replacement.
+
+
+def _reclaim_interrupted_scanner_export_staging(exports: Path) -> None:
+    try:
+        exports_fd = os.open(
+            exports,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ScannerWorkflowError(
+            "scanner exports directory cannot be opened safely"
+        ) from exc
+    try:
+        try:
+            names = os.listdir(exports_fd)
+        except OSError as exc:
+            raise ScannerWorkflowError(
+                "scanner exports directory cannot be inspected safely"
+            ) from exc
+
+        for name in names:
+            if _SCANNER_EXPORT_STAGING_NAME_RE.fullmatch(name) is None:
+                continue
+            try:
+                path_state = os.stat(
+                    name,
+                    dir_fd=exports_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                continue
+            if (
+                not stat.S_ISDIR(path_state.st_mode)
+                or path_state.st_uid != os.geteuid()
+                or stat.S_IMODE(path_state.st_mode) & 0o077
+            ):
+                continue
+
+            try:
+                directory_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    dir_fd=exports_fd,
+                )
+            except OSError:
+                continue
+            try:
+                bound = os.fstat(directory_fd)
+                identity = (bound.st_dev, bound.st_ino)
+                if (
+                    not stat.S_ISDIR(bound.st_mode)
+                    or identity != (path_state.st_dev, path_state.st_ino)
+                    or bound.st_uid != os.geteuid()
+                    or stat.S_IMODE(bound.st_mode) & 0o077
+                ):
+                    continue
+                try:
+                    child_names = set(os.listdir(directory_fd))
+                except OSError:
+                    continue
+                if not child_names.issubset(_SCANNER_EXPORT_STAGING_FILES):
+                    continue
+
+                safe = True
+                for child_name in child_names:
+                    try:
+                        child_state = os.stat(
+                            child_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        safe = False
+                        break
+                    if (
+                        not stat.S_ISREG(child_state.st_mode)
+                        or child_state.st_uid != os.geteuid()
+                        or child_state.st_nlink != 1
+                    ):
+                        safe = False
+                        break
+                if not safe:
+                    continue
+
+                _cleanup_scanner_export_staging(
+                    exports / name,
+                    directory_fd,
+                    identity,
+                    final_dir=Path(),
+                    publication_attempted=False,
+                )
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        os.close(exports_fd)
 
 
 def _rename_noreplace(source: Path, target: Path) -> None:
@@ -4983,6 +5123,24 @@ def _publish_verified_staging(
 
 
 def finalize_scan_session(
+    paths: ScanSessionPaths,
+    ocr_backend: OCRBackend,
+    *,
+    language: str = "deu",
+    pdf_builder: ImageToPdf = _default_pdf_builder,
+) -> ScanExport:
+    with _export_finalize_lock(paths):
+        _validate_session_storage_directory(paths, paths.exports, "exports")
+        _reclaim_interrupted_scanner_export_staging(paths.exports)
+        return _finalize_scan_session_locked(
+            paths,
+            ocr_backend,
+            language=language,
+            pdf_builder=pdf_builder,
+        )
+
+
+def _finalize_scan_session_locked(
     paths: ScanSessionPaths,
     ocr_backend: OCRBackend,
     *,
